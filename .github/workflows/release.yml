@@ -137,6 +137,10 @@ jobs:
 
           uv run python -m nuitka "${args[@]}" src/openwopan/app/main.py
 
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            mv build/main.app build/openwopan.app
+          fi
+
       - name: Package artifact
         shell: bash
         env:
