@@ -31,6 +31,7 @@ docs/
 tmp/
 cwconfig.json
 docs-backup-*.7z
+AGENTS.md
 
 # Local-only reference source. Do not commit OpenList source.
 references/openlist/
