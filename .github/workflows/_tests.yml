@@ -40,7 +40,6 @@ jobs:
         run: uv sync --frozen --dev
 
       - name: Install Qt runtime dependencies
-        if: ${{ inputs.xvfb }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
