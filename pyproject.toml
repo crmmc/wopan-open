@@ -1,0 +1,55 @@
+[project]
+name = "openwopan"
+version = "0.1.0"
+description = "Open source desktop client for China Unicom WoPan."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyside6",
+    "pyside6-fluent-widgets[full]>=1.11.1",
+    "cryptography>=49.0.0",
+    "httpx",
+    "keyring",
+    "platformdirs",
+]
+
+[project.scripts]
+openwopan = "openwopan.app.main:main"
+
+[dependency-groups]
+dev = [
+    "mypy",
+    "nuitka==4.1.3",
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.12,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "openwopan"
+module-root = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+disallow_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["PySide6.*", "qfluentwidgets", "qfluentwidgets.*", "keyring"]
+ignore_missing_imports = true
