@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from openwopan.app.logging_config import configure_logging, set_logging_level
 from openwopan.storage.settings import AppSettings
 
@@ -29,3 +31,8 @@ def test_set_logging_level_applies_to_openwopan_logger(tmp_path: object) -> None
     assert logging.getLogger("openwopan").level == logging.ERROR
     for handler in logging.getLogger("openwopan").handlers:
         assert handler.level == logging.ERROR
+
+
+def test_set_logging_level_rejects_unknown_level() -> None:
+    with pytest.raises(ValueError, match="invalid logging level"):
+        set_logging_level("NOPE")

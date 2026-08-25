@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+
+import pytest
 from pathlib import Path
 
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QFrame
@@ -414,12 +416,21 @@ def test_main_window_does_not_enter_file_rows(qapp: QApplication) -> None:
     assert window.current_directory_id() == ROOT_DIRECTORY_ID
 
 
-def test_main_window_maps_login_required_status(qapp: QApplication) -> None:
+@pytest.mark.parametrize(
+    "trigger_login_expired",
+    [
+        lambda window: window.refresh_current_directory(),
+        lambda window: window.create_folder_with_name("Reports"),
+    ],
+)
+def test_main_window_maps_login_required_status(
+    qapp: QApplication, trigger_login_expired
+) -> None:
     messages: list[str] = []
     window = MainWindow(LoginExpiredFileBrowser())
     window.login_required.connect(messages.append)
 
-    window.refresh_current_directory()
+    trigger_login_expired(window)
 
     assert window.displayed_items() == ()
     assert window.status_message() == "登录已过期，请重新登录"
@@ -708,17 +719,6 @@ def test_main_window_operation_failure_keeps_items_and_shows_error(qapp: QApplic
 
     assert window.displayed_items() == before
     assert window.status_message() == "重命名失败：name exists"
-
-
-def test_main_window_operation_login_required_emits_signal(qapp: QApplication) -> None:
-    messages: list[str] = []
-    window = MainWindow(LoginExpiredFileBrowser())
-    window.login_required.connect(messages.append)
-
-    window.create_folder_with_name("Reports")
-
-    assert window.status_message() == "登录已过期，请重新登录"
-    assert messages == ["登录已过期，请重新登录"]
 
 
 def test_main_window_upload_login_required_emits_signal(

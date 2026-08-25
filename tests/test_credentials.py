@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from openwopan.storage.credentials import CredentialStore
 
 
@@ -35,3 +37,18 @@ def test_credential_store_persists_last_account_id(monkeypatch: object) -> None:
 
     assert store.get_last_account_id() is None
     assert store.get_session_cookie("user-1") is None
+
+
+def test_credential_store_rejects_empty_account_id(monkeypatch: object) -> None:
+    fake_keyring = FakeKeyring(values={})
+    monkeypatch.setattr("openwopan.storage.credentials.keyring", fake_keyring)  # type: ignore[attr-defined]
+    store = CredentialStore(service_name="test-openwopan")
+
+    with pytest.raises(ValueError, match="account_id must not be empty"):
+        store.save_session_cookie("", "cookie")
+    with pytest.raises(ValueError, match="account_id must not be empty"):
+        store.get_session_cookie("")
+    with pytest.raises(ValueError, match="account_id must not be empty"):
+        store.delete_session_cookie("")
+    with pytest.raises(ValueError, match="account_id must not be empty"):
+        store.save_last_account_id("")

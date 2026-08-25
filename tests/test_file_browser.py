@@ -11,6 +11,7 @@ from openwopan.app.file_browser import (
     FileBrowserService,
 )
 from openwopan.storage.settings import AppSettings
+from openwopan.tasks.download import DownloadTaskState, DownloadTaskStore
 from openwopan.wopan.errors import WopanAuthenticationError, WopanBusinessError
 from openwopan.wopan.models import DownloadInfo, WopanCloudUsage, WopanItem, WopanItemKind
 
@@ -305,34 +306,38 @@ def test_file_browser_service_returns_cloud_usage() -> None:
     assert usage.total_bytes == 2048
 
 
-def test_file_browser_service_rejects_missing_upload_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("kind", "download_id", "match"),
+    [
+        (WopanItemKind.FOLDER, None, "只能下载文件"),
+        (WopanItemKind.FILE, None, "下载标识"),
+    ],
+)
+def test_file_browser_service_rejects_invalid_downloads(
+    tmp_path: Path, kind: WopanItemKind, download_id: str | None, match: str
+) -> None:
     service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
+    item = WopanItem(item_id="item-1", name="item", kind=kind, download_id=download_id)
 
-    with pytest.raises(FileBrowserError, match="本地文件不存在"):
-        service.upload_file("0", tmp_path / "missing.txt")
+    with pytest.raises(FileBrowserError, match=match):
+        service.download_file(item, tmp_path / "item")
 
 
-def test_file_browser_service_rejects_directory_upload(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("local_path_name", "match"),
+    [
+        ("missing.txt", "本地文件不存在"),
+        (".", "只能上传文件"),
+    ],
+)
+def test_file_browser_service_rejects_invalid_uploads(
+    tmp_path: Path, local_path_name: str, match: str
+) -> None:
     service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
+    local_path = tmp_path / local_path_name
 
-    with pytest.raises(FileBrowserError, match="只能上传文件"):
-        service.upload_file("0", tmp_path)
-
-
-def test_file_browser_service_rejects_folder_download(tmp_path: Path) -> None:
-    service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
-    item = WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)
-
-    with pytest.raises(FileBrowserError, match="只能下载文件"):
-        service.download_file(item, tmp_path / "Folder")
-
-
-def test_file_browser_service_requires_file_download_id(tmp_path: Path) -> None:
-    service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
-    item = WopanItem(item_id="file-1", name="report.txt", kind=WopanItemKind.FILE)
-
-    with pytest.raises(FileBrowserError, match="下载标识"):
-        service.download_file(item, tmp_path / "report.txt")
+    with pytest.raises(FileBrowserError, match=match):
+        service.upload_file("0", local_path)
 
 
 def test_file_browser_service_removes_partial_file_on_download_failure(tmp_path: Path) -> None:
@@ -370,3 +375,136 @@ def test_file_browser_service_maps_protocol_errors() -> None:
 
     with pytest.raises(FileBrowserError, match="failed"):
         service.list_directory("0")
+
+
+def test_file_browser_service_refreshes_expired_download_url(
+    tmp_path: Path,
+) -> None:
+    """Regression: 下载 URL 403 过期后通过 refresh 回调重新取链接并完成下载。"""
+    content = b"refreshed-content"
+    info_calls: list[str] = []
+    get_calls: list[str] = []
+
+    class RefreshingClient(FakeClient):
+        def get_download_info(self, item_id: str) -> DownloadInfo:
+            info_calls.append(item_id)
+            if len(info_calls) == 1:
+                return DownloadInfo(url="https://download.example.test/expired")
+            return DownloadInfo(url="https://download.example.test/fresh")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        get_calls.append(str(request.url))
+        if str(request.url).endswith("/expired"):
+            return httpx.Response(403)
+        return httpx.Response(200, content=content, headers={"Content-Length": str(len(content))})
+
+    service = FileBrowserService(  # type: ignore[arg-type]
+        RefreshingClient(),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        download_store=DownloadTaskStore(tmp_path / "store"),
+    )
+    item = WopanItem(
+        item_id="file-1",
+        name="report.txt",
+        kind=WopanItemKind.FILE,
+        download_id="fid-1",
+    )
+
+    result = service.download_file(item, tmp_path / "report.txt")
+
+    assert result.status == "已完成"
+    assert info_calls == ["fid-1", "fid-1"]
+    assert (tmp_path / "report.txt").read_bytes() == content
+    assert any(url.endswith("/fresh") for url in get_calls)
+
+
+def test_file_browser_service_download_records_and_removal(tmp_path: Path) -> None:
+    store = DownloadTaskStore(tmp_path / "store")
+    service = FileBrowserService(FakeClient(), download_store=store)  # type: ignore[arg-type]
+
+    assert service.download_records() == ()
+
+    state = DownloadTaskState(task_id="t1", file_name="a.bin", save_path=tmp_path / "a.bin")
+    state.status = "已暂停"
+    state.supports_resume = True
+    store.save(state)
+    state2 = DownloadTaskState(task_id="t2", file_name="b.bin", save_path=tmp_path / "b.bin")
+    state2.status = "失败"
+    state2.supports_resume = True
+    store.save(state2)
+
+    records = service.download_records()
+    assert [record.task_id for record in records] == ["t1", "t2"]
+    assert records[0].supports_resume is True  # 已暂停 + supports_resume 标记
+    assert records[1].supports_resume is True
+
+    service.remove_download_record("t1")
+    assert [record.task_id for record in service.download_records()] == ["t2"]
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://upload.example.test")
+    response = httpx.Response(status, request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError("unreachable")
+
+
+def test_file_browser_service_rejects_empty_download_path() -> None:
+    service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
+    item = WopanItem(
+        item_id="file-1",
+        name="report.txt",
+        kind=WopanItemKind.FILE,
+        download_id="fid-1",
+    )
+
+    with pytest.raises(FileBrowserError, match="保存路径不能为空"):
+        service.download_file(item, Path(""))
+
+
+def test_file_browser_service_rejects_empty_upload_parent(tmp_path: Path) -> None:
+    service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"data")
+
+    with pytest.raises(FileBrowserError, match="目标文件夹不能为空"):
+        service.upload_file("", local_path)
+
+
+@pytest.mark.parametrize(
+    ("error", "match"),
+    [
+        (_http_status_error(502), "HTTP 502"),
+        (httpx.ConnectError("offline"), "网络错误"),
+        (OSError("permission denied"), "无法读取本地文件"),
+    ],
+    ids=["http-status", "network", "read-error"],
+)
+def test_file_browser_service_maps_upload_failures(
+    tmp_path: Path, error: Exception, match: str
+) -> None:
+    class _FailingUploadClient(FakeClient):
+        def upload_file(
+            self, parent_id: str, local_path: Path, **_kwargs: object
+        ) -> WopanItem:
+            raise error
+
+    service = FileBrowserService(_FailingUploadClient())  # type: ignore[arg-type]
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"data")
+
+    with pytest.raises(FileBrowserError, match=match):
+        service.upload_file("0", local_path)
+
+
+def test_build_file_browser_service_constructs_service() -> None:
+    from openwopan.app.file_browser import build_file_browser_service
+
+    service = build_file_browser_service(
+        "WoCloud-Web-Token=1234567890abcdef-token", settings=AppSettings()
+    )
+
+    assert isinstance(service, FileBrowserService)

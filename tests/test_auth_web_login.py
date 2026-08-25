@@ -167,3 +167,45 @@ def test_web_login_coordinator_does_not_return_session_when_save_fails() -> None
 
     with pytest.raises(RuntimeError, match="keyring unavailable"):
         coordinator.complete(result)
+
+
+def test_build_token_preview_masks_short_token_entirely() -> None:
+    assert build_token_preview("short") == "***"
+    assert build_token_preview("123456789012") == "***"
+
+
+def test_web_login_coordinator_repersists_when_restored_account_changes() -> None:
+    """账号 ID 变化时 restore 重新持久化新账号的 cookie 和 last account id。"""
+    cookie_header = 'WoCloud-Web-Token=%2212345678-1234-1234-1234-123456789abc%22'
+    store = FakeCredentialStore(
+        last_account_id="old-account",
+        cookies_by_account={"old-account": cookie_header},
+    )
+    store.saved_account_id = None
+    validator = FakeValidator(ValidatedLoginUser(account_id="new-account"))
+    coordinator = WebLoginCoordinator(store, lambda _cookie: validator)
+
+    restored = coordinator.restore_last_session()
+
+    assert restored is not None
+    assert restored.session.account_id == "new-account"
+    assert store.last_account_id == "new-account"
+    assert store.cookies_by_account["new-account"] == cookie_header
+
+
+def test_web_login_coordinator_restore_returns_none_without_cookie() -> None:
+    store = FakeCredentialStore(
+        last_account_id="user-1",
+        cookies_by_account={},
+    )
+    coordinator = WebLoginCoordinator(
+        store,
+        lambda _cookie: FakeValidator(ValidatedLoginUser(account_id="user-1")),
+    )
+
+    assert coordinator.restore_last_session() is None
+
+
+def test_extract_wocloud_token_rejects_empty_value() -> None:
+    with pytest.raises(WebLoginTokenError, match="WoCloud-Web-Token is empty"):
+        extract_wocloud_token('WoCloud-Web-Token=""')
