@@ -116,7 +116,6 @@ jobs:
         run: |
           args=(
             --assume-yes-for-downloads
-            --follow-imports
             --enable-plugin=pyside6
             --include-package=qfluentwidgets
             --output-dir=build
