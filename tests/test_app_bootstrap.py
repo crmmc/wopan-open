@@ -6,7 +6,7 @@ import pytest
 
 from openwopan.app import main as main_module
 from openwopan.app.main import _application_args, _build_login_window, main
-from openwopan.auth.web_login import ValidatedLoginUser, WebLoginCoordinator
+from openwopan.auth.web_login import WebLoginCoordinator
 from openwopan.storage.settings import AppSettings
 
 
@@ -132,7 +132,6 @@ def test_main_schedules_controller_start_without_smoke_test(
     )
     monkeypatch.setattr(main_module, "configure_logging", lambda _s: tmp_path / "openwopan.log")  # type: ignore[operator]
 
-    from PySide6.QtWidgets import QApplication
 
     class _SingletonQApplication:
         """Reuses the existing QApplication so main() runs against a live Qt app."""
@@ -162,7 +161,6 @@ def test_main_schedules_controller_start_without_smoke_test(
 
     monkeypatch.setattr(main_module, "QApplication", _SingletonQApplication)
     captured_callbacks: list[object] = []
-    original_single_shot = main_module.QTimer.singleShot
 
     def fake_single_shot(_msec: int, callback: object) -> None:
         captured_callbacks.append(callback)
@@ -175,3 +173,58 @@ def test_main_schedules_controller_start_without_smoke_test(
     assert len(captured_callbacks) == 1
     assert callable(captured_callbacks[0])
     logging.getLogger("openwopan").info("main executed")
+
+
+def test_main_skips_font_setup_on_non_darwin_platform(
+    qapp: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
+) -> None:
+    """非 Darwin 平台应跳过 PingFang 字体设置，其余启动路径正常完成。"""
+    from PySide6.QtWidgets import QApplication
+
+    font_calls: list[object] = []
+    translator_calls: list[object] = []
+
+    class _RecordingQApplication:
+        """Reuses the existing QApplication and records font/translator setup."""
+
+        setHighDpiScaleFactorRoundingPolicy = staticmethod(
+            QApplication.setHighDpiScaleFactorRoundingPolicy
+        )
+
+        def __init__(self, _args: list[str]) -> None:
+            self._real = QApplication.instance()
+            assert self._real is not None
+
+        def setAttribute(self, *_args: object) -> None:
+            pass
+
+        def installTranslator(self, translator: object) -> None:
+            translator_calls.append(translator)
+
+        def setFont(self, font: object) -> None:
+            font_calls.append(font)
+
+        def quit(self) -> None:
+            pass
+
+        def exec(self) -> int:
+            return 0
+
+    monkeypatch.setattr(main_module, "QApplication", _RecordingQApplication)
+    monkeypatch.setattr(main_module.platform, "system", lambda: "Linux")
+    monkeypatch.setenv(main_module.SMOKE_TEST_ENV, "1")
+    monkeypatch.setattr(
+        main_module, "load_app_settings", lambda: AppSettings(log_level="INFO")
+    )
+    monkeypatch.setattr(
+        main_module, "ensure_app_settings_file", lambda _s: tmp_path / "settings.json"  # type: ignore[operator]
+    )
+    monkeypatch.setattr(main_module, "configure_logging", lambda _s: tmp_path / "openwopan.log")  # type: ignore[operator]
+
+    exit_code = main(["openwopan"])
+
+    assert exit_code == 0
+    assert font_calls == []
+    assert len(translator_calls) == 1

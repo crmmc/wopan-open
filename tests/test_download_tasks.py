@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 
 import httpx
@@ -10,8 +11,23 @@ from openwopan.tasks import download
 from openwopan.tasks.download import (
     DownloadCallbacks,
     DownloadError,
+    DownloadPartRecord,
     DownloadTaskControl,
+    DownloadTaskState,
     DownloadTaskStore,
+    _build_parts,
+    _clear_parts_if_plan_changed,
+    _compute_md5,
+    _download_part_size,
+    _merge_parts,
+    _read_content_length,
+    _read_non_negative_int,
+    _read_optional_positive_int,
+    _read_status,
+    _read_task_state,
+    _read_text,
+    _replace_output_file,
+    _validate_existing_parts,
     download_url,
     make_download_task_id,
 )
@@ -193,28 +209,6 @@ def _parse_range(value: str | None) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 # Coverage additions: store, control, single-stream, range and helper paths
 # ---------------------------------------------------------------------------
-
-import errno
-import json
-
-from openwopan.tasks.download import (
-    DownloadPart,
-    DownloadPartRecord,
-    DownloadTaskState,
-    _build_parts,
-    _clear_parts_if_plan_changed,
-    _compute_md5,
-    _download_part_size,
-    _merge_parts,
-    _read_content_length,
-    _read_non_negative_int,
-    _read_optional_positive_int,
-    _read_status,
-    _read_task_state,
-    _read_text,
-    _replace_output_file,
-    _validate_existing_parts,
-)
 
 
 def _state(

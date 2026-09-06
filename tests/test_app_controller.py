@@ -395,7 +395,6 @@ def test_controller_complete_login_invalid_cookie_without_window(qapp: object) -
 
 
 def test_controller_complete_login_factory_failure_without_window(qapp: object) -> None:
-    harness = _build_harness()
     token = "12345678-1234-1234-1234-123456789abc"
 
     dependencies = AppDependencies(
@@ -418,7 +417,9 @@ def test_controller_complete_login_factory_failure_without_window(qapp: object) 
     assert controller._login_window is None
 
 
-def test_controller_logout_deletes_credentials_on_success(qapp: object, monkeypatch: object) -> None:
+def test_controller_logout_deletes_credentials_on_success(
+    qapp: object, monkeypatch: object
+) -> None:
     @dataclass
     class _LocalKeyring:
         values: dict[tuple[str, str], str]

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -127,7 +126,6 @@ def test_upload_part_retries_transient_business_error_then_succeeds(
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url).endswith("/wohome/dispatcher"):
             return _success_response({"url": "https://upload.example.test"})
-        content_type = request.headers["Content-Type"]
         body = request.content
         part_marker = b'name="partIndex"'
         index_start = body.find(part_marker) + len(part_marker)
@@ -154,9 +152,9 @@ def test_upload_part_raises_after_retry_exhaustion(tmp_path: Path) -> None:
     local_file.write_bytes(b"content")
 
     with pytest.raises(WopanBusinessError, match="busy"):
-        _upload_client(_upload_handler(httpx.Response(200, json={"code": "9999", "msg": "busy"}))).upload_file(
-            "0", local_file, retry_max_attempts=0
-        )
+        _upload_client(
+            _upload_handler(httpx.Response(200, json={"code": "9999", "msg": "busy"}))
+        ).upload_file("0", local_file, retry_max_attempts=0)
 
 
 def test_upload_file_reraises_http_error(tmp_path: Path) -> None:

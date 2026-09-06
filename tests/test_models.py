@@ -1,3 +1,6 @@
+import importlib
+from importlib.metadata import PackageNotFoundError, version
+
 import pytest
 
 from openwopan import __version__
@@ -6,6 +9,26 @@ from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
 
 def test_package_version_is_available() -> None:
     assert isinstance(__version__, str)
+
+
+def test_package_version_falls_back_when_distribution_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """importlib.metadata 查不到 openwopan 发行版时，__version__ 应回退为 "0.0.0"。"""
+    import openwopan
+
+    def raise_package_not_found(name: str) -> str:
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr("importlib.metadata.version", raise_package_not_found)
+    try:
+        module = importlib.reload(openwopan)
+        assert module.__version__ == "0.0.0"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(openwopan)
+
+    assert openwopan.__version__ == version("openwopan")
 
 
 def test_wopan_item_model_uses_openwopan_fields() -> None:

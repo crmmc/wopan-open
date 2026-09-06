@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-
-import pytest
 from pathlib import Path
 
+import pytest
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QFrame
 
 from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError

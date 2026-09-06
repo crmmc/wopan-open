@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QPoint, QThread
-from PySide6.QtWidgets import QApplication, QDialog, QWidget
+from PySide6.QtCore import QPoint, Qt, QThread
+from PySide6.QtWidgets import QApplication, QDialog, QTreeWidgetItem, QWidget
 
 import openwopan.ui.main_window as main_window_module
 from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError
@@ -17,12 +17,12 @@ from openwopan.storage.settings import AppSettings
 from openwopan.tasks.download import DownloadTaskControl
 from openwopan.ui.main_window import (
     DownloadWorker,
+    MainWindow,
     NameInputDialog,
     PlaceholderInterface,
     TransferInterface,
     TransferRecord,
     UploadWorker,
-    MainWindow,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
@@ -253,7 +253,9 @@ class _SignalCollector:
             "login_required": [],
         }
         worker.progress.connect(lambda done, total: self.events["progress"].append((done, total)))
-        worker.status_changed.connect(lambda status: self.events["status_changed"].append((status,)))
+        worker.status_changed.connect(
+            lambda status: self.events["status_changed"].append((status,))
+        )
         worker.connections_changed.connect(
             lambda active, maximum: self.events["connections_changed"].append((active, maximum))
         )
@@ -2411,3 +2413,157 @@ def test_upload_succeeded_uses_task_id_fallback(qapp: QApplication) -> None:
     record = window.transfer_interface._find_record("upload", task_id)
     assert record is not None
     assert record.status == "已完成"
+
+
+@pytest.mark.parametrize(
+    ("created_at", "updated_at"),
+    [
+        (5.0, 7.0),  # both explicit -> both preserved
+        (0.0, 7.0),  # explicit updated_at survives even when created_at is auto-filled
+        (5.0, 0.0),  # created_at preserved; updated_at falls back to it
+    ],
+)
+def test_transfer_record_post_init_timestamp_fallbacks(
+    created_at: float, updated_at: float
+) -> None:
+    record = _make_record("d-1", created_at=created_at, updated_at=updated_at)
+
+    if created_at > 0:
+        assert record.created_at == created_at
+    else:
+        assert record.created_at > 0
+    if updated_at > 0:
+        assert record.updated_at == updated_at
+    else:
+        assert record.updated_at == record.created_at
+
+
+def test_transfer_active_download_folder_skips_latest_null_targets(
+    qapp: QApplication,
+) -> None:
+    transfer = TransferInterface()
+    transfer.add_download_record(_make_record("d-1", target_path=Path("/downloads/a.txt")))
+    transfer.add_download_record(_make_record("d-2", target_path=None))
+
+    assert transfer.active_download_folder() == Path("/downloads")
+
+    all_without_target = TransferInterface()
+    all_without_target.add_download_record(_make_record("d-3", target_path=None))
+
+    assert all_without_target.active_download_folder() is None
+
+
+def test_file_interface_download_action_starts_download_for_selected_row(
+    qapp: QApplication, tmp_path: Path, sync_threads: None
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(
+        browser,
+        settings=AppSettings(default_download_path=tmp_path, ask_download_location=False),
+    )
+    window.refresh_current_directory()
+    table = window.file_interface.file_table
+    table.clearSelection()
+    table.selectRow(1)
+
+    window.file_interface._download_selected_row()
+
+    assert browser.download_calls
+    assert browser.download_calls[0]["local_path"] == tmp_path / "report.txt"
+    assert window.status_message() == "下载完成：report.txt"
+
+
+@pytest.mark.parametrize(
+    ("clicked_id", "expected_directory_id"),
+    [
+        # Unknown id: the displayed-items loop exhausts without navigating anywhere.
+        ("ghost-folder", ROOT_DIRECTORY_ID),
+        # Known id on row 1: the loop skips the non-matching row 0, then navigates.
+        ("folder-9", "folder-9"),
+    ],
+)
+def test_tree_item_click_non_root_navigation_branches(
+    qapp: QApplication, clicked_id: str, expected_directory_id: str
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = [
+        _file_item("file-0", "first.txt"),
+        WopanItem(
+            item_id="folder-9",
+            name="Deep",
+            kind=WopanItemKind.FOLDER,
+            parent_id=ROOT_DIRECTORY_ID,
+        ),
+    ]
+    browser.items_by_parent["folder-9"] = [
+        WopanItem(
+            item_id="deep-file",
+            name="deep.txt",
+            kind=WopanItemKind.FILE,
+            parent_id="folder-9",
+            download_id="deep-fid",
+            size=1,
+        )
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    clicked = QTreeWidgetItem(["clicked"])
+    clicked.setData(0, Qt.ItemDataRole.UserRole, clicked_id)
+
+    window.file_interface._on_tree_item_clicked(clicked)
+
+    assert window.current_directory_id() == expected_directory_id
+
+
+def test_switch_to_interface_activates_widget_and_navigation(qapp: QApplication) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    assert window._stacked_widget is not None
+    assert window._navigation_interface is not None
+
+    window._switch_to_interface(window.transfer_interface, "transfers")
+
+    assert window._stacked_widget.currentWidget() is window.transfer_interface
+    transfers_nav_item = window._navigation_interface.panel.currentItem()
+
+    window._switch_to_interface(window.file_interface, "files")
+
+    assert window._stacked_widget.currentWidget() is window.file_interface
+    assert window._navigation_interface.panel.currentItem() is not transfers_nav_item
+
+
+def test_prompt_rename_item_cancelled_keeps_name_and_deletes_dialog(
+    qapp: QApplication, stub_name_dialog
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    stub_name_dialog.accept_result = QDialog.DialogCode.Rejected
+
+    window.prompt_rename_item(1)
+
+    assert window.displayed_items()[1].name == "report.txt"
+    assert stub_name_dialog.instances[0].title == "重命名"
+    assert stub_name_dialog.instances[0].deleted
+
+
+def test_upload_success_without_record_id_still_refreshes_directory(
+    qapp: QApplication,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    refreshes_before = len(browser.requested_parent_ids)
+    window._upload_task_id = None
+
+    uploaded = WopanItem(
+        item_id="uploaded-file",
+        name="orphan.txt",
+        kind=WopanItemKind.FILE,
+        download_id="uploaded-fid",
+        size=10,
+    )
+    window._on_upload_succeeded(uploaded)
+
+    assert len(browser.requested_parent_ids) == refreshes_before + 1
+    assert window.transfer_interface.upload_records == []
+    assert window.status_message() == "已上传「orphan.txt」，但刷新后未在当前目录看到，请稍后再刷新"
