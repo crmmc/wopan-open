@@ -10,6 +10,11 @@ on:
         required: false
         type: boolean
         default: false
+      coverage-suffix:
+        required: false
+        type: string
+        default: ""
+        description: "Suffix for the coverage data file and artifact (e.g. ui / logic)."
 
 jobs:
   pytest:
@@ -19,6 +24,7 @@ jobs:
       QTWEBENGINE_CHROMIUM_FLAGS: --disable-gpu --no-sandbox
       QTWEBENGINE_DISABLE_SANDBOX: "1"
       PYTEST_TARGETS: ${{ inputs['pytest-targets'] }}
+      COVERAGE_FILE: .coverage-${{ inputs.coverage-suffix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,8 +66,17 @@ jobs:
 
       - name: Run pytest under Xvfb
         if: ${{ inputs.xvfb }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" uv run pytest $PYTEST_TARGETS
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" uv run --frozen --with pytest-cov pytest $PYTEST_TARGETS --cov=src/openwopan --cov-branch --cov-report= --cov-fail-under=0
 
       - name: Run pytest
         if: ${{ !inputs.xvfb }}
-        run: uv run pytest $PYTEST_TARGETS
+        run: uv run --frozen --with pytest-cov pytest $PYTEST_TARGETS --cov=src/openwopan --cov-branch --cov-report= --cov-fail-under=0
+
+      - name: Upload coverage data
+        if: ${{ inputs.coverage-suffix != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ inputs.coverage-suffix }}
+          path: .coverage-${{ inputs.coverage-suffix }}
+          include-hidden-files: true
+          if-no-files-found: error

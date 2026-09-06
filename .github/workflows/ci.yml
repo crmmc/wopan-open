@@ -12,9 +12,44 @@ jobs:
     with:
       pytest-targets: tests/test_main_window.py tests/test_login_window.py tests/test_app_controller.py
       xvfb: true
+      coverage-suffix: ui
 
   logic-tests:
     uses: ./.github/workflows/_tests.yml
     with:
       pytest-targets: tests --ignore=tests/test_main_window.py --ignore=tests/test_login_window.py --ignore=tests/test_app_controller.py
       xvfb: false
+      coverage-suffix: logic
+
+  coverage-gate:
+    needs: [ui-tests, logic-tests]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+          path: .
+
+      - name: Combine coverage data
+        run: uv run --frozen --with pytest-cov coverage combine .coverage-ui .coverage-logic
+
+      - name: Enforce coverage gate
+        run: uv run --frozen --with pytest-cov coverage report --fail-under=95 --show-missing

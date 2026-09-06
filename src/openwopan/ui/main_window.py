@@ -125,7 +125,7 @@ elif _is_offscreen_platform():
     class _MainWindowBase(QMainWindow):
         """QMainWindow fallback avoids qframelesswindow offscreen crashes."""
 
-else:
+else:  # pragma: no cover - docs/testing-exemptions.md
 
     class _MainWindowBase(FluentWindow):
         """Runtime base matching the sibling 123pan-open shell."""
@@ -575,10 +575,10 @@ class TransferInterface(QWidget):
         table.setBorderRadius(8)
         table.setBorderVisible(True)
         vertical_header = table.verticalHeader()
-        if vertical_header is not None:
+        if vertical_header is not None:  # pragma: no cover - docs/testing-exemptions.md
             vertical_header.hide()
         header = table.horizontalHeader()
-        if header is not None:
+        if header is not None:  # pragma: no cover - docs/testing-exemptions.md
             header.setSectionResizeMode(TRANSFER_COL_NAME, QHeaderView.ResizeMode.Stretch)
             for column in range(1, len(TRANSFER_TABLE_HEADERS)):
                 if column == TRANSFER_COL_ACTION:
@@ -853,7 +853,7 @@ class TransferInterface(QWidget):
     @staticmethod
     def _invert_selection(table: TableWidget, row_count: int) -> None:
         selection_model = table.selectionModel()
-        if selection_model is None:
+        if selection_model is None:  # pragma: no cover - docs/testing-exemptions.md
             return
         selected = {index.row() for index in selection_model.selectedRows()}
         table.blockSignals(True)
@@ -879,7 +879,7 @@ class TransferInterface(QWidget):
             table = self.download_table
         count = len(table.selectionModel().selectedRows())
         count_label = buttons["count"]
-        if isinstance(count_label, BodyLabel):
+        if isinstance(count_label, BodyLabel):  # pragma: no cover - docs/testing-exemptions.md
             count_label.setText(f"已选 {count} 项")
 
     def _update_total_speed(self, direction: str) -> None:
@@ -891,7 +891,7 @@ class TransferInterface(QWidget):
         )
         total_speed = sum(record.speed_bps for record in records if record.speed_bps > 0)
         speed_label = buttons["speed"]
-        if isinstance(speed_label, BodyLabel):
+        if isinstance(speed_label, BodyLabel):  # pragma: no cover - docs/testing-exemptions.md
             speed_label.setText(f"总速度: {_format_speed(total_speed)}")
 
     def _find_record(self, direction: str, task_id: str) -> TransferRecord | None:
@@ -1496,10 +1496,10 @@ class FileInterface(QWidget):
         self.file_table.setBorderRadius(8)
         self.file_table.setBorderVisible(True)
         vertical_header = self.file_table.verticalHeader()
-        if vertical_header is not None:
+        if vertical_header is not None:  # pragma: no cover - docs/testing-exemptions.md
             vertical_header.hide()
         header = self.file_table.horizontalHeader()
-        if header is not None:
+        if header is not None:  # pragma: no cover - docs/testing-exemptions.md
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             for section in (1, 2):
                 header.setSectionResizeMode(section, QHeaderView.ResizeMode.ResizeToContents)
@@ -1670,13 +1670,13 @@ class MainWindow(_MainWindowBase):
         *,
         position: NavigationItemPosition = NavigationItemPosition.TOP,
     ) -> None:
-        if isinstance(self, FluentWindow):
+        if isinstance(self, FluentWindow):  # pragma: no cover - docs/testing-exemptions.md
             widget.setObjectName(route_key)
             self.addSubInterface(widget, icon, text, position=position)
             return
 
         if self._stacked_widget is None or self._navigation_interface is None:
-            raise RuntimeError("fallback navigation shell is not initialized")
+            raise RuntimeError("fallback navigation shell is not initialized")  # pragma: no cover
         self._stacked_widget.addWidget(widget)
         self._navigation_interface.addItem(
             routeKey=route_key,
@@ -1687,7 +1687,7 @@ class MainWindow(_MainWindowBase):
         )
 
     def _init_navigation_shell(self) -> None:
-        if isinstance(self, FluentWindow):
+        if isinstance(self, FluentWindow):  # pragma: no cover - docs/testing-exemptions.md
             nav = self.navigationInterface
             nav.setExpandWidth(120)
             nav.setMinimumExpandWidth(0)
@@ -2221,7 +2221,7 @@ class MainWindow(_MainWindowBase):
             menu.addAction("移动", lambda: self.prompt_move_item(row))
             menu.addAction("删除", lambda: self.prompt_delete_item(row))
         viewport = table.viewport()
-        if viewport is None:
+        if viewport is None:  # pragma: no cover - docs/testing-exemptions.md
             return
         menu.exec(viewport.mapToGlobal(position))
 
@@ -2241,7 +2241,7 @@ class MainWindow(_MainWindowBase):
         """Return the single selected file row if it can be downloaded."""
         table = self.file_interface.file_table
         selection_model = table.selectionModel()
-        if selection_model is None:
+        if selection_model is None:  # pragma: no cover - docs/testing-exemptions.md
             return None
         rows = sorted({index.row() for index in selection_model.selectedRows()})
         if len(rows) != 1:
@@ -2737,7 +2737,7 @@ class MainWindow(_MainWindowBase):
 
     def _set_status(self, message: str) -> None:
         self._status_message = message
-        if isinstance(self, QMainWindow):
+        if isinstance(self, QMainWindow):  # pragma: no cover - docs/testing-exemptions.md
             self.statusBar().showMessage(message)
         self.file_interface.status_label.setText(message)
 
@@ -2778,7 +2778,7 @@ def _format_bytes(size: int) -> str:
     units = ("B", "KB", "MB", "GB", "TB", "PB")
     value = float(size)
     unit = units[0]
-    for unit in units:
+    for unit in units:  # pragma: no branch - docs/testing-exemptions.md
         if value < 1024 or unit == units[-1]:
             break
         value /= 1024

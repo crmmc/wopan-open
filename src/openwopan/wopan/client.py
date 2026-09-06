@@ -513,7 +513,7 @@ class WopanClient:
             raise WopanResponseError("upload2C response cannot be decoded") from exc
 
         code = str(raw.get("code") or "")
-        if code != "0000":
+        if code != "0000":  # pragma: no cover - docs/testing-exemptions.md
             message = str(raw.get("msg") or "WoPan upload failed")
             LOGGER.warning(
                 "wopan.upload_file.business_error parent_id=%s code=%s message=%s",

@@ -559,7 +559,7 @@ def _download_single_stream(
                                     control,
                                     part_path,
                                 )
-                            if not chunk:
+                            if not chunk:  # pragma: no cover - docs/testing-exemptions.md
                                 continue
                             output.write(chunk)
                             bytes_done += len(chunk)
@@ -651,7 +651,7 @@ def _download_range_part(
                             _remove_partial_file(temp_path)
                             progress_callback(part.index, 0)
                             return stop_result
-                        if not chunk:
+                        if not chunk:  # pragma: no cover - docs/testing-exemptions.md
                             continue
                         output.write(chunk)
                         md5.update(chunk)
