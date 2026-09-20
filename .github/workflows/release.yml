@@ -33,6 +33,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      product_version: ${{ steps.version.outputs.product_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,8 +46,11 @@ jobs:
         run: |
           date_part="$(date -u +%Y%m%d)"
           short_sha="$(git rev-parse --short HEAD)"
-          tag="${{ inputs['base-version'] }}-${date_part}-${short_sha}"
+          base_version="${{ inputs['base-version'] }}"
+          product_version="${base_version#v}"
+          tag="${base_version}-${date_part}-${short_sha}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "product_version=${product_version}" >> "$GITHUB_OUTPUT"
           echo "Release tag: ${tag}"
 
   build:
@@ -56,6 +60,8 @@ jobs:
       - version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    env:
+      PRODUCT_VERSION: ${{ needs.version.outputs.product_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -127,14 +133,14 @@ jobs:
             --output-dir=build
             --output-filename=openwopan
             --product-name=OpenWoPan
-            --product-version=0.1.0
+            --product-version="$PRODUCT_VERSION"
             --company-name=OpenWoPan
           )
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             args+=(--mode=onefile --onefile-tempdir-spec="{CACHE_DIR}/OpenWoPan/{PRODUCT}/{VERSION}" --windows-console-mode=disable)
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            args+=(--mode=app --macos-app-name=OpenWoPan --macos-app-version=0.1.0)
+            args+=(--mode=app --macos-app-name=OpenWoPan --macos-app-version="$PRODUCT_VERSION")
           else
             args+=(--mode=onefile --onefile-tempdir-spec="{CACHE_DIR}/OpenWoPan/{PRODUCT}/{VERSION}")
           fi
