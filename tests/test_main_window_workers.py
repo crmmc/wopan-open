@@ -45,6 +45,7 @@ def _sync_worker_tests(request: pytest.FixtureRequest) -> None:
         "test_background_download_updates_ui_on_gui_thread",
         "test_refresh_directory_updates_ui_on_gui_thread",
         "test_refresh_directory_ignores_in_flight_request",
+        "test_create_folder_updates_ui_on_gui_thread",
     }
     if request.node.name not in real_thread_tests:
         request.getfixturevalue("sync_threads")
@@ -635,6 +636,104 @@ def test_refresh_directory_updates_ui_on_gui_thread(qapp: QApplication) -> None:
     assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
+class _CreateThreadRecordingMainWindow(MainWindow):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.create_handler_thread_id: int | None = None
+
+    def _on_create_folder_succeeded(self, result: object) -> None:
+        super()._on_create_folder_succeeded(result)
+        self.create_handler_thread_id = threading.get_ident()
+
+
+@pytest.mark.parametrize(
+    ("direction", "expected_status"),
+    [
+        ("upload", "上传完成：upload.txt"),
+        ("create", "创建成功"),
+    ],
+)
+def test_visibility_check_waits_for_refresh_completion(
+    qapp: QApplication, tmp_path: Path, direction: str, expected_status: str
+) -> None:
+    """The after-refresh visibility check must see the fresh item list.
+
+    Regression: the check used to read ``_items`` immediately after kicking
+    an async refresh, always reporting "not visible after refresh".
+    """
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    assert _wait_until(qapp, lambda: window._directory_thread is None)
+
+    if direction == "upload":
+        local_path = tmp_path / "upload.txt"
+        local_path.write_text("content")
+        window.upload_file_to_current_directory(local_path)
+        assert _wait_until(
+            qapp,
+            lambda: window.status_message() == "上传完成：upload.txt"
+            and window._upload_thread is None
+            and window._directory_thread is None,
+        )
+    else:
+        window.create_folder_with_name("新建文件夹")
+        assert _wait_until(
+            qapp,
+            lambda: "未在当前目录看到" not in window.status_message()
+            and window._create_thread is None
+            and window._directory_thread is None,
+        )
+
+    assert "未在当前目录看到" not in window.status_message()
+
+
+def test_create_folder_updates_ui_on_gui_thread(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    window = _CreateThreadRecordingMainWindow(browser)
+    gui_thread_id = threading.get_ident()
+    create_thread_ids: list[int] = []
+    list_thread_ids: list[int] = []
+    original_create_folder = browser.create_folder
+    original_list_directory = browser.list_directory
+
+    def create_folder(parent_id: str, name: str) -> WopanItem:
+        create_thread_ids.append(threading.get_ident())
+        return original_create_folder(parent_id, name)
+
+    def list_directory(parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+        list_thread_ids.append(threading.get_ident())
+        return original_list_directory(parent_id)
+
+    browser.create_folder = create_folder  # type: ignore[method-assign]
+    browser.list_directory = list_directory  # type: ignore[method-assign]
+    window.create_folder_with_name("Reports")
+
+    assert _wait_until(
+        qapp, lambda: window._create_thread is None and window._directory_thread is None
+    )
+    assert window.create_handler_thread_id == gui_thread_id
+    assert create_thread_ids and create_thread_ids[0] != gui_thread_id
+    assert list_thread_ids and list_thread_ids[-1] != gui_thread_id
+    assert any(item.name == "Reports" for item in window.displayed_items())
+
+
+def test_create_folder_failure_clears_thread_and_reports_status(
+    qapp: QApplication,
+    sync_threads: None,
+) -> None:
+    class FailingCreateBrowser(WorkerFileBrowser):
+        def create_folder(self, parent_id: str, name: str) -> WopanItem:
+            raise FileBrowserError("create down")
+
+    window = MainWindow(FailingCreateBrowser())
+    window.create_folder_with_name("name")
+
+    assert window._create_thread is None
+    assert window._create_worker is None
+    assert window.status_message() == "新建文件夹失败：create down"
+
+
 def test_refresh_directory_ignores_in_flight_request(
     qapp: QApplication,
     caplog: pytest.LogCaptureFixture,
@@ -727,7 +826,10 @@ def test_close_window_without_active_transfer_is_noop(qapp: QApplication) -> Non
     assert window._directory_thread is None
 
 
-@pytest.mark.parametrize("direction", ["download", "upload", "directory"])
+@pytest.mark.parametrize(
+    "direction",
+    ["download", "upload", "directory", "create", "rename", "delete", "move", "usage"],
+)
 def test_close_window_logs_timeout_and_accepts_close(
     qapp: QApplication,
     caplog: pytest.LogCaptureFixture,
@@ -745,8 +847,11 @@ def test_close_window_logs_timeout_and_accepts_close(
     elif direction == "upload":
         window._upload_thread = thread  # type: ignore[assignment]
         window._upload_task_id = task_id
-    else:
+    elif direction == "directory":
         window._directory_thread = thread  # type: ignore[assignment]
+    else:
+        field = f"_{direction}_thread"
+        setattr(window, field, thread)
 
     event = QCloseEvent()
     with caplog.at_level("WARNING", logger=main_window_module.LOGGER.name):
