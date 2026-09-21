@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from openwopan.app.bootstrap import AppDependencies
 from openwopan.app.controller import ApplicationController
 from openwopan.auth.session import AuthSession
@@ -11,6 +13,11 @@ from openwopan.storage.credentials import CredentialStore
 from openwopan.storage.settings import AppSettings
 from openwopan.ui.main_window import MainWindow
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+
+
+@pytest.fixture(autouse=True)
+def _sync_controller_main_window(sync_threads: None) -> None:
+    """Keep controller tests synchronous while directory refresh is worker-backed."""
 
 
 class FakeSignal:

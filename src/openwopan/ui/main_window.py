@@ -4,9 +4,10 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from PySide6.QtCore import (
     QItemSelectionModel,
@@ -118,7 +119,7 @@ FRAME_STYLE = (
     "}"
 )
 LOGGER = logging.getLogger(__name__)
-# Keep abandoned (unjoinable) transfer threads alive: dropping the last Python
+# Keep abandoned (unjoinable) worker threads alive: dropping the last Python
 # reference would delete a still-running QThread and abort the process.
 _THREAD_KEEP_ALIVE: set[QThread] = set()
 FIF = FluentIcon
@@ -267,6 +268,32 @@ class MoveTargetDialog(QDialog):
         self._selected_index = index
         self._ok_button.setEnabled(True)
         self._ok_button.setText(f"移动到「{self._entries[index].name}」")
+
+
+class BrowserOperationWorker(QObject):
+    """Run one blocking file-browser operation in a worker thread."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+    login_required = Signal(str)
+
+    def __init__(self, operation: Callable[[], object]) -> None:
+        super().__init__()
+        self._operation = operation
+
+    def run(self) -> None:
+        """Run the operation and emit exactly one terminal signal."""
+        try:
+            result = self._operation()
+        except FileBrowserLoginRequiredError as exc:
+            self.login_required.emit(str(exc))
+        except FileBrowserError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            LOGGER.exception("main_window.operation.unexpected_error")
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
 
 
 class DownloadWorker(QObject):
@@ -1691,6 +1718,10 @@ class MainWindow(_MainWindowBase):
         ]
         self._items: list[WopanItem] = []
         self._status_message = "请先登录"
+        self._directory_thread: QThread | None = None
+        self._directory_worker: BrowserOperationWorker | None = None
+        self._directory_parent_id: str | None = None
+        self._directory_refresh_pending = False
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_item: WopanItem | None = None
@@ -1734,7 +1765,13 @@ class MainWindow(_MainWindowBase):
         self._render_items()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Stop active transfers before the window destroys their threads."""
+        """Stop active background work before the window destroys its threads."""
+        directory_thread = self._directory_thread
+        if directory_thread is not None and directory_thread.isRunning():
+            directory_thread.quit()
+            if not directory_thread.wait(THREAD_JOIN_TIMEOUT_MS):
+                self._abandon_thread_after_timeout(directory_thread, "directory", None)
+
         download_thread = self._download_thread
         if download_thread is not None and download_thread.isRunning():
             task_id = self._download_task_id
@@ -1961,30 +1998,75 @@ class MainWindow(_MainWindowBase):
             self._set_status("请先登录")
             self._render_items()
             return
+        if self._directory_thread is not None:
+            # A refresh is in flight; remember the latest intent so navigation
+            # during loading still lands on the current breadcrumb target.
+            self._directory_refresh_pending = True
+            LOGGER.debug("main_window.refresh.skipped_busy")
+            return
 
         parent_id = self.current_directory_id()
         LOGGER.info("main_window.refresh.start parent_id=%s", parent_id)
         self._set_status("正在加载...")
-        try:
-            self._items = self._file_browser.list_directory(parent_id)
-        except FileBrowserLoginRequiredError as exc:
-            self._items = []
-            message = str(exc)
-            LOGGER.info("main_window.refresh.login_required parent_id=%s", parent_id)
-            self._set_status(message)
-            self.login_required.emit(message)
-        except FileBrowserError as exc:
-            self._items = []
-            LOGGER.warning("main_window.refresh.failed parent_id=%s error=%s", parent_id, exc)
-            self._set_status(f"加载失败：{exc}")
-            InfoBar.error(title="加载失败", content=str(exc), parent=self)
-        else:
-            LOGGER.info(
-                "main_window.refresh.success parent_id=%s item_count=%s",
-                parent_id,
-                len(self._items),
-            )
+
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.list_directory(parent_id))
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_directory_refresh_succeeded)
+        worker.failed.connect(self._on_directory_refresh_failed)
+        worker.login_required.connect(self._on_directory_refresh_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_directory_refresh)
+
+        self._directory_thread = thread
+        self._directory_worker = worker
+        self._directory_parent_id = parent_id
+        thread.start()
+
+    def _on_directory_refresh_succeeded(self, result: object) -> None:
+        self._items = cast(list[WopanItem], result)
+        LOGGER.info(
+            "main_window.refresh.success parent_id=%s item_count=%s",
+            self._directory_parent_id,
+            len(self._items),
+        )
         self._render_items()
+
+    def _on_directory_refresh_failed(self, message: str) -> None:
+        self._items = []
+        LOGGER.warning(
+            "main_window.refresh.failed parent_id=%s error=%s",
+            self._directory_parent_id,
+            message,
+        )
+        self._set_status(f"加载失败：{message}")
+        InfoBar.error(title="加载失败", content=message, parent=self)
+        self._render_items()
+
+    def _on_directory_refresh_login_required(self, message: str) -> None:
+        self._items = []
+        LOGGER.info(
+            "main_window.refresh.login_required parent_id=%s",
+            self._directory_parent_id,
+        )
+        self._set_status(message)
+        self.login_required.emit(message)
+        self._render_items()
+
+    def _clear_directory_refresh(self) -> None:
+        self._directory_thread = None
+        self._directory_worker = None
+        self._directory_parent_id = None
+        if self._directory_refresh_pending:
+            self._directory_refresh_pending = False
+            self.refresh_current_directory()
 
     def create_folder_with_name(self, name: str) -> None:
         """Create a folder in the current directory."""

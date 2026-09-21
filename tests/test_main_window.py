@@ -21,6 +21,11 @@ from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
 
 
+@pytest.fixture(autouse=True)
+def _sync_main_window_threads(sync_threads: None) -> None:
+    """Keep legacy synchronous MainWindow assertions deterministic."""
+
+
 class FakeFileBrowser:
     def __init__(self) -> None:
         self.requested_parent_ids: list[str] = []

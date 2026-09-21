@@ -22,6 +22,7 @@ from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequire
 from openwopan.storage.settings import AppSettings
 from openwopan.tasks.download import DownloadTaskControl
 from openwopan.ui.main_window import (
+    BrowserOperationWorker,
     DownloadWorker,
     MainWindow,
     NameInputDialog,
@@ -32,6 +33,23 @@ from openwopan.ui.main_window import (
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+
+
+@pytest.fixture(autouse=True)
+def _sync_worker_tests(request: pytest.FixtureRequest) -> None:
+    """Keep worker lifecycle tests synchronous except GUI-affinity regressions."""
+    real_thread_tests = {
+        "test_close_window_cancels_and_joins_running_download",
+        "test_background_download_unexpected_failure_clears_real_thread",
+        "test_background_upload_updates_ui_on_gui_thread",
+        "test_background_download_updates_ui_on_gui_thread",
+        "test_refresh_directory_updates_ui_on_gui_thread",
+        "test_refresh_directory_ignores_in_flight_request",
+    }
+    if request.node.name not in real_thread_tests:
+        request.getfixturevalue("sync_threads")
+
+
 
 
 def _renamed(item: WopanItem, new_name: str) -> WopanItem:
@@ -214,20 +232,6 @@ def _wait_until(qapp: QApplication, predicate, timeout: float = 5.0) -> bool:
     return predicate()
 
 
-class SyncQThread(QThread):
-    """QThread stand-in that runs the worker synchronously on the main thread.
-
-    Real cross-thread delivery is covered by the gui-thread regression tests;
-    this stand-in keeps the remaining lifecycle tests synchronous and
-    deterministic without spawning real threads.
-    """
-
-    def start(self, *args: object, **kwargs: object) -> None:
-        self.started.emit()
-
-    def quit(self) -> None:
-        self.finished.emit()
-
 
 class _CloseBlockingDownloadBrowser(WorkerFileBrowser):
     def __init__(self) -> None:
@@ -292,17 +296,6 @@ class _RefusingThread:
         self.wait_timeouts.append(timeout)
         return False
 
-
-
-@pytest.fixture
-def sync_threads(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(main_window_module, "QThread", SyncQThread)
-    monkeypatch.setattr(
-        main_window_module.DownloadWorker, "moveToThread", lambda self, thread: None
-    )
-    monkeypatch.setattr(
-        main_window_module.UploadWorker, "moveToThread", lambda self, thread: None
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,9 +570,125 @@ def test_upload_worker_maps_failed_and_login_required(
     assert collector.events["succeeded"] == []
 
 
-# ---------------------------------------------------------------------------
-# Background download / upload task lifecycle
-# ---------------------------------------------------------------------------
+def test_browser_operation_worker_emits_success(qapp: QApplication) -> None:
+    result = [WopanItem(item_id="item", name="item", kind=WopanItemKind.FILE)]
+    worker = BrowserOperationWorker(lambda: result)
+    succeeded: list[object] = []
+    worker.succeeded.connect(succeeded.append)
+
+    worker.run()
+
+    assert succeeded == [result]
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [FileBrowserError, FileBrowserLoginRequiredError, RuntimeError],
+)
+def test_browser_operation_worker_maps_all_errors(
+    qapp: QApplication,
+    error_type: type[Exception],
+) -> None:
+    worker = BrowserOperationWorker(lambda: (_ for _ in ()).throw(error_type("boom")))
+    failed: list[str] = []
+    login_required: list[str] = []
+    worker.failed.connect(failed.append)
+    worker.login_required.connect(login_required.append)
+
+    worker.run()
+
+    if error_type is FileBrowserLoginRequiredError:
+        assert login_required == ["boom"]
+        assert failed == []
+    else:
+        assert failed == ["boom"]
+        assert login_required == []
+
+
+class _ThreadRecordingMainWindow(MainWindow):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.refresh_handler_thread_id: int | None = None
+
+    def _on_directory_refresh_succeeded(self, result: object) -> None:
+        super()._on_directory_refresh_succeeded(result)
+        self.refresh_handler_thread_id = threading.get_ident()
+
+
+def test_refresh_directory_updates_ui_on_gui_thread(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    window = _ThreadRecordingMainWindow(browser)
+    gui_thread_id = threading.get_ident()
+    browser_thread_ids: list[int] = []
+    original_list_directory = browser.list_directory
+
+    def list_directory(parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+        browser_thread_ids.append(threading.get_ident())
+        return original_list_directory(parent_id)
+
+    browser.list_directory = list_directory  # type: ignore[method-assign]
+    window.refresh_current_directory()
+
+    assert _wait_until(qapp, lambda: window._directory_thread is None)
+    assert window.refresh_handler_thread_id == gui_thread_id
+    assert browser_thread_ids and browser_thread_ids[0] != gui_thread_id
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+
+
+def test_refresh_directory_ignores_in_flight_request(
+    qapp: QApplication,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    browser = WorkerFileBrowser()
+    started = threading.Event()
+    release = threading.Event()
+    call_count = 0
+
+    def blocking_list_directory(parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        release.wait(5)
+        return list(browser.items_by_parent[parent_id])
+
+    browser.list_directory = blocking_list_directory  # type: ignore[method-assign]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    assert _wait_until(qapp, started.is_set)
+
+    with caplog.at_level("DEBUG", logger=main_window_module.LOGGER.name):
+        window.refresh_current_directory()
+    assert window._directory_thread is not None
+    assert call_count == 1
+    assert "main_window.refresh.skipped_busy" in caplog.text
+
+    release.set()
+    assert _wait_until(qapp, lambda: window._directory_thread is None)
+
+
+def test_refresh_directory_runs_pending_refresh_after_in_flight_finishes(
+    qapp: QApplication,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+
+    # Simulate an in-flight refresh; navigation during loading marks the intent.
+    window._directory_thread = object()  # type: ignore[assignment]
+    window.enter_displayed_folder(0)
+    assert window._directory_refresh_pending is True
+    assert window.current_directory_id() == "folder-1"
+
+    # The in-flight refresh finishing replays the latest navigation intent.
+    window._clear_directory_refresh()
+
+    assert window._directory_refresh_pending is False
+    assert window._directory_thread is None
+    assert window.current_directory_id() == "folder-1"
+    assert [item.name for item in window.displayed_items()] == ["child.txt"]
+
+
 
 
 def test_close_window_cancels_and_joins_running_download(
@@ -615,9 +724,10 @@ def test_close_window_without_active_transfer_is_noop(qapp: QApplication) -> Non
     assert event.isAccepted()
     assert window._download_thread is None
     assert window._upload_thread is None
+    assert window._directory_thread is None
 
 
-@pytest.mark.parametrize("direction", ["download", "upload"])
+@pytest.mark.parametrize("direction", ["download", "upload", "directory"])
 def test_close_window_logs_timeout_and_accepts_close(
     qapp: QApplication,
     caplog: pytest.LogCaptureFixture,
@@ -632,9 +742,11 @@ def test_close_window_logs_timeout_and_accepts_close(
         window._download_task_id = task_id
         control = DownloadTaskControl()
         window._download_controls[task_id] = control
-    else:
+    elif direction == "upload":
         window._upload_thread = thread  # type: ignore[assignment]
         window._upload_task_id = task_id
+    else:
+        window._directory_thread = thread  # type: ignore[assignment]
 
     event = QCloseEvent()
     with caplog.at_level("WARNING", logger=main_window_module.LOGGER.name):
@@ -775,6 +887,7 @@ def test_background_download_unexpected_failure_clears_real_thread(
     window = MainWindow(browser)
 
     window.refresh_current_directory()
+    assert _wait_until(qapp, lambda: window._directory_thread is None)
     window.download_displayed_item(1, tmp_path / "report.txt")
 
     assert _wait_until(qapp, lambda: window._download_thread is None)
@@ -886,6 +999,7 @@ def test_background_download_updates_ui_on_gui_thread(
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
+    assert _wait_until(qapp, lambda: window._directory_thread is None)
     observed, gui_thread_id = _record_update_thread_ids(window)
 
     window.download_displayed_item(1, tmp_path / "report.txt")
