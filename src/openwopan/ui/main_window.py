@@ -8,7 +8,16 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QItemSelectionModel, QObject, QPoint, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import (
+    QItemSelectionModel,
+    QObject,
+    QPoint,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -421,6 +430,8 @@ class TransferRecord:
 class TransferInterface(QWidget):
     """Transfer center aligned with the sibling Fluent client."""
 
+    PROGRESS_RENDER_INTERVAL_MS = 150
+
     remove_records_requested = Signal(str, object)
     open_download_folder_requested = Signal(object)
     pause_download_requested = Signal(str)
@@ -435,6 +446,8 @@ class TransferInterface(QWidget):
         self.upload_status_filter = "全部"
         self.download_status_filter = "全部"
         self._active_direction = "upload"
+        self._pending_progress_directions: set[str] = set()
+        self._progress_render_scheduled = False
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(24, 20, 24, 24)
         self._main_layout.setSpacing(12)
@@ -448,11 +461,13 @@ class TransferInterface(QWidget):
     def add_upload_record(self, record: TransferRecord) -> None:
         """Add or replace an upload task row."""
         self._upsert_record(self.upload_records, record)
+        self.flush_progress_render()
         self._render_upload_table()
 
     def add_download_record(self, record: TransferRecord) -> None:
         """Add or replace a download task row."""
         self._upsert_record(self.download_records, record)
+        self.flush_progress_render()
         self._render_download_table()
 
     def update_record(
@@ -475,6 +490,13 @@ class TransferInterface(QWidget):
         previous_bytes = record.bytes_done
         previous_time = record.updated_at
         now = time.monotonic()
+        progress_only = (
+            status is None
+            and total_bytes is None
+            and max_connections is None
+            and can_resume is None
+            and error is None
+        )
         if status is not None:
             record.status = status
         if total_bytes is not None:
@@ -497,6 +519,34 @@ class TransferInterface(QWidget):
             record.speed_bps = 0.0
             record.active_connections = 0
         record.updated_at = now
+        if record.status in TERMINAL_TRANSFER_STATUSES:
+            self.flush_progress_render()
+            self._render_direction(direction)
+        elif progress_only:
+            self._schedule_progress_render(direction)
+        else:
+            self.flush_progress_render()
+            self._render_direction(direction)
+
+    def flush_progress_render(self) -> None:
+        """Render pending progress updates immediately; intended for tests and terminal updates."""
+        if not self._pending_progress_directions:
+            self._progress_render_scheduled = False
+            return
+        pending = tuple(self._pending_progress_directions)
+        self._pending_progress_directions.clear()
+        self._progress_render_scheduled = False
+        for direction in pending:
+            self._render_direction(direction)
+
+    def _schedule_progress_render(self, direction: str) -> None:
+        self._pending_progress_directions.add(direction)
+        if self._progress_render_scheduled:
+            return
+        self._progress_render_scheduled = True
+        QTimer.singleShot(self.PROGRESS_RENDER_INTERVAL_MS, self.flush_progress_render)
+
+    def _render_direction(self, direction: str) -> None:
         if direction == "upload":
             self._render_upload_table()
         else:
@@ -508,11 +558,13 @@ class TransferInterface(QWidget):
             self.upload_records = [
                 record for record in self.upload_records if record.task_id not in task_ids
             ]
+            self.flush_progress_render()
             self._render_upload_table()
             return
         self.download_records = [
             record for record in self.download_records if record.task_id not in task_ids
         ]
+        self.flush_progress_render()
         self._render_download_table()
 
     def active_download_folder(self) -> Path | None:
@@ -692,10 +744,12 @@ class TransferInterface(QWidget):
 
     def _on_upload_filter_changed(self, status: str) -> None:
         self.upload_status_filter = status
+        self.flush_progress_render()
         self._render_upload_table()
 
     def _on_download_filter_changed(self, status: str) -> None:
         self.download_status_filter = status
+        self.flush_progress_render()
         self._render_download_table()
 
     def _render_upload_table(self) -> None:

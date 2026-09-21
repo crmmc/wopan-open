@@ -1944,6 +1944,75 @@ def test_transfer_update_record_computes_speed_and_terminal_state(qapp: QApplica
     assert transfer._find_record("upload", "missing-task") is None
 
 
+def test_transfer_update_record_coalesces_progress_renders(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(
+        _make_record("u-1", direction="upload", status="上传中", total_bytes=2048)
+    )
+    render_calls: list[object] = []
+    original_render = transfer._render_table
+    scheduled: list[object] = []
+    monkeypatch.setattr(
+        main_window_module.QTimer,
+        "singleShot",
+        staticmethod(lambda _delay, callback: scheduled.append(callback)),
+    )
+    monkeypatch.setattr(
+        transfer,
+        "_render_table",
+        lambda table, records, direction: (
+            render_calls.append(direction), original_render(table, records, direction)
+        )[1],
+    )
+
+    for bytes_done in (256, 512, 768):
+        transfer.update_record("upload", "u-1", bytes_done=bytes_done)
+
+    assert len(scheduled) == 1
+    assert render_calls == []
+    record = transfer._find_record("upload", "u-1")
+    assert record is not None
+    assert record.bytes_done == 768
+
+    scheduled[0]()
+    assert render_calls == ["upload"]
+    assert transfer.upload_table.item(0, 2).text() == "37% (768 B / 2.0 KB)"
+
+
+def test_transfer_terminal_update_flushes_and_renders_final_bytes(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(
+        _make_record("u-1", direction="upload", status="上传中", total_bytes=2048)
+    )
+
+    transfer.update_record("upload", "u-1", bytes_done=1024)
+    transfer.update_record("upload", "u-1", status="已完成", bytes_done=2048)
+
+    assert transfer.upload_table.item(0, 2).text() == "100% (2.0 KB / 2.0 KB)"
+    assert transfer.upload_table.item(0, 4).text() == "已完成"
+
+
+def test_transfer_status_update_renders_immediately(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transfer = TransferInterface()
+    transfer.add_download_record(_make_record("d-1"))
+    render_calls: list[str] = []
+    original_render = transfer._render_download_table
+    monkeypatch.setattr(
+        transfer,
+        "_render_download_table",
+        lambda: (render_calls.append("download"), original_render())[1],
+    )
+
+    transfer.update_record("download", "d-1", status="失败")
+
+    assert render_calls == ["download"]
+    assert transfer.download_table.item(0, 4).text() == "失败"
+
+
 def test_transfer_update_record_clamps_inputs(qapp: QApplication) -> None:
     transfer = TransferInterface()
     transfer.add_download_record(_make_record("d-1"))
