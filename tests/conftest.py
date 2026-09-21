@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication
 
+import openwopan.app.controller as controller_module
 import openwopan.ui.main_window as main_window_module
 
 
@@ -27,8 +28,14 @@ class SyncQThread(QThread):
 @pytest.fixture
 def sync_threads(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_window_module, "QThread", SyncQThread)
+    monkeypatch.setattr(controller_module, "QThread", SyncQThread)
     monkeypatch.setattr(
         main_window_module.BrowserOperationWorker,
+        "moveToThread",
+        lambda self, thread: None,
+    )
+    monkeypatch.setattr(
+        controller_module.ControllerOperationWorker,
         "moveToThread",
         lambda self, thread: None,
     )
