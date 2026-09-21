@@ -547,13 +547,17 @@ class TransferInterface(QWidget):
             record.active_connections = 0
         record.updated_at = now
         if record.status in TERMINAL_TRANSFER_STATUSES:
-            self.flush_progress_render()
+            self._discard_pending_progress(direction)
             self._render_direction(direction)
         elif progress_only:
             self._schedule_progress_render(direction)
         else:
-            self.flush_progress_render()
+            self._discard_pending_progress(direction)
             self._render_direction(direction)
+
+    def _discard_pending_progress(self, direction: str) -> None:
+        """Drop one direction's pending coalesced render; the caller renders it now."""
+        self._pending_progress_directions.discard(direction)
 
     def flush_progress_render(self) -> None:
         """Render pending progress updates immediately; intended for tests and terminal updates."""
@@ -1722,7 +1726,7 @@ class MainWindow(_MainWindowBase):
         self._directory_worker: BrowserOperationWorker | None = None
         self._directory_parent_id: str | None = None
         self._directory_refresh_pending = False
-        self._after_refresh: Callable[[list[WopanItem]], None] | None = None
+        self._after_refresh: tuple[str, Callable[[list[WopanItem], bool], None]] | None = None
         self._create_thread: QThread | None = None
         self._create_worker: BrowserOperationWorker | None = None
         self._create_parent_id: str | None = None
@@ -1779,42 +1783,38 @@ class MainWindow(_MainWindowBase):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Stop active background work before the window destroys its threads."""
-        directory_thread = self._directory_thread
-        if directory_thread is not None and directory_thread.isRunning():
-            directory_thread.quit()
-            if not directory_thread.wait(THREAD_JOIN_TIMEOUT_MS):
-                self._abandon_thread_after_timeout(directory_thread, "directory", None)
-
+        # Cooperative-stop and quit every running thread first, then wait for
+        # all of them against one shared budget — waiting per thread in turn
+        # would stack each THREAD_JOIN_TIMEOUT_MS on a pathological close.
+        running: list[tuple[QThread, str, str | None]] = []
         for thread, direction in (
+            (self._directory_thread, "directory"),
             (self._create_thread, "create"),
             (self._rename_thread, "rename"),
             (self._delete_thread, "delete"),
             (self._move_thread, "move"),
             (self._usage_thread, "usage"),
+            (self._download_thread, "download"),
+            (self._upload_thread, "upload"),
         ):
-            if thread is not None and thread.isRunning():
-                thread.quit()
-                if not thread.wait(THREAD_JOIN_TIMEOUT_MS):
-                    self._abandon_thread_after_timeout(thread, direction, None)
+            if thread is None or not thread.isRunning():
+                continue
+            if direction == "download":
+                task_id = self._download_task_id
+                if task_id is not None:
+                    control = self._download_controls.get(task_id)
+                    if control is not None:
+                        control.request_cancel()
+            elif direction == "upload":
+                task_id = self._upload_task_id
+            else:
+                task_id = None
+            thread.quit()
+            running.append((thread, direction, task_id))
 
-        download_thread = self._download_thread
-        if download_thread is not None and download_thread.isRunning():
-            task_id = self._download_task_id
-            if task_id is not None:
-                control = self._download_controls.get(task_id)
-                if control is not None:
-                    control.request_cancel()
-            download_thread.quit()
-            if not download_thread.wait(THREAD_JOIN_TIMEOUT_MS):
-                self._abandon_thread_after_timeout(download_thread, "download", task_id)
-
-        upload_thread = self._upload_thread
-        if upload_thread is not None and upload_thread.isRunning():
-            upload_thread.quit()
-            if not upload_thread.wait(THREAD_JOIN_TIMEOUT_MS):
-                self._abandon_thread_after_timeout(
-                    upload_thread, "upload", self._upload_task_id
-                )
+        for thread, direction, task_id in running:
+            if thread.isRunning() and not thread.wait(THREAD_JOIN_TIMEOUT_MS):
+                self._abandon_thread_after_timeout(thread, direction, task_id)
 
         super().closeEvent(event)
 
@@ -2046,14 +2046,17 @@ class MainWindow(_MainWindowBase):
         self.logout_requested.emit()
 
     def refresh_current_directory(
-        self, after: Callable[[list[WopanItem]], None] | None = None
+        self, after: Callable[[list[WopanItem], bool], None] | None = None
     ) -> None:
         """Load the current directory from the application file browser service.
 
         ``after`` runs on the GUI thread with the fresh item list once the
         refresh lands (including a trailing refresh after a busy skip); it is
-        dropped when the refresh fails. Use it instead of reading ``_items``
-        right after this call — the refresh is asynchronous.
+        dropped when the refresh fails. The callback also receives
+        ``still_current`` — False when the user navigated away after the
+        refresh was requested, so directory-dependent checks must be skipped.
+        Use this instead of reading ``_items`` right after this call — the
+        refresh is asynchronous.
         """
         if self._file_browser is None:
             self._items = []
@@ -2061,7 +2064,7 @@ class MainWindow(_MainWindowBase):
             self._render_items()
             return
         if after is not None:
-            self._after_refresh = after
+            self._after_refresh = (self.current_directory_id(), after)
         if self._directory_thread is not None:
             # A refresh is in flight; remember the latest intent so navigation
             # during loading still lands on the current breadcrumb target.
@@ -2102,10 +2105,11 @@ class MainWindow(_MainWindowBase):
             len(self._items),
         )
         self._render_items()
-        after = self._after_refresh
+        entry = self._after_refresh
         self._after_refresh = None
-        if after is not None:
-            after(self._items)
+        if entry is not None:
+            requested_parent_id, after = entry
+            after(self._items, self.current_directory_id() == requested_parent_id)
 
     def _on_directory_refresh_failed(self, message: str) -> None:
         self._items = []
@@ -2190,13 +2194,17 @@ class MainWindow(_MainWindowBase):
         folder_name = self._create_folder_name or created_item.name
         LOGGER.info("main_window.create_folder.success item_id=%s", created_item.item_id)
         self.refresh_current_directory(
-            after=lambda items: self._report_create_visibility(created_item, folder_name)
+            after=lambda items, still_current: self._report_create_visibility(
+                created_item, folder_name, still_current
+            )
         )
 
     def _report_create_visibility(
-        self, created_item: WopanItem, folder_name: str
+        self, created_item: WopanItem, folder_name: str, still_current: bool
     ) -> None:
-        if not any(item.item_id == created_item.item_id for item in self._items):
+        if still_current and not any(
+            item.item_id == created_item.item_id for item in self._items
+        ):
             LOGGER.warning(
                 "main_window.create_folder.not_visible_after_refresh item_id=%s parent_id=%s",
                 created_item.item_id,
@@ -2877,11 +2885,13 @@ class MainWindow(_MainWindowBase):
                 total_bytes=total,
             )
         self.refresh_current_directory(
-            after=lambda items: self._report_upload_visibility(item)
+            after=lambda items, still_current: self._report_upload_visibility(
+                item, still_current
+            )
         )
 
-    def _report_upload_visibility(self, item: WopanItem) -> None:
-        visible = any(
+    def _report_upload_visibility(self, item: WopanItem, still_current: bool) -> None:
+        visible = not still_current or any(
             displayed_item.item_id == item.item_id
             or (item.download_id is not None and displayed_item.download_id == item.download_id)
             or displayed_item.name == item.name

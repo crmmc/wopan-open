@@ -490,6 +490,57 @@ def test_controller_complete_login_ignores_duplicate_in_flight(qapp: object) -> 
     harness.controller._login_thread = None
 
 
+def test_controller_restore_updates_main_window_on_gui_thread(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui_thread_id = threading.get_ident()
+    worker_thread_ids: list[int] = []
+    handler_thread_ids: list[int] = []
+
+    class _ThreadCapturingCoordinator(FakeLoginCoordinator):
+        def restore_last_session(self) -> RestoredWebLogin | None:
+            worker_thread_ids.append(threading.get_ident())
+            return super().restore_last_session()
+
+    class _ThreadCapturingWindow(MainWindow):
+        def set_auth_session(self, session: AuthSession) -> None:
+            handler_thread_ids.append(threading.get_ident())
+            super().set_auth_session(session)
+
+    coordinator = _ThreadCapturingCoordinator(
+        restored_login=RestoredWebLogin(
+            session=AuthSession(account_id="user-1", display_name="User One"),
+            cookie_header="WoCloud-Web-Token=%2212345678-1234-1234-1234-123456789abc%22",
+        )
+    )
+    dependencies = AppDependencies(
+        credential_store=CredentialStore(),
+        web_login_coordinator=coordinator,  # type: ignore[arg-type]
+        file_browser_factory=lambda _cookie, _settings: FakeFileBrowser(),  # type: ignore[arg-type]
+        settings=AppSettings(),
+    )
+    window = _ThreadCapturingWindow()
+    controller = ApplicationController(
+        dependencies,
+        window,
+        FakeLoginWindow,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(controller_module, "QThread", RealQThread)
+    monkeypatch.setattr(
+        controller_module.ControllerOperationWorker,
+        "moveToThread",
+        QObject.moveToThread,
+    )
+
+    controller.start()
+
+    assert _wait_until(qapp, lambda: controller._restore_thread is None)
+    assert worker_thread_ids
+    assert worker_thread_ids[0] != gui_thread_id
+    assert handler_thread_ids == [gui_thread_id]
+
+
 def test_controller_complete_login_updates_main_window_on_gui_thread(
     qapp: QApplication,
     monkeypatch: pytest.MonkeyPatch,
