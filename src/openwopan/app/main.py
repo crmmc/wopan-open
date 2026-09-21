@@ -14,7 +14,7 @@ from qfluentwidgets import FluentTranslator, Theme, setTheme
 
 from openwopan.app.bootstrap import AppDependencies, build_dependencies
 from openwopan.app.controller import ApplicationController, LoginWindowBoundary
-from openwopan.app.logging_config import configure_logging
+from openwopan.app.logging_config import configure_logging, install_crash_reporting
 from openwopan.storage.settings import ensure_app_settings_file, load_app_settings
 from openwopan.ui.login_window import LoginWindow
 from openwopan.ui.main_window import MainWindow
@@ -39,11 +39,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings = load_app_settings()
     settings_path = ensure_app_settings_file(settings)
     log_path = configure_logging(settings)
+    crash_log_path = install_crash_reporting(log_path)
     LOGGER.info(
-        "app.start log_level=%s settings_path=%s log_path=%s",
+        "app.start log_level=%s settings_path=%s log_path=%s crash_log_path=%s",
         settings.log_level,
         settings_path,
         log_path,
+        crash_log_path,
     )
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
