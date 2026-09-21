@@ -75,3 +75,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         QTimer.singleShot(0, controller.start)
 
     return int(app.exec())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
