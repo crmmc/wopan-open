@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QItemSelectionModel, QObject, QPoint, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -86,6 +86,7 @@ TRANSFER_COL_STATUS = 4
 TRANSFER_COL_ACTION = 5
 TRANSFER_ACTION_COLUMN_WIDTH = 156
 TRANSFER_ACTION_BUTTON_SIZE = (32, 24)
+THREAD_JOIN_TIMEOUT_MS = 3000
 UPLOAD_STATUS_FILTERS = ("全部", "等待中", "上传中", "已完成", "失败")
 DOWNLOAD_STATUS_FILTERS = (
     "全部",
@@ -108,6 +109,9 @@ FRAME_STYLE = (
     "}"
 )
 LOGGER = logging.getLogger(__name__)
+# Keep abandoned (unjoinable) transfer threads alive: dropping the last Python
+# reference would delete a still-running QThread and abort the process.
+_THREAD_KEEP_ALIVE: set[QThread] = set()
 FIF = FluentIcon
 
 
@@ -259,13 +263,13 @@ class MoveTargetDialog(QDialog):
 class DownloadWorker(QObject):
     """Background worker for one ordinary file download."""
 
-    progress = Signal(int, object)
-    status_changed = Signal(str)
-    connections_changed = Signal(int, int)
-    succeeded = Signal(str, str)
-    stopped = Signal(str)
-    failed = Signal(str)
-    login_required = Signal(str)
+    progress = Signal(object, object, str)
+    status_changed = Signal(str, str)
+    connections_changed = Signal(int, int, str)
+    succeeded = Signal(str, str, str)
+    stopped = Signal(str, str)
+    failed = Signal(str, str)
+    login_required = Signal(str, str)
 
     def __init__(
         self,
@@ -289,9 +293,13 @@ class DownloadWorker(QObject):
                 result = self._file_browser.download_file(
                     self._item,
                     self._local_path,
-                    self.progress.emit,
-                    status_callback=self.status_changed.emit,
-                    connection_callback=self.connections_changed.emit,
+                    lambda bytes_done, total_bytes: self.progress.emit(
+                        bytes_done, total_bytes, self._task_id
+                    ),
+                    status_callback=lambda status: self.status_changed.emit(status, self._task_id),
+                    connection_callback=lambda active, maximum: self.connections_changed.emit(
+                        active, maximum, self._task_id
+                    ),
                     control=self._control,
                     task_id=self._task_id,
                 )
@@ -301,48 +309,58 @@ class DownloadWorker(QObject):
                 result = self._file_browser.download_file(
                     self._item,
                     self._local_path,
-                    self.progress.emit,
+                    lambda bytes_done, total_bytes: self.progress.emit(
+                        bytes_done, total_bytes, self._task_id
+                    ),
                 )
         except FileBrowserLoginRequiredError as exc:
-            self.login_required.emit(str(exc))
+            self.login_required.emit(str(exc), self._task_id)
         except FileBrowserError as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(str(exc), self._task_id)
+        except Exception as exc:
+            LOGGER.exception("main_window.download.unexpected_error")
+            self.failed.emit(str(exc), self._task_id)
         else:
             status = getattr(result, "status", "已完成")
             if status == "已完成":
-                self.succeeded.emit(self._item.name, str(self._local_path))
+                self.succeeded.emit(self._item.name, str(self._local_path), self._task_id)
                 return
-            self.stopped.emit(str(status))
+            self.stopped.emit(str(status), self._task_id)
 
 
 class UploadWorker(QObject):
     """Background worker for one ordinary file upload."""
 
-    succeeded = Signal(object)
-    failed = Signal(str)
-    login_required = Signal(str)
+    succeeded = Signal(object, str)
+    failed = Signal(str, str)
+    login_required = Signal(str, str)
 
     def __init__(
         self,
         file_browser: FileBrowserBackend,
         parent_id: str,
         local_path: Path,
+        task_id: str,
     ) -> None:
         super().__init__()
         self._file_browser = file_browser
         self._parent_id = parent_id
         self._local_path = local_path
+        self._task_id = task_id
 
     def run(self) -> None:
         """Run the blocking upload in a worker thread."""
         try:
             item = self._file_browser.upload_file(self._parent_id, self._local_path)
         except FileBrowserLoginRequiredError as exc:
-            self.login_required.emit(str(exc))
+            self.login_required.emit(str(exc), self._task_id)
         except FileBrowserError as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(str(exc), self._task_id)
+        except Exception as exc:
+            LOGGER.exception("main_window.upload.unexpected_error")
+            self.failed.emit(str(exc), self._task_id)
         else:
-            self.succeeded.emit(item)
+            self.succeeded.emit(item, self._task_id)
 
 
 class PlaceholderInterface(QWidget):
@@ -1661,6 +1679,47 @@ class MainWindow(_MainWindowBase):
 
         self._render_items()
 
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Stop active transfers before the window destroys their threads."""
+        download_thread = self._download_thread
+        if download_thread is not None and download_thread.isRunning():
+            task_id = self._download_task_id
+            if task_id is not None:
+                control = self._download_controls.get(task_id)
+                if control is not None:
+                    control.request_cancel()
+            download_thread.quit()
+            if not download_thread.wait(THREAD_JOIN_TIMEOUT_MS):
+                self._abandon_thread_after_timeout(download_thread, "download", task_id)
+
+        upload_thread = self._upload_thread
+        if upload_thread is not None and upload_thread.isRunning():
+            upload_thread.quit()
+            if not upload_thread.wait(THREAD_JOIN_TIMEOUT_MS):
+                self._abandon_thread_after_timeout(
+                    upload_thread, "upload", self._upload_task_id
+                )
+
+        super().closeEvent(event)
+
+    @staticmethod
+    def _abandon_thread_after_timeout(
+        thread: QThread, direction: str, task_id: str | None
+    ) -> None:
+        # Detach so window destruction cannot delete a running QThread (qFatal),
+        # and keep a reference so Python GC cannot either. No terminate(): it
+        # can kill the thread mid-bytecode holding the GIL and deadlock.
+        thread.setParent(None)
+        _THREAD_KEEP_ALIVE.add(thread)
+        thread.finished.connect(lambda kept=thread: _THREAD_KEEP_ALIVE.discard(kept))
+        LOGGER.warning(
+            "main_window.close.thread_abandoned direction=%s task_id=%s "
+            "join_timeout_ms=%s",
+            direction,
+            task_id,
+            THREAD_JOIN_TIMEOUT_MS,
+        )
+
     def _add_sub_interface(
         self,
         widget: QWidget,
@@ -2284,44 +2343,12 @@ class MainWindow(_MainWindowBase):
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_download_progress)
-        worker.status_changed.connect(
-            lambda status, record_id=task_id: self._on_download_status_changed(
-                status,
-                task_id=record_id,
-            )
-        )
-        worker.connections_changed.connect(
-            lambda active, maximum, record_id=task_id: self._on_download_connections_changed(
-                active,
-                maximum,
-                task_id=record_id,
-            )
-        )
-        worker.succeeded.connect(
-            lambda item_name, path, record_id=task_id: self._on_download_succeeded(
-                item_name,
-                path,
-                task_id=record_id,
-            )
-        )
-        worker.stopped.connect(
-            lambda status, record_id=task_id: self._on_download_stopped(
-                status,
-                task_id=record_id,
-            )
-        )
-        worker.failed.connect(
-            lambda message, record_id=task_id: self._on_download_failed(
-                message,
-                task_id=record_id,
-            )
-        )
-        worker.login_required.connect(
-            lambda message, record_id=task_id: self._on_download_login_required(
-                message,
-                task_id=record_id,
-            )
-        )
+        worker.status_changed.connect(self._on_download_status_changed)
+        worker.connections_changed.connect(self._on_download_connections_changed)
+        worker.succeeded.connect(self._on_download_succeeded)
+        worker.stopped.connect(self._on_download_stopped)
+        worker.failed.connect(self._on_download_failed)
+        worker.login_required.connect(self._on_download_login_required)
         worker.succeeded.connect(thread.quit)
         worker.stopped.connect(thread.quit)
         worker.failed.connect(thread.quit)
@@ -2380,28 +2407,13 @@ class MainWindow(_MainWindowBase):
             return
 
         thread = QThread(self)
-        worker = UploadWorker(self._file_browser, parent_id, local_path)
+        worker = UploadWorker(self._file_browser, parent_id, local_path, task_id)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
-        worker.succeeded.connect(
-            lambda item, record_id=task_id: self._on_upload_succeeded(
-                item,
-                task_id=record_id,
-            )
-        )
-        worker.failed.connect(
-            lambda message, record_id=task_id: self._on_upload_failed(
-                message,
-                task_id=record_id,
-            )
-        )
-        worker.login_required.connect(
-            lambda message, record_id=task_id: self._on_upload_login_required(
-                message,
-                task_id=record_id,
-            )
-        )
+        worker.succeeded.connect(self._on_upload_succeeded)
+        worker.failed.connect(self._on_upload_failed)
+        worker.login_required.connect(self._on_upload_login_required)
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
@@ -2422,7 +2434,6 @@ class MainWindow(_MainWindowBase):
         self,
         bytes_read: int,
         total_bytes: object,
-        *,
         task_id: str | None = None,
     ) -> None:
         total = total_bytes if isinstance(total_bytes, int) and total_bytes > 0 else None
@@ -2431,7 +2442,6 @@ class MainWindow(_MainWindowBase):
             self.transfer_interface.update_record(
                 "download",
                 record_id,
-                status="下载中",
                 bytes_done=bytes_read,
                 total_bytes=total,
             )
@@ -2440,7 +2450,7 @@ class MainWindow(_MainWindowBase):
             return
         self._set_status(f"正在下载：{_format_bytes(bytes_read)} / {_format_bytes(total)}")
 
-    def _on_download_status_changed(self, status: str, *, task_id: str | None = None) -> None:
+    def _on_download_status_changed(self, status: str, task_id: str | None = None) -> None:
         record_id = task_id or self._download_task_id
         if record_id is None:
             return
@@ -2457,7 +2467,6 @@ class MainWindow(_MainWindowBase):
         self,
         active_connections: int,
         max_connections: int,
-        *,
         task_id: str | None = None,
     ) -> None:
         record_id = task_id or self._download_task_id
@@ -2474,7 +2483,6 @@ class MainWindow(_MainWindowBase):
         self,
         item_name: str,
         local_path: str,
-        *,
         task_id: str | None = None,
     ) -> None:
         path = Path(local_path)
@@ -2497,13 +2505,13 @@ class MainWindow(_MainWindowBase):
         self._set_status(f"下载完成：{path.name}")
         InfoBar.success(title="下载完成", content=path.name, parent=self)
 
-    def _on_download_failed(self, message: str, *, task_id: str | None = None) -> None:
+    def _on_download_failed(self, message: str, task_id: str | None = None) -> None:
         LOGGER.warning("main_window.download.failed error=%s", message)
         self._mark_transfer_failed("download", task_id or self._download_task_id, message)
         self._set_status(f"下载失败：{message}")
         InfoBar.error(title="下载失败", content=message, parent=self)
 
-    def _on_download_stopped(self, status: str, *, task_id: str | None = None) -> None:
+    def _on_download_stopped(self, status: str, task_id: str | None = None) -> None:
         record_id = task_id or self._download_task_id
         if record_id is not None:
             self.transfer_interface.update_record(
@@ -2515,7 +2523,7 @@ class MainWindow(_MainWindowBase):
             )
         self._set_status(f"下载状态：{status}")
 
-    def _on_download_login_required(self, message: str, *, task_id: str | None = None) -> None:
+    def _on_download_login_required(self, message: str, task_id: str | None = None) -> None:
         self._mark_transfer_failed("download", task_id or self._download_task_id, message)
         self._show_login_required_error(message)
 
@@ -2528,7 +2536,7 @@ class MainWindow(_MainWindowBase):
         self._download_task_id = None
         self.update_operation_controls()
 
-    def _on_upload_succeeded(self, item: object, *, task_id: str | None = None) -> None:
+    def _on_upload_succeeded(self, item: object, task_id: str | None = None) -> None:
         if not isinstance(item, WopanItem):
             LOGGER.warning("main_window.upload.invalid_success_payload")
             self._on_upload_failed("上传结果无效", task_id=task_id)
@@ -2561,13 +2569,13 @@ class MainWindow(_MainWindowBase):
             return
         self._set_status(f"已上传「{item.name}」，但刷新后未在当前目录看到，请稍后再刷新")
 
-    def _on_upload_failed(self, message: str, *, task_id: str | None = None) -> None:
+    def _on_upload_failed(self, message: str, task_id: str | None = None) -> None:
         LOGGER.warning("main_window.upload.failed error=%s", message)
         self._mark_transfer_failed("upload", task_id or self._upload_task_id, message)
         self._set_status(f"上传失败：{message}")
         InfoBar.error(title="上传失败", content=message, parent=self)
 
-    def _on_upload_login_required(self, message: str, *, task_id: str | None = None) -> None:
+    def _on_upload_login_required(self, message: str, task_id: str | None = None) -> None:
         self._mark_transfer_failed("upload", task_id or self._upload_task_id, message)
         self._show_login_required_error(message)
 
@@ -2633,6 +2641,10 @@ class MainWindow(_MainWindowBase):
                 for task_id in normalized_ids:
                     remove_download_record(task_id)
         self.transfer_interface.remove_records(direction, normalized_ids)
+        if direction == "download":
+            for task_id in normalized_ids:
+                self._download_items_by_task.pop(task_id, None)
+                self._download_controls.pop(task_id, None)
 
     def _pause_download_task(self, task_id: str) -> None:
         control = self._download_controls.get(task_id)

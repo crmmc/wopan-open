@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from PySide6.QtCore import QPoint, Qt, QThread
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QDialog, QTreeWidgetItem, QWidget
 
 import openwopan.ui.main_window as main_window_module
@@ -61,9 +67,8 @@ class WorkerFileBrowser:
     """File browser double supporting the callback-style download API."""
 
     def __init__(self, download_error: Exception | None = None) -> None:
-        # emit_progress=False avoids the production mixed direct/queued signal
-        # ordering between progress (queued bound slot) and terminal signals
-        # (direct lambdas) when driven from a real QThread in tests.
+        # emit_progress=False keeps callback-order assertions deterministic;
+        # progress is only emitted when the test opts in.
         self.emit_progress = False
         self.requested_parent_ids: list[str] = []
         self.uploaded_files: list[tuple[str, Path]] = []
@@ -212,10 +217,9 @@ def _wait_until(qapp: QApplication, predicate, timeout: float = 5.0) -> bool:
 class SyncQThread(QThread):
     """QThread stand-in that runs the worker synchronously on the main thread.
 
-    The production code connects worker signals to plain lambdas, which Qt
-    delivers in the emitting thread; with a real QThread that would render
-    widgets off the GUI thread and crash offscreen tests. Running the same
-    wiring synchronously keeps every connection line exercised deterministically.
+    Real cross-thread delivery is covered by the gui-thread regression tests;
+    this stand-in keeps the remaining lifecycle tests synchronous and
+    deterministic without spawning real threads.
     """
 
     def start(self, *args: object, **kwargs: object) -> None:
@@ -223,6 +227,71 @@ class SyncQThread(QThread):
 
     def quit(self) -> None:
         self.finished.emit()
+
+
+class _CloseBlockingDownloadBrowser(WorkerFileBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.cancelled = threading.Event()
+
+    def download_file(
+        self,
+        item: WopanItem,
+        local_path: Path,
+        progress_callback: object | None = None,
+        status_callback: object | None = None,
+        connection_callback: object | None = None,
+        control: object | None = None,
+        task_id: str | None = None,
+    ) -> object:
+        assert isinstance(control, DownloadTaskControl)
+        self.started.set()
+        while not self.release.wait(0.01):
+            status = control.stop_result()
+            if status is not None:
+                self.cancelled.set()
+                return SimpleNamespace(status=status, task_id=task_id, local_path=local_path)
+        return SimpleNamespace(status="已完成", task_id=task_id, local_path=local_path)
+
+
+class _FakeFinishedSignal:
+    """Minimal signal stand-in recording connected slots."""
+
+    def __init__(self) -> None:
+        self.slots: list[Callable[[], None]] = []
+
+    def connect(self, slot: Callable[[], None]) -> None:
+        self.slots.append(slot)
+
+    def emit(self) -> None:
+        for slot in self.slots:
+            slot()
+
+
+class _RefusingThread:
+    """Thread stub that ignores quit() and never joins within the timeout."""
+
+    def __init__(self) -> None:
+        self.quit_called = False
+        self.set_parent_values: list[object | None] = []
+        self.wait_timeouts: list[int] = []
+        self.finished = _FakeFinishedSignal()
+
+    def isRunning(self) -> bool:
+        return True
+
+    def quit(self) -> None:
+        self.quit_called = True
+
+    def setParent(self, parent: object | None) -> None:
+        self.set_parent_values.append(parent)
+
+    def wait(self, timeout: int) -> bool:
+        self.wait_timeouts.append(timeout)
+        return False
+
 
 
 @pytest.fixture
@@ -252,20 +321,28 @@ class _SignalCollector:
             "failed": [],
             "login_required": [],
         }
-        worker.progress.connect(lambda done, total: self.events["progress"].append((done, total)))
+        worker.progress.connect(
+            lambda done, total, task_id: self.events["progress"].append((done, total, task_id))
+        )
         worker.status_changed.connect(
-            lambda status: self.events["status_changed"].append((status,))
+            lambda status, task_id: self.events["status_changed"].append((status, task_id))
         )
         worker.connections_changed.connect(
-            lambda active, maximum: self.events["connections_changed"].append((active, maximum))
+            lambda active, maximum, task_id: self.events["connections_changed"].append(
+                (active, maximum, task_id)
+            )
         )
         worker.succeeded.connect(
-            lambda name, path: self.events["succeeded"].append((name, path))
+            lambda name, path, task_id: self.events["succeeded"].append((name, path, task_id))
         )
-        worker.stopped.connect(lambda status: self.events["stopped"].append((status,)))
-        worker.failed.connect(lambda message: self.events["failed"].append((message,)))
+        worker.stopped.connect(
+            lambda status, task_id: self.events["stopped"].append((status, task_id))
+        )
+        worker.failed.connect(
+            lambda message, task_id: self.events["failed"].append((message, task_id))
+        )
         worker.login_required.connect(
-            lambda message: self.events["login_required"].append((message,))
+            lambda message, task_id: self.events["login_required"].append((message, task_id))
         )
 
 
@@ -276,10 +353,14 @@ class _UploadCollector:
             "failed": [],
             "login_required": [],
         }
-        worker.succeeded.connect(lambda item: self.events["succeeded"].append((item,)))
-        worker.failed.connect(lambda message: self.events["failed"].append((message,)))
+        worker.succeeded.connect(
+            lambda item, task_id: self.events["succeeded"].append((item, task_id))
+        )
+        worker.failed.connect(
+            lambda message, task_id: self.events["failed"].append((message, task_id))
+        )
         worker.login_required.connect(
-            lambda message: self.events["login_required"].append((message,))
+            lambda message, task_id: self.events["login_required"].append((message, task_id))
         )
 
 
@@ -330,11 +411,11 @@ def test_download_worker_emits_all_callbacks_and_success(
 
     worker.run()
 
-    assert collector.events["progress"] == [(512, 1024)]
-    assert collector.events["status_changed"] == [("下载中",)]
-    assert collector.events["connections_changed"] == [(2, 4)]
+    assert collector.events["progress"] == [(512, 1024, "download-1")]
+    assert collector.events["status_changed"] == [("下载中", "download-1")]
+    assert collector.events["connections_changed"] == [(2, 4, "download-1")]
     assert collector.events["succeeded"] == [
-        ("report.txt", str(tmp_path / "report.txt"))
+        ("report.txt", str(tmp_path / "report.txt"), "download-1")
     ]
     assert collector.events["stopped"] == []
     assert collector.events["failed"] == []
@@ -351,35 +432,35 @@ def test_download_worker_falls_back_to_legacy_signature(
 
     assert browser.download_calls == [{"legacy": True, "local_path": tmp_path / "report.txt"}]
     assert collector.events["succeeded"] == [
-        ("report.txt", str(tmp_path / "report.txt"))
+        ("report.txt", str(tmp_path / "report.txt"), "download-1")
     ]
 
 
-def test_download_worker_reraises_unrelated_type_error(
+def test_download_worker_reports_unrelated_type_error(
     qapp: QApplication, tmp_path: Path
 ) -> None:
     worker = _make_download_worker(UnrelatedTypeErrorFileBrowser(), tmp_path)
     collector = _SignalCollector(worker)
 
-    with pytest.raises(TypeError):
-        worker.run()
+    worker.run()
 
+    assert collector.events["failed"] == [("bad operand type", "download-1")]
     assert collector.events["succeeded"] == []
 
 
 @pytest.mark.parametrize(
     ("browser_factory", "expected_signal", "expected_payload"),
     [
-        (lambda: _StoppedResultBrowser(), "stopped", ("已暂停",)),
+        (lambda: _StoppedResultBrowser(), "stopped", ("已暂停", "download-1")),
         (
             lambda: _RaisingBrowser(FileBrowserError("network down")),
             "failed",
-            ("network down",),
+            ("network down", "download-1"),
         ),
         (
             lambda: _RaisingBrowser(FileBrowserLoginRequiredError("登录已过期，请重新登录")),
             "login_required",
-            ("登录已过期，请重新登录",),
+            ("登录已过期，请重新登录", "download-1"),
         ),
     ],
 )
@@ -399,6 +480,29 @@ def test_download_worker_maps_stopped_failed_and_login_required(
     assert collector.events["succeeded"] == []
 
 
+def test_download_worker_reports_unexpected_error_without_raising(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    worker = _make_download_worker(_RaisingBrowser(RuntimeError("disk full")), tmp_path)
+    collector = _SignalCollector(worker)
+
+    worker.run()
+
+    assert collector.events["failed"] == [("disk full", "download-1")]
+    assert collector.events["succeeded"] == []
+
+
+def test_download_progress_accepts_large_byte_count(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    worker = _make_download_worker(WorkerFileBrowser(), tmp_path)
+    collector = _SignalCollector(worker)
+
+    worker.progress.emit(3_000_000_000, None, "download-1")
+
+    assert collector.events["progress"] == [(3_000_000_000, None, "download-1")]
+
+
 def test_download_worker_defaults_to_completed_without_status_object(
     qapp: QApplication, tmp_path: Path
 ) -> None:
@@ -408,31 +512,50 @@ def test_download_worker_defaults_to_completed_without_status_object(
     worker.run()
 
     assert collector.events["succeeded"] == [
-        ("report.txt", str(tmp_path / "report.txt"))
+        ("report.txt", str(tmp_path / "report.txt"), "download-1")
     ]
+
+
+def test_upload_worker_reports_unexpected_error_without_raising(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    worker = UploadWorker(
+        _RaisingBrowser(RuntimeError("disk full")),
+        ROOT_DIRECTORY_ID,
+        tmp_path / "u.txt",
+        "upload-1",
+    )  # type: ignore[arg-type]
+    collector = _UploadCollector(worker)
+
+    worker.run()
+
+    assert collector.events["failed"] == [("disk full", "upload-1")]
+    assert collector.events["succeeded"] == []
 
 
 def test_upload_worker_emits_success(qapp: QApplication, tmp_path: Path) -> None:
     browser = WorkerFileBrowser()
     local_path = tmp_path / "upload.txt"
     local_path.write_text("content")
-    worker = UploadWorker(browser, ROOT_DIRECTORY_ID, local_path)  # type: ignore[arg-type]
+    worker = UploadWorker(browser, ROOT_DIRECTORY_ID, local_path, "upload-1")  # type: ignore[arg-type]
     collector = _UploadCollector(worker)
 
     worker.run()
 
     assert len(collector.events["succeeded"]) == 1
-    assert collector.events["succeeded"][0][0].name == "upload.txt"
+    item, task_id = collector.events["succeeded"][0]
+    assert item.name == "upload.txt"
+    assert task_id == "upload-1"
 
 
 @pytest.mark.parametrize(
     ("error", "expected_signal", "expected_payload"),
     [
-        (FileBrowserError("upload failed"), "failed", ("upload failed",)),
+        (FileBrowserError("upload failed"), "failed", ("upload failed", "upload-1")),
         (
             FileBrowserLoginRequiredError("登录已过期，请重新登录"),
             "login_required",
-            ("登录已过期，请重新登录",),
+            ("登录已过期，请重新登录", "upload-1"),
         ),
     ],
 )
@@ -443,7 +566,9 @@ def test_upload_worker_maps_failed_and_login_required(
     expected_signal: str,
     expected_payload: tuple,
 ) -> None:
-    worker = UploadWorker(_RaisingBrowser(error), ROOT_DIRECTORY_ID, tmp_path / "u.txt")  # type: ignore[arg-type]
+    worker = UploadWorker(
+        _RaisingBrowser(error), ROOT_DIRECTORY_ID, tmp_path / "u.txt", "upload-1"
+    )  # type: ignore[arg-type]
     collector = _UploadCollector(worker)
 
     worker.run()
@@ -455,6 +580,157 @@ def test_upload_worker_maps_failed_and_login_required(
 # ---------------------------------------------------------------------------
 # Background download / upload task lifecycle
 # ---------------------------------------------------------------------------
+
+
+def test_close_window_cancels_and_joins_running_download(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    browser = _CloseBlockingDownloadBrowser()
+    window = MainWindow(browser)
+    task_id = "download-close"
+    window._start_download_task(_file_item(), tmp_path / "report.txt", task_id)
+    thread = window._download_thread
+    assert thread is not None
+
+    try:
+        assert _wait_until(qapp, browser.started.is_set)
+
+        window.close()
+
+        assert browser.cancelled.is_set()
+        assert thread.wait(500)
+        assert not thread.isRunning()
+    finally:
+        browser.release.set()
+        thread.quit()
+        thread.wait(3000)
+
+
+def test_close_window_without_active_transfer_is_noop(qapp: QApplication) -> None:
+    window = MainWindow()
+    event = QCloseEvent()
+
+    window.closeEvent(event)
+
+    assert event.isAccepted()
+    assert window._download_thread is None
+    assert window._upload_thread is None
+
+
+@pytest.mark.parametrize("direction", ["download", "upload"])
+def test_close_window_logs_timeout_and_accepts_close(
+    qapp: QApplication,
+    caplog: pytest.LogCaptureFixture,
+    direction: str,
+) -> None:
+    window = MainWindow()
+    thread = _RefusingThread()
+    task_id = f"{direction}-close"
+    control: DownloadTaskControl | None = None
+    if direction == "download":
+        window._download_thread = thread  # type: ignore[assignment]
+        window._download_task_id = task_id
+        control = DownloadTaskControl()
+        window._download_controls[task_id] = control
+    else:
+        window._upload_thread = thread  # type: ignore[assignment]
+        window._upload_task_id = task_id
+
+    event = QCloseEvent()
+    with caplog.at_level("WARNING", logger=main_window_module.LOGGER.name):
+        window.closeEvent(event)
+
+    assert event.isAccepted()
+    assert thread.quit_called
+    assert thread.set_parent_values == [None]
+    assert thread.wait_timeouts == [main_window_module.THREAD_JOIN_TIMEOUT_MS]
+    assert "main_window.close.thread_abandoned" in caplog.text
+    assert f"direction={direction}" in caplog.text
+    if direction == "download":
+        assert control is not None
+        assert control.stop_result() == "cancelled"
+
+
+def test_abandoned_thread_leaves_keep_alive_when_finished(qapp: QApplication) -> None:
+    window = MainWindow()
+    thread = _RefusingThread()
+    window._download_thread = thread  # type: ignore[assignment]
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert event.isAccepted()
+    assert thread in main_window_module._THREAD_KEEP_ALIVE
+
+    thread.finished.emit()
+
+    assert thread not in main_window_module._THREAD_KEEP_ALIVE
+
+
+def test_close_window_stuck_thread_exits_subprocess() -> None:
+    # The child thread ignores quit() like a stuck network read, but exits via
+    # a cooperative flag once the window is gone. Old code (no detach) aborted
+    # with qFatal while destroying the still-running parented thread; the fix
+    # must let the window close and the process exit with status 0.
+    script = r'''
+import os
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+from PySide6.QtCore import QThread, QTimer
+from PySide6.QtWidgets import QApplication
+from openwopan.ui.main_window import MainWindow
+
+
+class StuckThread(QThread):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.stop_requested = False
+
+    def run(self):
+        while not self.stop_requested:
+            self.msleep(100)
+
+
+app = QApplication([])
+window = MainWindow()
+thread = StuckThread(window)
+window._download_thread = thread
+thread.start()
+
+
+def shutdown():
+    if not thread.isRunning():
+        raise RuntimeError("stuck thread did not start")
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+    print("WINDOW_DESTROYED_WITH_RUNNING_THREAD", flush=True)
+    thread.stop_requested = True
+    if not thread.wait(5000):
+        raise RuntimeError("stuck thread did not stop cooperatively")
+    print("SUBPROCESS_CLOSE_OK", flush=True)
+    app.quit()
+
+
+QTimer.singleShot(0, shutdown)
+raise SystemExit(app.exec())
+'''
+    env = os.environ.copy()
+    src_path = Path(__file__).resolve().parents[1] / "src"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(src_path), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "SUBPROCESS_CLOSE_OK" in result.stdout
 
 
 def test_background_download_updates_records_and_clears_task(
@@ -490,6 +766,21 @@ def test_background_download_failure_marks_record_failed(
     assert records[0].status == "失败"
     assert records[0].error == "network down"
     assert window.status_message() == "下载失败：network down"
+
+
+def test_background_download_unexpected_failure_clears_real_thread(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    browser = WorkerFileBrowser(download_error=RuntimeError("disk full"))
+    window = MainWindow(browser)
+
+    window.refresh_current_directory()
+    window.download_displayed_item(1, tmp_path / "report.txt")
+
+    assert _wait_until(qapp, lambda: window._download_thread is None)
+    assert window.transfer_interface.download_records[0].status == "失败"
+    assert window.transfer_interface.download_records[0].error == "disk full"
+    assert window.status_message() == "下载失败：disk full"
 
 
 def test_background_download_login_required_emits_signal(
@@ -553,6 +844,54 @@ def test_background_upload_failure_marks_record_failed(
     assert window._upload_thread is None
     assert window.transfer_interface.upload_records[0].status == "失败"
     assert window.status_message() == "上传失败：upload failed"
+
+
+def _record_update_thread_ids(window: MainWindow) -> tuple[list[int], int]:
+    """Patch the transfer table updater to record which thread executed it.
+
+    GUI updates queued from a real worker thread must run on the GUI thread;
+    direct lambda connections execute on the emitting thread and crash Qt.
+    """
+    gui_thread_id = threading.get_ident()
+    observed: list[int] = []
+    original_update = window.transfer_interface.update_record
+
+    def recording_update(direction: str, task_id: str, **kwargs: object) -> None:
+        observed.append(threading.get_ident())
+        original_update(direction, task_id, **kwargs)  # type: ignore[arg-type]
+
+    window.transfer_interface.update_record = recording_update  # type: ignore[assignment, method-assign]
+    return observed, gui_thread_id
+
+
+def test_background_upload_updates_ui_on_gui_thread(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "upload.txt"
+    local_path.write_text("content")
+    window.refresh_current_directory()
+    observed, gui_thread_id = _record_update_thread_ids(window)
+
+    window.upload_file_to_current_directory(local_path)
+
+    assert _wait_until(qapp, lambda: window._upload_thread is None and len(observed) >= 2)
+    assert observed == [gui_thread_id] * len(observed)
+
+
+def test_background_download_updates_ui_on_gui_thread(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    observed, gui_thread_id = _record_update_thread_ids(window)
+
+    window.download_displayed_item(1, tmp_path / "report.txt")
+
+    assert _wait_until(qapp, lambda: window._download_thread is None and len(observed) >= 2)
+    assert observed == [gui_thread_id] * len(observed)
 
 
 def test_start_tasks_reject_missing_browser(qapp: QApplication, tmp_path: Path) -> None:
@@ -740,7 +1079,9 @@ def _make_session():
     return AuthSession(account_id="13800138000", display_name="User")
 
 
-def test_remove_transfer_records_delegates_to_browser_and_ui(qapp: QApplication) -> None:
+def test_remove_transfer_records_delegates_to_browser_and_ui(
+    qapp: QApplication, sync_threads: None
+) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -748,11 +1089,33 @@ def test_remove_transfer_records_delegates_to_browser_and_ui(qapp: QApplication)
         window, "download-1", target_path=Path("/tmp/report.txt"), item=_file_item()
     )
 
+    window.transfer_interface.add_download_record(
+        TransferRecord(
+            task_id="download-2",
+            direction="download",
+            name="other.txt",
+            size=2048,
+            target_path=Path("/tmp/other.txt"),
+            status="已暂停",
+        )
+    )
+    window._download_items_by_task["download-2"] = _file_item("file-2", "other.txt")
+    window._download_controls["download-2"] = DownloadTaskControl()
+
     window.transfer_interface.remove_records_requested.emit("download", {"download-1"})
     window.transfer_interface.remove_records_requested.emit("upload", ["not-a-set"])
 
     assert browser.removed_download_records == ["download-1"]
-    assert window.transfer_interface.download_records == []
+    assert window.transfer_interface.download_records[0].task_id == "download-2"
+    assert "download-1" not in window._download_items_by_task
+    assert "download-2" in window._download_items_by_task
+    assert "download-1" not in window._download_controls
+    assert "download-2" in window._download_controls
+
+    window._resume_download_task("download-2")
+
+    assert window.transfer_interface.download_records[0].status == "已完成"
+    assert browser.download_calls[-1]["task_id"] == "download-2"
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +1132,14 @@ def test_download_progress_handler_formats_known_and_unknown_totals(
     )
 
     window._on_download_progress(512, 1024, task_id="download-1")
-    assert window.status_message() == "正在下载：512 B / 1.0 KB"
+    record = window.transfer_interface._find_record("download", "download-1")
+    assert record is not None
+    assert record.status == "下载中"
+
+    record.status = "已暂停"
+    window._on_download_progress(768, 1024, "download-1")
+    assert record.status == "已暂停"
+    assert record.bytes_done == 768
 
     window._on_download_progress(768, None, task_id="download-1")
     assert window.status_message() == "正在下载：768 B"
