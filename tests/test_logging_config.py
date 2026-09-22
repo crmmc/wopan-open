@@ -4,6 +4,7 @@ import faulthandler
 import logging
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,7 +70,81 @@ def crash_reporting(tmp_path: Path):
 
 
 def _read_log(log_path: Path) -> str:
+    for handler in logging.getLogger("openwopan").handlers:
+        handler.flush()
     return log_path.read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def crash_reporting_installer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    log_path = tmp_path / "openwopan.log"
+    configure_logging(AppSettings(log_level="INFO"), log_path)
+    monkeypatch.setattr(sys, "excepthook", lambda *_args: None)
+    monkeypatch.setattr(threading, "excepthook", lambda _args: None)
+
+    def _install(on_crash: Callable[[Path], None] | None = None) -> Path:
+        crash_path = install_crash_reporting(log_path, on_crash=on_crash)
+        assert crash_path is not None
+        return log_path
+
+    yield _install
+
+    faulthandler.disable()
+    stream = logging_config._fault_handler_stream
+    if stream is not None and not stream.closed:
+        stream.close()
+
+
+def test_crash_reporting_calls_on_crash_with_log_path(crash_reporting_installer) -> None:
+    received: list[Path] = []
+    log_path = crash_reporting_installer(received.append)
+
+    sys.excepthook(RuntimeError, RuntimeError("boom"), None)
+
+    assert received == [log_path]
+    assert "app.crash.unhandled_exception" in _read_log(log_path)
+
+
+def test_crash_reporting_survives_on_crash_failure(crash_reporting_installer) -> None:
+    def _raise_dialog_error(_path: Path) -> None:
+        raise RuntimeError("dialog failed")
+
+    log_path = crash_reporting_installer(_raise_dialog_error)
+
+    sys.excepthook(RuntimeError, RuntimeError("boom"), None)
+
+    content = _read_log(log_path)
+    assert "app.crash.unhandled_exception" in content
+    assert "app.crash.dialog_failed" in content
+
+
+def test_crash_reporting_does_not_call_on_crash_for_keyboard_interrupt(
+    crash_reporting_installer,
+) -> None:
+    received: list[Path] = []
+    crash_reporting_installer(received.append)
+
+    sys.excepthook(KeyboardInterrupt, KeyboardInterrupt(), None)
+
+    assert received == []
+
+
+def test_thread_crash_reporting_does_not_call_on_crash(crash_reporting_installer) -> None:
+    received: list[Path] = []
+    crash_reporting_installer(received.append)
+    args = SimpleNamespace(
+        exc_type=RuntimeError,
+        exc_value=RuntimeError("worker died"),
+        exc_traceback=None,
+        thread=SimpleNamespace(name="worker"),
+    )
+
+    threading.excepthook(args)
+
+    assert received == []
 
 
 def test_crash_reporting_logs_unhandled_exception(crash_reporting) -> None:

@@ -4,6 +4,7 @@ import faulthandler
 import logging
 import sys
 import threading
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import IO, Any
@@ -60,7 +61,10 @@ def set_logging_level(level_name: str) -> None:
         handler.setLevel(level)
 
 
-def install_crash_reporting(log_path: Path) -> Path | None:
+def install_crash_reporting(
+    log_path: Path,
+    on_crash: Callable[[Path], None] | None = None,
+) -> Path | None:
     """Leave evidence in the logs when the process dies unexpectedly.
 
     Unhandled Python exceptions are written to the rotating application log,
@@ -84,6 +88,11 @@ def install_crash_reporting(log_path: Path) -> Path | None:
     def _excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
         if not issubclass(exc_type, KeyboardInterrupt):
             LOGGER.error("app.crash.unhandled_exception", exc_info=(exc_type, exc_value, exc_tb))
+            if on_crash is not None:
+                try:
+                    on_crash(log_path)
+                except Exception:
+                    LOGGER.warning("app.crash.dialog_failed", exc_info=True)
         previous_hook(exc_type, exc_value, exc_tb)
 
     def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
