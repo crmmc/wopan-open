@@ -4,6 +4,7 @@ import base64
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -599,3 +600,79 @@ def test_dispatch_rejects_missing_rsp() -> None:
 
     with pytest.raises(WopanResponseError, match="missing RSP"):
         wopan.query_cloud_usage("13800138000")
+
+
+def _decrypt_payload(encrypted: str, key: bytes) -> object:
+    cipher = Cipher(algorithms.AES(key), modes.CBC(IV))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(base64.b64decode(encrypted)) + decryptor.finalize()
+    return json.loads(padded[: -padded[-1]])
+
+
+def _capture_upload_body() -> tuple[dict[str, object], dict[str, object]]:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return _success_response({"url": "https://upload.example.test"})
+        captured["body"] = request.content
+        return httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-1"}})
+
+    return captured, handler
+
+
+def _parse_multipart_fields(body: bytes) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for block in body.split(b"form-data; name=")[1:]:
+        name_end = block.find(b"\r\n\r\n")
+        value_end = block.find(b"\r\n--")
+        name = block[:name_end].strip(b'"').decode()
+        value = block[name_end + 4 : value_end].decode()
+        fields[name] = value
+    return fields
+
+
+def test_upload_file_uses_upload_name_for_metadata(tmp_path: Path) -> None:
+    """upload_name 覆盖本地名：fileName/fileInfo(fileType)/mime 均基于该名。"""
+    local_file = tmp_path / "local-name.txt"
+    local_file.write_bytes(b"content")
+    captured, handler = _capture_upload_body()
+
+    item = WopanClient(
+        COOKIE_HEADER, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    ).upload_file("folder-1", local_file, retry_max_attempts=0, upload_name="cloud.png")
+
+    body = cast(bytes, captured["body"])
+    fields = _parse_multipart_fields(body)
+    file_info = _decrypt_payload(fields["fileInfo"], TOKEN[:16].encode())
+    assert item.name == "cloud.png"
+    assert item.file_type == "1"
+    assert fields["fileName"] == "cloud.png"
+    assert file_info == {
+        "spaceType": "0",
+        "directoryId": "folder-1",
+        "batchNo": file_info["batchNo"],
+        "fileName": "cloud.png",
+        "fileSize": len(b"content"),
+        "fileType": "1",
+    }
+    assert b'filename="cloud.png"' in body
+    assert b"image/png" in body
+
+
+def test_upload_file_keeps_local_name_without_upload_name(tmp_path: Path) -> None:
+    """缺省 upload_name 时沿用本地文件名（现有调用零影响）。"""
+    local_file = tmp_path / "local-name.txt"
+    local_file.write_bytes(b"content")
+    captured, handler = _capture_upload_body()
+
+    item = WopanClient(
+        COOKIE_HEADER, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    ).upload_file("folder-1", local_file, retry_max_attempts=0)
+
+    body = cast(bytes, captured["body"])
+    fields = _parse_multipart_fields(body)
+    assert item.name == "local-name.txt"
+    assert fields["fileName"] == "local-name.txt"
+    assert b'filename="local-name.txt"' in body
+    assert b"text/plain" in body

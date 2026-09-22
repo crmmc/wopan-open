@@ -80,6 +80,7 @@ from openwopan.app.logging_config import app_log_path, set_logging_level
 from openwopan.auth.session import AuthSession
 from openwopan.storage.settings import AppSettings, app_settings_path, save_app_settings
 from openwopan.tasks.download import DownloadTaskControl
+from openwopan.tasks.upload import FolderUploadJob
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
 
@@ -377,17 +378,24 @@ class UploadWorker(QObject):
         parent_id: str,
         local_path: Path,
         task_id: str,
+        upload_name: str | None = None,
     ) -> None:
         super().__init__()
         self._file_browser = file_browser
         self._parent_id = parent_id
         self._local_path = local_path
         self._task_id = task_id
+        self._upload_name = upload_name
 
     def run(self) -> None:
         """Run the blocking upload in a worker thread."""
         try:
-            item = self._file_browser.upload_file(self._parent_id, self._local_path)
+            if self._upload_name is None:
+                item = self._file_browser.upload_file(self._parent_id, self._local_path)
+            else:
+                item = self._file_browser.upload_file(
+                    self._parent_id, self._local_path, upload_name=self._upload_name
+                )
         except FileBrowserLoginRequiredError as exc:
             self.login_required.emit(str(exc), self._task_id)
         except FileBrowserError as exc:
@@ -452,6 +460,16 @@ class TransferRecord:
         if not total or total <= 0:
             return 0
         return max(0, min(100, int(self.bytes_done * 100 / total)))
+
+
+@dataclass(slots=True)
+class QueuedUploadFile:
+    """One folder-upload file waiting for the single upload slot."""
+
+    task_id: str
+    local_path: Path
+    target_dir_id: str
+    upload_name: str
 
 
 class TransferInterface(QWidget):
@@ -1749,6 +1767,14 @@ class MainWindow(_MainWindowBase):
         self._upload_worker: UploadWorker | None = None
         self._upload_path: Path | None = None
         self._upload_task_id: str | None = None
+        self._folder_prepare_thread: QThread | None = None
+        self._folder_prepare_worker: BrowserOperationWorker | None = None
+        self._folder_upload_record_id: str | None = None
+        self._folder_upload_queue: list[QueuedUploadFile] = []
+        self._folder_upload_active: QueuedUploadFile | None = None
+        self._folder_upload_success_count = 0
+        self._folder_upload_failure_count = 0
+        self._folder_upload_target_dir_id: str | None = None
         self._transfer_sequence = 0
 
         self.setWindowTitle("OpenWoPan")
@@ -1796,6 +1822,7 @@ class MainWindow(_MainWindowBase):
             (self._usage_thread, "usage"),
             (self._download_thread, "download"),
             (self._upload_thread, "upload"),
+            (self._folder_prepare_thread, "folder_upload"),
         ):
             if thread is None or not thread.isRunning():
                 continue
@@ -2449,6 +2476,145 @@ class MainWindow(_MainWindowBase):
         else:
             self._on_upload_succeeded(uploaded_item, task_id=task_id)
 
+    def upload_folder_to_current_directory(self, local_root: Path) -> None:
+        """Upload one local folder tree to the current directory (two phases)."""
+        if self._file_browser is None:
+            self._set_status("请先登录")
+            return
+        if not local_root.name:
+            self._set_status("上传文件夹不能为空")
+            InfoBar.warning(title="上传", content="上传文件夹不能为空", parent=self)
+            return
+        if self._upload_thread is not None or self._folder_prepare_thread is not None:
+            self._set_status("已有上传任务正在进行")
+            InfoBar.warning(title="上传", content="已有上传任务正在进行", parent=self)
+            return
+
+        parent_id = self.current_directory_id()
+        LOGGER.info(
+            "main_window.folder_upload.prepare.start parent_id=%s root_name_length=%s",
+            parent_id,
+            len(local_root.name),
+        )
+        record_id = self._create_upload_record(local_root)
+        self.transfer_interface.update_record("upload", record_id, status="创建目录中")
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(
+            lambda: file_browser.prepare_folder_upload(parent_id, local_root)
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_folder_upload_prepared)
+        worker.failed.connect(self._on_folder_upload_prepare_failed)
+        worker.login_required.connect(self._on_folder_upload_prepare_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_folder_prepare)
+
+        self._folder_prepare_thread = thread
+        self._folder_prepare_worker = worker
+        self._folder_upload_record_id = record_id
+        self._folder_upload_target_dir_id = parent_id
+        self._set_status(f"正在创建目录「{local_root.name}」...")
+        thread.start()
+
+    def _on_folder_upload_prepared(self, result: object) -> None:
+        job = cast(FolderUploadJob, result)
+        record_id = self._folder_upload_record_id
+        if record_id is not None:
+            self.transfer_interface.update_record("upload", record_id, status="已完成")
+        LOGGER.info(
+            "main_window.folder_upload.prepare.success root_item_id=%s file_count=%s",
+            job.root_item_id,
+            len(job.files),
+        )
+        queue: list[QueuedUploadFile] = []
+        for planned in job.files:
+            task_id = self._create_upload_record(
+                planned.local_path,
+                name=planned.name,
+                size=planned.size,
+            )
+            queue.append(
+                QueuedUploadFile(
+                    task_id=task_id,
+                    local_path=planned.local_path,
+                    target_dir_id=planned.target_dir_id,
+                    upload_name=planned.name,
+                )
+            )
+        self._folder_upload_queue = queue
+        self._start_next_folder_upload_file()
+
+    def _on_folder_upload_prepare_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.folder_upload.prepare.failed error=%s", message)
+        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
+        self._set_status(f"上传文件夹失败：{message}")
+        InfoBar.error(title="上传文件夹失败", content=message, parent=self)
+
+    def _on_folder_upload_prepare_login_required(self, message: str) -> None:
+        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
+        self._show_login_required_error(message)
+
+    def _clear_folder_prepare(self) -> None:
+        self._folder_prepare_thread = None
+        self._folder_prepare_worker = None
+        self._folder_upload_record_id = None
+
+    def _start_next_folder_upload_file(self) -> None:
+        """Dequeue and start the next folder-upload file when the slot is free."""
+        if not self._folder_upload_queue:
+            self._finish_folder_upload()
+            return
+        if self._upload_thread is not None:
+            # Slot holds a single-file upload; retried from _clear_upload_task.
+            LOGGER.debug("main_window.folder_upload.deferred_busy")
+            return
+        queued = self._folder_upload_queue.pop(0)
+        self._folder_upload_active = queued
+        self._start_upload_task(
+            queued.target_dir_id,
+            queued.local_path,
+            queued.task_id,
+            upload_name=queued.upload_name,
+        )
+
+    def _continue_folder_upload_queue(self) -> None:
+        """Advance the folder-upload queue after the upload slot cleared."""
+        if self._folder_upload_active is None and not self._folder_upload_queue:
+            return
+        if self._folder_upload_queue:
+            self._start_next_folder_upload_file()
+            return
+        self._finish_folder_upload()
+
+    def _finish_folder_upload(self) -> None:
+        success_count = self._folder_upload_success_count
+        failure_count = self._folder_upload_failure_count
+        target_dir_id = self._folder_upload_target_dir_id
+        self._folder_upload_active = None
+        self._folder_upload_queue = []
+        self._folder_upload_success_count = 0
+        self._folder_upload_failure_count = 0
+        self._folder_upload_target_dir_id = None
+        LOGGER.info(
+            "main_window.folder_upload.finished success=%s failed=%s",
+            success_count,
+            failure_count,
+        )
+        content = f"成功 {success_count} 个，失败 {failure_count} 个"
+        if failure_count == 0:
+            InfoBar.info(title="上传完成", content=content, parent=self)
+        else:
+            InfoBar.warning(title="上传完成", content=content, parent=self)
+        self._set_status(f"文件夹上传完成：{content}")
+        if target_dir_id is not None and self.current_directory_id() == target_dir_id:
+            self.refresh_current_directory()
+
     def prompt_create_folder(self) -> None:
         """Prompt for a folder name and create it."""
         dialog = NameInputDialog(
@@ -2570,6 +2736,20 @@ class MainWindow(_MainWindowBase):
             return
         self.upload_file_to_current_directory(Path(path_text))
 
+    def prompt_upload_folder(self) -> None:
+        """Prompt for one local folder and upload it to the current directory."""
+        if self._file_browser is None:
+            self._set_status("请先登录")
+            return
+
+        path_text = QFileDialog.getExistingDirectory(
+            self,
+            "上传文件夹",
+        )
+        if not path_text:
+            return
+        self.upload_folder_to_current_directory(Path(path_text))
+
     def enter_displayed_folder(self, row: int) -> None:
         """Enter a displayed folder row."""
         if row < 0 or row >= len(self._items):
@@ -2597,6 +2777,7 @@ class MainWindow(_MainWindowBase):
             menu.addAction("刷新", self.refresh_current_directory)
             menu.addAction("新建文件夹", self.prompt_create_folder)
             menu.addAction("上传文件", self.prompt_upload_file)
+            menu.addAction("上传文件夹", self.prompt_upload_folder)
         else:
             if item.kind is WopanItemKind.FOLDER:
                 menu.addAction("打开", lambda: self.enter_displayed_folder(row))
@@ -2725,7 +2906,14 @@ class MainWindow(_MainWindowBase):
                 raise
             self._file_browser.download_file(item, local_path, progress_callback)
 
-    def _start_upload_task(self, parent_id: str, local_path: Path, task_id: str) -> None:
+    def _start_upload_task(
+        self,
+        parent_id: str,
+        local_path: Path,
+        task_id: str,
+        *,
+        upload_name: str | None = None,
+    ) -> None:
         if self._file_browser is None:
             self._set_status("请先登录")
             return
@@ -2735,7 +2923,7 @@ class MainWindow(_MainWindowBase):
             return
 
         thread = QThread(self)
-        worker = UploadWorker(self._file_browser, parent_id, local_path, task_id)
+        worker = UploadWorker(self._file_browser, parent_id, local_path, task_id, upload_name)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -2754,7 +2942,8 @@ class MainWindow(_MainWindowBase):
         self._upload_path = local_path
         self._upload_task_id = task_id
         self.transfer_interface.update_record("upload", task_id, status="上传中")
-        self._set_status(f"正在上传「{local_path.name}」...")
+        display_name = upload_name if upload_name is not None else local_path.name
+        self._set_status(f"正在上传「{display_name}」...")
         self.update_operation_controls()
         thread.start()
 
@@ -2884,6 +3073,12 @@ class MainWindow(_MainWindowBase):
                 bytes_done=total or 0,
                 total_bytes=total,
             )
+        if self._folder_upload_active is not None and record_id == (
+            self._folder_upload_active.task_id
+        ):
+            # Folder-queue files refresh once at queue drain, not per file.
+            self._folder_upload_success_count += 1
+            return
         self.refresh_current_directory(
             after=lambda items, still_current: self._report_upload_visibility(
                 item, still_current
@@ -2905,13 +3100,28 @@ class MainWindow(_MainWindowBase):
 
     def _on_upload_failed(self, message: str, task_id: str | None = None) -> None:
         LOGGER.warning("main_window.upload.failed error=%s", message)
-        self._mark_transfer_failed("upload", task_id or self._upload_task_id, message)
+        record_id = task_id or self._upload_task_id
+        if self._folder_upload_active is not None and record_id == (
+            self._folder_upload_active.task_id
+        ):
+            self._folder_upload_failure_count += 1
+        self._mark_transfer_failed("upload", record_id, message)
         self._set_status(f"上传失败：{message}")
         InfoBar.error(title="上传失败", content=message, parent=self)
 
     def _on_upload_login_required(self, message: str, task_id: str | None = None) -> None:
         self._mark_transfer_failed("upload", task_id or self._upload_task_id, message)
         self._show_login_required_error(message)
+        if self._folder_upload_active is not None or self._folder_upload_queue:
+            LOGGER.info(
+                "main_window.folder_upload.login_stopped pending=%s",
+                len(self._folder_upload_queue),
+            )
+            self._folder_upload_active = None
+            self._folder_upload_queue = []
+            self._folder_upload_success_count = 0
+            self._folder_upload_failure_count = 0
+            self._folder_upload_target_dir_id = None
 
     def _clear_upload_task(self) -> None:
         self._upload_thread = None
@@ -2919,6 +3129,7 @@ class MainWindow(_MainWindowBase):
         self._upload_path = None
         self._upload_task_id = None
         self.update_operation_controls()
+        self._continue_folder_upload_queue()
 
     def _create_download_record(self, item: WopanItem, local_path: Path) -> str:
         task_id = self._next_transfer_task_id("download")
@@ -2933,13 +3144,24 @@ class MainWindow(_MainWindowBase):
         self._download_items_by_task[task_id] = item
         return task_id
 
-    def _create_upload_record(self, local_path: Path) -> str:
+    def _create_upload_record(
+        self,
+        local_path: Path,
+        *,
+        name: str | None = None,
+        size: int | None = None,
+    ) -> str:
         task_id = self._next_transfer_task_id("upload")
-        size = local_path.stat().st_size if local_path.exists() and local_path.is_file() else None
+        if size is None:
+            size = (
+                local_path.stat().st_size
+                if local_path.exists() and local_path.is_file()
+                else None
+            )
         record = TransferRecord(
             task_id=task_id,
             direction="upload",
-            name=local_path.name,
+            name=name if name is not None else local_path.name,
             size=size,
             target_path=local_path,
         )

@@ -431,6 +431,7 @@ class WopanClient:
         upload_part_size_mb: int = 5,
         max_upload_threads: int = 16,
         retry_max_attempts: int = 3,
+        upload_name: str | None = None,
     ) -> WopanItem:
         """Upload a local file to a parent directory."""
         if not parent_id:
@@ -439,7 +440,7 @@ class WopanClient:
             raise ValueError("local_path must be an existing file")
 
         file_size = local_path.stat().st_size
-        file_name = local_path.name
+        file_name = upload_name if upload_name is not None else local_path.name
         part_size = _bounded_int(upload_part_size_mb, 5, 5, 16) * BYTES_PER_MB
         total_parts = max(1, (file_size + part_size - 1) // part_size)
         max_workers = 1 if total_parts == 1 else min(

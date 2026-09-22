@@ -21,6 +21,11 @@ import openwopan.ui.main_window as main_window_module
 from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError
 from openwopan.storage.settings import AppSettings
 from openwopan.tasks.download import DownloadTaskControl
+from openwopan.tasks.upload import (
+    FolderUploadJob,
+    PlannedUploadFile,
+    scan_folder_tree,
+)
 from openwopan.ui.main_window import (
     BrowserOperationWorker,
     DownloadWorker,
@@ -91,6 +96,10 @@ class WorkerFileBrowser:
         self.emit_progress = False
         self.requested_parent_ids: list[str] = []
         self.uploaded_files: list[tuple[str, Path]] = []
+        self.upload_names: list[str | None] = []
+        self.upload_errors: list[Exception | None] = []
+        self.prepare_error: Exception | None = None
+        self.prepared_uploads: list[tuple[str, Path]] = []
         self.download_calls: list[dict[str, Any]] = []
         self.download_error = download_error
         self.removed_download_records: list[str] = []
@@ -146,18 +155,51 @@ class WorkerFileBrowser:
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         return WopanCloudUsage(used_bytes=1, total_bytes=2)
 
-    def upload_file(self, parent_id: str, local_path: Path) -> WopanItem:
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+    ) -> WopanItem:
         self.uploaded_files.append((parent_id, local_path))
+        self.upload_names.append(upload_name)
+        if self.upload_errors:
+            error = self.upload_errors.pop(0)
+            if error is not None:
+                raise error
+        effective_name = upload_name if upload_name is not None else local_path.name
         uploaded = WopanItem(
             item_id="uploaded-file",
-            name=local_path.name,
+            name=effective_name,
             kind=WopanItemKind.FILE,
             parent_id=parent_id,
             download_id="uploaded-fid",
             size=1,
         )
-        self.items_by_parent[parent_id] = [*self.items_by_parent[parent_id], uploaded]
+        self.items_by_parent[parent_id] = [*self.items_by_parent.get(parent_id, []), uploaded]
         return uploaded
+
+    def prepare_folder_upload(self, parent_id: str, local_root: Path) -> FolderUploadJob:
+        self.prepared_uploads.append((parent_id, local_root))
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        plan = scan_folder_tree(local_root)
+        files = tuple(
+            PlannedUploadFile(
+                local_path=planned.local_path,
+                target_dir_id=f"cloud-{parent_id}-{planned.rel_dir or 'root'}",
+                name=planned.name,
+                size=planned.size,
+            )
+            for planned in plan.files
+        )
+        return FolderUploadJob(
+            root_item_id="cloud-root",
+            root_name=plan.root_name,
+            files=files,
+            total_bytes=sum(planned.size for planned in files),
+        )
 
     def download_records(self) -> tuple[SimpleNamespace, ...]:
         return (
@@ -1974,6 +2016,7 @@ def test_open_file_context_menu_builds_menu_per_row_type(
         "刷新",
         "新建文件夹",
         "上传文件",
+        "上传文件夹",
     ]
 
 
@@ -3225,3 +3268,335 @@ def test_upload_success_without_record_id_still_refreshes_directory(
     assert len(browser.requested_parent_ids) == refreshes_before + 1
     assert window.transfer_interface.upload_records == []
     assert window.status_message() == "已上传「orphan.txt」，但刷新后未在当前目录看到，请稍后再刷新"
+
+
+class _InfoBarSpy:
+    """Record InfoBar calls so summary toasts can be asserted."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def make(kind: str):
+            def call(title: str, content: str, parent: object = None, **_kwargs: object) -> None:
+                self.calls.append((kind, title, content))
+
+            return call
+
+        monkeypatch.setattr(
+            main_window_module,
+            "InfoBar",
+            SimpleNamespace(
+                info=make("info"),
+                warning=make("warning"),
+                error=make("error"),
+                success=make("success"),
+            ),
+        )
+
+
+def _make_folder_tree(tmp_path: Path) -> Path:
+    root = tmp_path / "相册"
+    root.mkdir()
+    (root / "2024").mkdir()
+    (root / "空目录").mkdir()
+    (root / "说明.txt").write_bytes(b"hello")
+    (root / "2024" / "春节.md").write_bytes(b"12345")
+    return root
+
+
+def _upload_records(window: MainWindow) -> list[TransferRecord]:
+    return list(window.transfer_interface.upload_records)
+
+
+def test_prompt_upload_folder_requires_browser(qapp: QApplication) -> None:
+    window = MainWindow()
+
+    window.prompt_upload_folder()
+
+    assert window.status_message() == "请先登录"
+
+
+def test_prompt_upload_folder_cancelled_by_user(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    monkeypatch.setattr(main_window_module, "QFileDialog", FakeFileDialog)
+    FakeFileDialog.existing_directory = ""
+
+    window.prompt_upload_folder()
+
+    assert browser.prepared_uploads == []
+
+
+def test_prompt_upload_folder_uploads_selected_folder(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+    monkeypatch.setattr(main_window_module, "QFileDialog", FakeFileDialog)
+    FakeFileDialog.existing_directory = str(local_root)
+
+    window.prompt_upload_folder()
+
+    assert browser.prepared_uploads == [(ROOT_DIRECTORY_ID, local_root)]
+    assert len(browser.uploaded_files) == 2
+    assert window._folder_prepare_thread is None
+    assert window._folder_upload_queue == []
+    assert window._folder_upload_active is None
+
+
+def test_folder_upload_runs_two_phases_and_updates_records(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """AC1/AC7：准备记录 + 每文件记录，全部顺序执行并到达终态。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+
+    window.upload_folder_to_current_directory(local_root)
+
+    records = _upload_records(window)
+    assert [record.name for record in records] == ["相册", "春节.md", "说明.txt"]
+    assert [record.status for record in records] == ["已完成", "已完成", "已完成"]
+    assert records[1].target_path == local_root / "2024" / "春节.md"
+    # 阶段二逐文件顺序执行，父目录为目标云端目录 ID，名字为去重后的最终名
+    assert [parent_id for parent_id, _ in browser.uploaded_files] == [
+        f"cloud-{ROOT_DIRECTORY_ID}-2024",
+        f"cloud-{ROOT_DIRECTORY_ID}-root",
+    ]
+    assert browser.upload_names == ["春节.md", "说明.txt"]
+
+
+def test_folder_upload_shows_summary_and_refreshes_target_directory(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R6：队列排空后弹汇总；仍停留在目标目录则自动刷新。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+    spy = _InfoBarSpy()
+    spy.install(monkeypatch)
+    requested_before = len(browser.requested_parent_ids)
+
+    window.upload_folder_to_current_directory(local_root)
+
+    assert spy.calls[-1] == ("info", "上传完成", "成功 2 个，失败 0 个")
+    # 结束时当前目录刷新一次（单文件路径的逐文件刷新不适用队列文件）
+    assert browser.requested_parent_ids[requested_before:] == [ROOT_DIRECTORY_ID]
+
+
+def test_folder_upload_skips_final_refresh_after_navigation(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """R6：用户离开目标目录后收尾不再刷新该目录。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window._folder_upload_target_dir_id = "0"
+    window.enter_displayed_folder(0)  # 进入「Folder」子目录
+    requested_before = list(browser.requested_parent_ids)
+
+    window._finish_folder_upload()
+
+    assert browser.requested_parent_ids == requested_before
+
+
+def test_folder_upload_continues_after_single_file_failure(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5：单文件失败不中断其余文件，结束汇总成功/失败数。"""
+    browser = WorkerFileBrowser()
+    browser.upload_errors = [FileBrowserError("网络错误"), None]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+    spy = _InfoBarSpy()
+    spy.install(monkeypatch)
+
+    window.upload_folder_to_current_directory(local_root)
+
+    records = _upload_records(window)
+    assert [record.status for record in records] == ["已完成", "失败", "已完成"]
+    assert records[1].error == "网络错误"
+    assert ("error", "上传失败", "网络错误") in spy.calls
+    assert spy.calls[-1] == ("warning", "上传完成", "成功 1 个，失败 1 个")
+    assert len(browser.uploaded_files) == 2
+
+
+def test_folder_upload_stops_chaining_on_login_required(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """AC6：登录态失效停止排队，未开始记录保持等待中。"""
+    browser = WorkerFileBrowser()
+    browser.upload_errors = [None, FileBrowserLoginRequiredError("登录已过期，请重新登录")]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    observed_messages: list[str] = []
+    window.login_required.connect(observed_messages.append)
+    local_root = _make_folder_tree(tmp_path)
+    (local_root / "结尾.txt").write_bytes(b"tail")  # 第三个文件保持等待中
+
+    window.upload_folder_to_current_directory(local_root)
+
+    assert observed_messages == ["登录已过期，请重新登录"]
+    records = _upload_records(window)
+    assert [record.name for record in records] == ["相册", "春节.md", "结尾.txt", "说明.txt"]
+    assert [record.status for record in records] == ["已完成", "已完成", "失败", "等待中"]
+    # 登录失效的文件已尝试但不计入成功；第三个文件从未开始
+    assert browser.uploaded_files == [
+        (f"cloud-{ROOT_DIRECTORY_ID}-2024", local_root / "2024" / "春节.md"),
+        (f"cloud-{ROOT_DIRECTORY_ID}-root", local_root / "结尾.txt"),
+    ]
+    assert window._folder_upload_queue == []
+    assert window._folder_upload_active is None
+
+
+def test_folder_upload_prepare_failure_reports_and_skips_file_records(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """AC4：阶段一失败明确报错，不创建任何文件上传任务。"""
+    browser = WorkerFileBrowser()
+    browser.prepare_error = FileBrowserError("创建目录失败：没有权限")
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+
+    window.upload_folder_to_current_directory(local_root)
+
+    records = _upload_records(window)
+    assert len(records) == 1
+    assert records[0].status == "失败"
+    assert records[0].error == "创建目录失败：没有权限"
+    assert browser.uploaded_files == []
+    assert "上传文件夹失败" in window.status_message()
+    assert window._folder_prepare_thread is None
+
+
+def test_folder_upload_prepare_login_required_marks_record_failed(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.prepare_error = FileBrowserLoginRequiredError("登录已过期，请重新登录")
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    observed_messages: list[str] = []
+    window.login_required.connect(observed_messages.append)
+
+    window.upload_folder_to_current_directory(_make_folder_tree(tmp_path))
+
+    assert observed_messages == ["登录已过期，请重新登录"]
+    records = _upload_records(window)
+    assert [record.status for record in records] == ["失败"]
+    assert browser.uploaded_files == []
+
+
+def test_folder_upload_without_files_finishes_with_empty_summary(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    spy = _InfoBarSpy()
+    spy.install(monkeypatch)
+    empty_root = tmp_path / "空文件夹"
+    empty_root.mkdir()
+
+    window.upload_folder_to_current_directory(empty_root)
+
+    assert spy.calls[-1] == ("info", "上传完成", "成功 0 个，失败 0 个")
+    assert browser.uploaded_files == []
+    records = _upload_records(window)
+    assert [record.status for record in records] == ["已完成"]
+
+
+def test_folder_upload_rejects_while_upload_slot_busy(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """F2：槽位占用（单文件上传或目录准备中）时拒绝新的文件夹上传。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+
+    window._upload_thread = QThread(window)  # type: ignore[assignment]
+    window.upload_folder_to_current_directory(local_root)
+    assert window.status_message() == "已有上传任务正在进行"
+    assert browser.prepared_uploads == []
+    window._upload_thread = None
+
+    window._folder_prepare_thread = QThread(window)  # type: ignore[assignment]
+    window.upload_folder_to_current_directory(local_root)
+    assert window.status_message() == "已有上传任务正在进行"
+    assert browser.prepared_uploads == []
+    window._folder_prepare_thread = None
+
+
+def test_folder_upload_defers_until_single_upload_slot_frees(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """准备完成时槽位被单文件上传占用：先排队，槽位释放后自动继续。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+    job = browser.prepare_folder_upload(ROOT_DIRECTORY_ID, local_root)
+
+    window._upload_thread = QThread(window)  # type: ignore[assignment]
+    window._folder_upload_target_dir_id = ROOT_DIRECTORY_ID
+    window._on_folder_upload_prepared(job)
+    assert len(window._folder_upload_queue) == len(job.files)
+    assert browser.uploaded_files == []
+
+    window._upload_thread = None
+    window._clear_upload_task()
+
+    assert browser.uploaded_files == [
+        (f"cloud-{ROOT_DIRECTORY_ID}-2024", local_root / "2024" / "春节.md"),
+        (f"cloud-{ROOT_DIRECTORY_ID}-root", local_root / "说明.txt"),
+    ]
+    assert window._folder_upload_queue == []
+
+
+def test_upload_folder_to_current_directory_requires_browser(qapp: QApplication) -> None:
+    window = MainWindow()
+
+    window.upload_folder_to_current_directory(Path("/tmp/any-folder"))
+
+    assert window.status_message() == "请先登录"
+
+
+def test_upload_folder_to_current_directory_rejects_empty_folder_name(
+    qapp: QApplication,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.upload_folder_to_current_directory(Path("/"))
+
+    assert window.status_message() == "上传文件夹不能为空"
+    assert browser.prepared_uploads == []

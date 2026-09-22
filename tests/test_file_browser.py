@@ -291,6 +291,7 @@ def test_file_browser_service_updates_transfer_settings_for_future_uploads(tmp_p
             "upload_part_size_mb": 8,
             "max_upload_threads": 4,
             "retry_max_attempts": 2,
+            "upload_name": None,
         }
     ]
 
@@ -508,3 +509,189 @@ def test_build_file_browser_service_constructs_service() -> None:
     )
 
     assert isinstance(service, FileBrowserService)
+
+
+class FolderUploadFakeClient(FakeClient):
+    """Fake client with deterministic dir ids and per-directory existing names."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.existing_names: dict[str, set[str]] = {}
+
+    def list_files(self, parent_id: str) -> list[WopanItem]:
+        self.requested_parent_ids.append(parent_id)
+        if self.error is not None:
+            raise self.error
+        return [
+            WopanItem(item_id=f"{parent_id}:{name}", name=name, kind=WopanItemKind.FOLDER)
+            for name in sorted(self.existing_names.get(parent_id, set()))
+        ]
+
+    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+        self.created_folders.append((parent_id, name))
+        if self.error is not None:
+            raise self.error
+        item_id = f"dir-{len(self.created_folders)}"
+        return WopanItem(
+            item_id=item_id,
+            name=name,
+            kind=WopanItemKind.FOLDER,
+            parent_id=parent_id,
+        )
+
+
+def _make_local_tree(tmp_path: Path) -> Path:
+    root = tmp_path / "photos"
+    root.mkdir()
+    (root / "相册").mkdir()
+    (root / "空目录").mkdir()
+    (root / "top.txt").write_bytes(b"12345")
+    (root / "相册" / "春节.md").write_bytes(b"hello")
+    return root
+
+
+def test_prepare_folder_upload_creates_tree_and_plans_files(tmp_path: Path) -> None:
+    client = FolderUploadFakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_root = _make_local_tree(tmp_path)
+
+    job = service.prepare_folder_upload("0", local_root)
+
+    assert job.root_name == "photos"
+    assert job.root_item_id == "dir-1"
+    assert job.total_bytes == 10
+    assert client.created_folders == [
+        ("0", "photos"),
+        ("dir-1", "相册"),
+        ("dir-1", "空目录"),
+    ]
+    assert [(file.name, file.target_dir_id, file.size) for file in job.files] == [
+        ("top.txt", "dir-1", 5),
+        ("春节.md", "dir-2", 5),
+    ]
+    assert all(file.local_path.is_file() for file in job.files)
+    # 只列出目标目录与接收内容的云端目录，每目录至多一次
+    assert client.requested_parent_ids == ["0", "dir-1", "dir-2"]
+
+
+def test_prepare_folder_upload_renames_conflicting_root_folder(tmp_path: Path) -> None:
+    client = FolderUploadFakeClient()
+    client.existing_names["0"] = {"photos", "photos (1)"}
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_root = _make_local_tree(tmp_path)
+
+    job = service.prepare_folder_upload("0", local_root)
+
+    assert job.root_name == "photos (2)"
+    assert client.created_folders[0] == ("0", "photos (2)")
+
+
+def test_prepare_folder_upload_renames_conflicting_subfolder_and_files(
+    tmp_path: Path,
+) -> None:
+    client = FolderUploadFakeClient()
+    # 模拟云端目录内已有同名内容（如并发上传或服务端同名合并）
+    client.existing_names["dir-1"] = {"相册", "top.txt"}
+    client.existing_names["dir-2"] = {"春节.md"}
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_root = _make_local_tree(tmp_path)
+
+    job = service.prepare_folder_upload("0", local_root)
+
+    assert client.created_folders == [
+        ("0", "photos"),
+        ("dir-1", "相册 (1)"),
+        ("dir-1", "空目录"),
+    ]
+    assert [(file.name, file.target_dir_id) for file in job.files] == [
+        ("top (1).txt", "dir-1"),
+        ("春节 (1).md", "dir-2"),
+    ]
+
+
+def test_prepare_folder_upload_keeps_distinct_local_names_without_extra_lists(
+    tmp_path: Path,
+) -> None:
+    client = FolderUploadFakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    root = tmp_path / "solo"
+    root.mkdir()
+    (root / "a.txt").write_bytes(b"a")
+
+    job = service.prepare_folder_upload("0", root)
+
+    # 每个接收文件的云端目录恰好列出一次
+    assert client.requested_parent_ids == ["0", "dir-1"]
+    assert [file.name for file in job.files] == ["a.txt"]
+
+
+def test_prepare_folder_upload_dedupes_same_local_name_in_one_dir(tmp_path: Path) -> None:
+    """同名冲突防御：同一目录内已占用名会推进计数，即使来自本地重名计划。"""
+    client = FolderUploadFakeClient()
+    client.existing_names["dir-1"] = {"a.txt", "a (1).txt"}
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    root = tmp_path / "dup"
+    root.mkdir()
+    (root / "a.txt").write_bytes(b"a")
+
+    job = service.prepare_folder_upload("0", root)
+
+    assert [file.name for file in job.files] == ["a (2).txt"]
+
+
+def test_prepare_folder_upload_fails_without_partial_job_on_create_error(
+    tmp_path: Path,
+) -> None:
+    class _FailSecondCreate(FolderUploadFakeClient):
+        def create_folder(self, parent_id: str, name: str) -> WopanItem:
+            if self.created_folders:
+                raise WopanBusinessError("0001", "denied")
+            return super().create_folder(parent_id, name)
+
+    client = _FailSecondCreate()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_root = _make_local_tree(tmp_path)
+
+    with pytest.raises(FileBrowserError, match="创建目录失败"):
+        service.prepare_folder_upload("0", local_root)
+
+    # 阶段一失败不产出任何文件上传计划（部分目录可能已创建，不做回滚）
+    assert client.created_folders == [("0", "photos")]
+
+
+def test_prepare_folder_upload_maps_login_expiry(tmp_path: Path) -> None:
+    client = FolderUploadFakeClient()
+    client.error = WopanAuthenticationError("expired")
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_root = _make_local_tree(tmp_path)
+
+    with pytest.raises(FileBrowserLoginRequiredError, match="重新登录"):
+        service.prepare_folder_upload("0", local_root)
+
+
+def test_prepare_folder_upload_maps_scan_failure(tmp_path: Path) -> None:
+    service = FileBrowserService(FolderUploadFakeClient())  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserError, match="扫描本地文件夹失败"):
+        service.prepare_folder_upload("0", tmp_path / "missing")
+
+
+@pytest.mark.parametrize(
+    ("parent_id", "local_path_name", "match"),
+    [
+        ("", "root", "目标文件夹不能为空"),
+        ("0", "", "上传文件夹不能为空"),
+    ],
+)
+def test_prepare_folder_upload_rejects_invalid_arguments(
+    tmp_path: Path, parent_id: str, local_path_name: str, match: str
+) -> None:
+    service = FileBrowserService(FolderUploadFakeClient())  # type: ignore[arg-type]
+    if local_path_name:
+        local_root = tmp_path / local_path_name
+        local_root.mkdir(exist_ok=True)
+    else:
+        local_root = Path("/")
+
+    with pytest.raises(FileBrowserError, match=match):
+        service.prepare_folder_upload(parent_id, local_root)

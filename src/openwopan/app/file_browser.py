@@ -19,6 +19,12 @@ from openwopan.tasks.download import (
     download_url,
     make_download_task_id,
 )
+from openwopan.tasks.upload import (
+    FolderUploadJob,
+    PlannedUploadFile,
+    next_available_name,
+    scan_folder_tree,
+)
 from openwopan.wopan.client import ORIGIN, REFERER, ROOT_DIRECTORY_ID, WopanClient
 from openwopan.wopan.errors import WopanAuthenticationError, WopanError
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
@@ -68,8 +74,17 @@ class FileBrowserBackend(Protocol):
     ) -> DownloadResult | None:
         """Download one file to a local path."""
 
-    def upload_file(self, parent_id: str, local_path: Path) -> WopanItem:
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+    ) -> WopanItem:
         """Upload one local file to a directory."""
+
+    def prepare_folder_upload(self, parent_id: str, local_root: Path) -> FolderUploadJob:
+        """Create the cloud directory tree for a local folder upload."""
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""
@@ -209,7 +224,13 @@ class FileBrowserService:
         )
         return result
 
-    def upload_file(self, parent_id: str, local_path: Path) -> WopanItem:
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+    ) -> WopanItem:
         """Upload one local file to a directory."""
         if not parent_id:
             raise FileBrowserError("目标文件夹不能为空")
@@ -231,6 +252,7 @@ class FileBrowserService:
                     upload_part_size_mb=self._settings.upload_part_size_mb,
                     max_upload_threads=self._settings.max_upload_threads,
                     retry_max_attempts=self._settings.retry_max_attempts,
+                    upload_name=upload_name,
                 )
             )
         except httpx.HTTPStatusError as exc:
@@ -253,6 +275,87 @@ class FileBrowserService:
             len(item.name),
         )
         return item
+
+    def prepare_folder_upload(self, parent_id: str, local_root: Path) -> FolderUploadJob:
+        """Create the cloud directory tree for a local folder upload.
+
+        Creates every directory (root first, parent before child, empty dirs
+        included), deduplicates every cloud name against existing siblings,
+        and returns the per-file upload plan. On any failure the whole
+        preparation fails without partial results; directories already
+        created stay on the cloud (no rollback).
+        """
+        if not parent_id:
+            raise FileBrowserError("目标文件夹不能为空")
+        if not local_root.name:
+            raise FileBrowserError("上传文件夹不能为空")
+        LOGGER.info(
+            "file_browser.prepare_folder_upload.start parent_id=%s root_name_length=%s",
+            parent_id,
+            len(local_root.name),
+        )
+        try:
+            plan = scan_folder_tree(local_root)
+        except OSError as exc:
+            LOGGER.warning("file_browser.prepare_folder_upload.scan_failed error=%s", exc)
+            raise FileBrowserError(f"扫描本地文件夹失败：{exc}") from exc
+
+        try:
+            root_name = next_available_name(plan.root_name, self._existing_names(parent_id))
+            root_item = self.create_folder(parent_id, root_name)
+            dir_ids = {"": root_item.item_id}
+            used_names: dict[str, set[str]] = {}
+
+            def taken_names(rel_dir: str) -> set[str]:
+                if rel_dir not in used_names:
+                    used_names[rel_dir] = self._existing_names(dir_ids[rel_dir])
+                return used_names[rel_dir]
+
+            for rel_path in plan.folders:
+                rel_parent, _, local_name = rel_path.rpartition("/")
+                parent_names = taken_names(rel_parent)
+                folder_name = next_available_name(local_name, parent_names)
+                created = self.create_folder(dir_ids[rel_parent], folder_name)
+                parent_names.add(folder_name)
+                dir_ids[rel_path] = created.item_id
+
+            planned_files: list[PlannedUploadFile] = []
+            for planned in plan.files:
+                names = taken_names(planned.rel_dir)
+                upload_name = next_available_name(planned.name, names)
+                names.add(upload_name)
+                planned_files.append(
+                    PlannedUploadFile(
+                        local_path=planned.local_path,
+                        target_dir_id=dir_ids[planned.rel_dir],
+                        name=upload_name,
+                        size=planned.size,
+                    )
+                )
+        except FileBrowserLoginRequiredError:
+            raise
+        except FileBrowserError as exc:
+            LOGGER.warning("file_browser.prepare_folder_upload.failed error=%s", exc)
+            raise FileBrowserError(f"创建目录失败：{exc}") from exc
+
+        total_bytes = sum(planned.size for planned in planned_files)
+        LOGGER.info(
+            "file_browser.prepare_folder_upload.success parent_id=%s folder_count=%s "
+            "file_count=%s total_bytes=%s",
+            parent_id,
+            len(plan.folders),
+            len(planned_files),
+            total_bytes,
+        )
+        return FolderUploadJob(
+            root_item_id=root_item.item_id,
+            root_name=root_name,
+            files=tuple(planned_files),
+            total_bytes=total_bytes,
+        )
+
+    def _existing_names(self, directory_id: str) -> set[str]:
+        return {item.name for item in self.list_directory(directory_id)}
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""
