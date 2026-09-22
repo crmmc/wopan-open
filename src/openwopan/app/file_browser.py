@@ -296,8 +296,12 @@ class FileBrowserService:
         )
         try:
             plan = scan_folder_tree(local_root)
-        except OSError as exc:
-            LOGGER.warning("file_browser.prepare_folder_upload.scan_failed error=%s", exc)
+        except (OSError, ValueError) as exc:
+            LOGGER.warning(
+                "file_browser.prepare_folder_upload.scan_failed errno=%s error_type=%s",
+                getattr(exc, "errno", None),
+                type(exc).__name__,
+            )
             raise FileBrowserError(f"扫描本地文件夹失败：{exc}") from exc
 
         try:
@@ -335,7 +339,10 @@ class FileBrowserService:
         except FileBrowserLoginRequiredError:
             raise
         except FileBrowserError as exc:
-            LOGGER.warning("file_browser.prepare_folder_upload.failed error=%s", exc)
+            LOGGER.warning(
+                "file_browser.prepare_folder_upload.failed error_type=%s",
+                type(exc).__name__,
+            )
             raise FileBrowserError(f"创建目录失败：{exc}") from exc
 
         total_bytes = sum(planned.size for planned in planned_files)

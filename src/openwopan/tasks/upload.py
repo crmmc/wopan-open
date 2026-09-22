@@ -63,6 +63,8 @@ def next_available_name(requested: str, used: set[str]) -> str:
 
 def scan_folder_tree(local_root: Path) -> FolderUploadPlan:
     """Scan one local folder tree into an upload plan without network access."""
+    if local_root.is_symlink():
+        raise ValueError("不能上传符号链接文件夹")
     folders: list[str] = []
     files: list[PlannedFile] = []
     _scan_directory(local_root, "", folders, files)

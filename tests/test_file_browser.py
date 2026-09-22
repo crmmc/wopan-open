@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
@@ -669,11 +670,36 @@ def test_prepare_folder_upload_maps_login_expiry(tmp_path: Path) -> None:
         service.prepare_folder_upload("0", local_root)
 
 
-def test_prepare_folder_upload_maps_scan_failure(tmp_path: Path) -> None:
+def test_prepare_folder_upload_maps_scan_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     service = FileBrowserService(FolderUploadFakeClient())  # type: ignore[arg-type]
 
     with pytest.raises(FileBrowserError, match="扫描本地文件夹失败"):
         service.prepare_folder_upload("0", tmp_path / "missing")
+
+    # 日志只记错误类型，不携带本地路径（用户目录/文件名不进日志）
+    scan_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "prepare_folder_upload.scan_failed" in record.getMessage()
+    ]
+    assert scan_logs
+    assert all(str(tmp_path) not in message for message in scan_logs)
+
+
+def test_prepare_folder_upload_rejects_symlink_root(tmp_path: Path) -> None:
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    linked_root = tmp_path / "linked-root"
+    try:
+        os.symlink(real_dir, linked_root)
+    except (OSError, NotImplementedError):
+        pytest.skip("platform cannot create symlinks")
+    service = FileBrowserService(FolderUploadFakeClient())  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserError, match="扫描本地文件夹失败：不能上传符号链接"):
+        service.prepare_folder_upload("0", linked_root)
 
 
 @pytest.mark.parametrize(

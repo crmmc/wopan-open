@@ -866,11 +866,22 @@ def test_close_window_without_active_transfer_is_noop(qapp: QApplication) -> Non
     assert window._download_thread is None
     assert window._upload_thread is None
     assert window._directory_thread is None
+    assert window._folder_prepare_thread is None
 
 
 @pytest.mark.parametrize(
     "direction",
-    ["download", "upload", "directory", "create", "rename", "delete", "move", "usage"],
+    [
+        "download",
+        "upload",
+        "directory",
+        "create",
+        "rename",
+        "delete",
+        "move",
+        "usage",
+        "folder_upload",
+    ],
 )
 def test_close_window_logs_timeout_and_accepts_close(
     qapp: QApplication,
@@ -889,6 +900,8 @@ def test_close_window_logs_timeout_and_accepts_close(
     elif direction == "upload":
         window._upload_thread = thread  # type: ignore[assignment]
         window._upload_task_id = task_id
+    elif direction == "folder_upload":
+        window._folder_prepare_thread = thread  # type: ignore[assignment]
     elif direction == "directory":
         window._directory_thread = thread  # type: ignore[assignment]
     else:
@@ -1137,6 +1150,27 @@ def test_background_upload_updates_ui_on_gui_thread(
     window.upload_file_to_current_directory(local_path)
 
     assert _wait_until(qapp, lambda: window._upload_thread is None and len(observed) >= 2)
+    assert observed == [gui_thread_id] * len(observed)
+
+
+def test_folder_prepare_updates_ui_on_gui_thread(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    observed, gui_thread_id = _record_update_thread_ids(window)
+    local_root = _make_folder_tree(tmp_path)
+
+    window.upload_folder_to_current_directory(local_root)
+
+    assert _wait_until(
+        qapp,
+        lambda: window._folder_prepare_thread is None
+        and window._folder_upload_active is None
+        and window._folder_upload_queue == []
+        and len(observed) >= 3,
+    )
     assert observed == [gui_thread_id] * len(observed)
 
 

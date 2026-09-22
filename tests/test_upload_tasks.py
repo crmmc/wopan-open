@@ -72,6 +72,20 @@ def test_scan_folder_tree_skips_symlinks(tmp_path: Path) -> None:
     assert [file.name for file in plan.files] == ["real.txt"]
 
 
+def test_scan_folder_tree_rejects_symlink_root(tmp_path: Path) -> None:
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    _write(real_dir / "inner.txt")
+    linked_root = tmp_path / "linked-root"
+    try:
+        os.symlink(real_dir, linked_root)
+    except (OSError, NotImplementedError):
+        pytest.skip("platform cannot create symlinks")
+
+    with pytest.raises(ValueError, match="不能上传符号链接"):
+        scan_folder_tree(linked_root)
+
+
 def test_scan_folder_tree_reports_unreadable_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2551,7 +2551,9 @@ class MainWindow(_MainWindowBase):
         self._start_next_folder_upload_file()
 
     def _on_folder_upload_prepare_failed(self, message: str) -> None:
-        LOGGER.warning("main_window.folder_upload.prepare.failed error=%s", message)
+        LOGGER.warning(
+            "main_window.folder_upload.prepare.failed error_length=%s", len(message)
+        )
         self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
         self._set_status(f"上传文件夹失败：{message}")
         InfoBar.error(title="上传文件夹失败", content=message, parent=self)
