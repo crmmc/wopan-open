@@ -10,6 +10,15 @@ from openwopan.auth.web_login import WebLoginCoordinator
 from openwopan.storage.settings import AppSettings
 
 
+@pytest.fixture(autouse=True)
+def _stub_crash_reporting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "install_crash_reporting",
+        lambda _path, on_crash=None: None,
+    )
+
+
 def test_build_dependencies_wires_default_graph() -> None:
     from openwopan.app.bootstrap import build_dependencies
 

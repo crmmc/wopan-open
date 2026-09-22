@@ -4,12 +4,22 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from PySide6.QtCore import QItemSelectionModel, QObject, QPoint, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtCore import (
+    QItemSelectionModel,
+    QObject,
+    QPoint,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -86,6 +96,7 @@ TRANSFER_COL_STATUS = 4
 TRANSFER_COL_ACTION = 5
 TRANSFER_ACTION_COLUMN_WIDTH = 156
 TRANSFER_ACTION_BUTTON_SIZE = (32, 24)
+THREAD_JOIN_TIMEOUT_MS = 3000
 UPLOAD_STATUS_FILTERS = ("全部", "等待中", "上传中", "已完成", "失败")
 DOWNLOAD_STATUS_FILTERS = (
     "全部",
@@ -108,6 +119,9 @@ FRAME_STYLE = (
     "}"
 )
 LOGGER = logging.getLogger(__name__)
+# Keep abandoned (unjoinable) worker threads alive: dropping the last Python
+# reference would delete a still-running QThread and abort the process.
+_THREAD_KEEP_ALIVE: set[QThread] = set()
 FIF = FluentIcon
 
 
@@ -256,16 +270,42 @@ class MoveTargetDialog(QDialog):
         self._ok_button.setText(f"移动到「{self._entries[index].name}」")
 
 
+class BrowserOperationWorker(QObject):
+    """Run one blocking file-browser operation in a worker thread."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+    login_required = Signal(str)
+
+    def __init__(self, operation: Callable[[], object]) -> None:
+        super().__init__()
+        self._operation = operation
+
+    def run(self) -> None:
+        """Run the operation and emit exactly one terminal signal."""
+        try:
+            result = self._operation()
+        except FileBrowserLoginRequiredError as exc:
+            self.login_required.emit(str(exc))
+        except FileBrowserError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            LOGGER.exception("main_window.operation.unexpected_error")
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
 class DownloadWorker(QObject):
     """Background worker for one ordinary file download."""
 
-    progress = Signal(int, object)
-    status_changed = Signal(str)
-    connections_changed = Signal(int, int)
-    succeeded = Signal(str, str)
-    stopped = Signal(str)
-    failed = Signal(str)
-    login_required = Signal(str)
+    progress = Signal(object, object, str)
+    status_changed = Signal(str, str)
+    connections_changed = Signal(int, int, str)
+    succeeded = Signal(str, str, str)
+    stopped = Signal(str, str)
+    failed = Signal(str, str)
+    login_required = Signal(str, str)
 
     def __init__(
         self,
@@ -289,9 +329,13 @@ class DownloadWorker(QObject):
                 result = self._file_browser.download_file(
                     self._item,
                     self._local_path,
-                    self.progress.emit,
-                    status_callback=self.status_changed.emit,
-                    connection_callback=self.connections_changed.emit,
+                    lambda bytes_done, total_bytes: self.progress.emit(
+                        bytes_done, total_bytes, self._task_id
+                    ),
+                    status_callback=lambda status: self.status_changed.emit(status, self._task_id),
+                    connection_callback=lambda active, maximum: self.connections_changed.emit(
+                        active, maximum, self._task_id
+                    ),
                     control=self._control,
                     task_id=self._task_id,
                 )
@@ -301,48 +345,58 @@ class DownloadWorker(QObject):
                 result = self._file_browser.download_file(
                     self._item,
                     self._local_path,
-                    self.progress.emit,
+                    lambda bytes_done, total_bytes: self.progress.emit(
+                        bytes_done, total_bytes, self._task_id
+                    ),
                 )
         except FileBrowserLoginRequiredError as exc:
-            self.login_required.emit(str(exc))
+            self.login_required.emit(str(exc), self._task_id)
         except FileBrowserError as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(str(exc), self._task_id)
+        except Exception as exc:
+            LOGGER.exception("main_window.download.unexpected_error")
+            self.failed.emit(str(exc), self._task_id)
         else:
             status = getattr(result, "status", "已完成")
             if status == "已完成":
-                self.succeeded.emit(self._item.name, str(self._local_path))
+                self.succeeded.emit(self._item.name, str(self._local_path), self._task_id)
                 return
-            self.stopped.emit(str(status))
+            self.stopped.emit(str(status), self._task_id)
 
 
 class UploadWorker(QObject):
     """Background worker for one ordinary file upload."""
 
-    succeeded = Signal(object)
-    failed = Signal(str)
-    login_required = Signal(str)
+    succeeded = Signal(object, str)
+    failed = Signal(str, str)
+    login_required = Signal(str, str)
 
     def __init__(
         self,
         file_browser: FileBrowserBackend,
         parent_id: str,
         local_path: Path,
+        task_id: str,
     ) -> None:
         super().__init__()
         self._file_browser = file_browser
         self._parent_id = parent_id
         self._local_path = local_path
+        self._task_id = task_id
 
     def run(self) -> None:
         """Run the blocking upload in a worker thread."""
         try:
             item = self._file_browser.upload_file(self._parent_id, self._local_path)
         except FileBrowserLoginRequiredError as exc:
-            self.login_required.emit(str(exc))
+            self.login_required.emit(str(exc), self._task_id)
         except FileBrowserError as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(str(exc), self._task_id)
+        except Exception as exc:
+            LOGGER.exception("main_window.upload.unexpected_error")
+            self.failed.emit(str(exc), self._task_id)
         else:
-            self.succeeded.emit(item)
+            self.succeeded.emit(item, self._task_id)
 
 
 class PlaceholderInterface(QWidget):
@@ -403,6 +457,8 @@ class TransferRecord:
 class TransferInterface(QWidget):
     """Transfer center aligned with the sibling Fluent client."""
 
+    PROGRESS_RENDER_INTERVAL_MS = 150
+
     remove_records_requested = Signal(str, object)
     open_download_folder_requested = Signal(object)
     pause_download_requested = Signal(str)
@@ -417,6 +473,8 @@ class TransferInterface(QWidget):
         self.upload_status_filter = "全部"
         self.download_status_filter = "全部"
         self._active_direction = "upload"
+        self._pending_progress_directions: set[str] = set()
+        self._progress_render_scheduled = False
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(24, 20, 24, 24)
         self._main_layout.setSpacing(12)
@@ -430,11 +488,13 @@ class TransferInterface(QWidget):
     def add_upload_record(self, record: TransferRecord) -> None:
         """Add or replace an upload task row."""
         self._upsert_record(self.upload_records, record)
+        self.flush_progress_render()
         self._render_upload_table()
 
     def add_download_record(self, record: TransferRecord) -> None:
         """Add or replace a download task row."""
         self._upsert_record(self.download_records, record)
+        self.flush_progress_render()
         self._render_download_table()
 
     def update_record(
@@ -457,6 +517,13 @@ class TransferInterface(QWidget):
         previous_bytes = record.bytes_done
         previous_time = record.updated_at
         now = time.monotonic()
+        progress_only = (
+            status is None
+            and total_bytes is None
+            and max_connections is None
+            and can_resume is None
+            and error is None
+        )
         if status is not None:
             record.status = status
         if total_bytes is not None:
@@ -479,6 +546,38 @@ class TransferInterface(QWidget):
             record.speed_bps = 0.0
             record.active_connections = 0
         record.updated_at = now
+        if record.status in TERMINAL_TRANSFER_STATUSES:
+            self._discard_pending_progress(direction)
+            self._render_direction(direction)
+        elif progress_only:
+            self._schedule_progress_render(direction)
+        else:
+            self._discard_pending_progress(direction)
+            self._render_direction(direction)
+
+    def _discard_pending_progress(self, direction: str) -> None:
+        """Drop one direction's pending coalesced render; the caller renders it now."""
+        self._pending_progress_directions.discard(direction)
+
+    def flush_progress_render(self) -> None:
+        """Render pending progress updates immediately; intended for tests and terminal updates."""
+        if not self._pending_progress_directions:
+            self._progress_render_scheduled = False
+            return
+        pending = tuple(self._pending_progress_directions)
+        self._pending_progress_directions.clear()
+        self._progress_render_scheduled = False
+        for direction in pending:
+            self._render_direction(direction)
+
+    def _schedule_progress_render(self, direction: str) -> None:
+        self._pending_progress_directions.add(direction)
+        if self._progress_render_scheduled:
+            return
+        self._progress_render_scheduled = True
+        QTimer.singleShot(self.PROGRESS_RENDER_INTERVAL_MS, self.flush_progress_render)
+
+    def _render_direction(self, direction: str) -> None:
         if direction == "upload":
             self._render_upload_table()
         else:
@@ -490,11 +589,13 @@ class TransferInterface(QWidget):
             self.upload_records = [
                 record for record in self.upload_records if record.task_id not in task_ids
             ]
+            self.flush_progress_render()
             self._render_upload_table()
             return
         self.download_records = [
             record for record in self.download_records if record.task_id not in task_ids
         ]
+        self.flush_progress_render()
         self._render_download_table()
 
     def active_download_folder(self) -> Path | None:
@@ -674,10 +775,12 @@ class TransferInterface(QWidget):
 
     def _on_upload_filter_changed(self, status: str) -> None:
         self.upload_status_filter = status
+        self.flush_progress_render()
         self._render_upload_table()
 
     def _on_download_filter_changed(self, status: str) -> None:
         self.download_status_filter = status
+        self.flush_progress_render()
         self._render_download_table()
 
     def _render_upload_table(self) -> None:
@@ -1619,6 +1722,23 @@ class MainWindow(_MainWindowBase):
         ]
         self._items: list[WopanItem] = []
         self._status_message = "请先登录"
+        self._directory_thread: QThread | None = None
+        self._directory_worker: BrowserOperationWorker | None = None
+        self._directory_parent_id: str | None = None
+        self._directory_refresh_pending = False
+        self._after_refresh: tuple[str, Callable[[list[WopanItem], bool], None]] | None = None
+        self._create_thread: QThread | None = None
+        self._create_worker: BrowserOperationWorker | None = None
+        self._create_parent_id: str | None = None
+        self._create_folder_name: str | None = None
+        self._rename_thread: QThread | None = None
+        self._rename_worker: BrowserOperationWorker | None = None
+        self._delete_thread: QThread | None = None
+        self._delete_worker: BrowserOperationWorker | None = None
+        self._move_thread: QThread | None = None
+        self._move_worker: BrowserOperationWorker | None = None
+        self._usage_thread: QThread | None = None
+        self._usage_worker: BrowserOperationWorker | None = None
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_item: WopanItem | None = None
@@ -1660,6 +1780,61 @@ class MainWindow(_MainWindowBase):
         self._init_navigation_shell()
 
         self._render_items()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Stop active background work before the window destroys its threads."""
+        # Cooperative-stop and quit every running thread first, then wait for
+        # all of them against one shared budget — waiting per thread in turn
+        # would stack each THREAD_JOIN_TIMEOUT_MS on a pathological close.
+        running: list[tuple[QThread, str, str | None]] = []
+        for thread, direction in (
+            (self._directory_thread, "directory"),
+            (self._create_thread, "create"),
+            (self._rename_thread, "rename"),
+            (self._delete_thread, "delete"),
+            (self._move_thread, "move"),
+            (self._usage_thread, "usage"),
+            (self._download_thread, "download"),
+            (self._upload_thread, "upload"),
+        ):
+            if thread is None or not thread.isRunning():
+                continue
+            if direction == "download":
+                task_id = self._download_task_id
+                if task_id is not None:
+                    control = self._download_controls.get(task_id)
+                    if control is not None:
+                        control.request_cancel()
+            elif direction == "upload":
+                task_id = self._upload_task_id
+            else:
+                task_id = None
+            thread.quit()
+            running.append((thread, direction, task_id))
+
+        for thread, direction, task_id in running:
+            if thread.isRunning() and not thread.wait(THREAD_JOIN_TIMEOUT_MS):
+                self._abandon_thread_after_timeout(thread, direction, task_id)
+
+        super().closeEvent(event)
+
+    @staticmethod
+    def _abandon_thread_after_timeout(
+        thread: QThread, direction: str, task_id: str | None
+    ) -> None:
+        # Detach so window destruction cannot delete a running QThread (qFatal),
+        # and keep a reference so Python GC cannot either. No terminate(): it
+        # can kill the thread mid-bytecode holding the GIL and deadlock.
+        thread.setParent(None)
+        _THREAD_KEEP_ALIVE.add(thread)
+        thread.finished.connect(lambda kept=thread: _THREAD_KEEP_ALIVE.discard(kept))
+        LOGGER.warning(
+            "main_window.close.thread_abandoned direction=%s task_id=%s "
+            "join_timeout_ms=%s",
+            direction,
+            task_id,
+            THREAD_JOIN_TIMEOUT_MS,
+        )
 
     def _add_sub_interface(
         self,
@@ -1800,26 +1975,55 @@ class MainWindow(_MainWindowBase):
             self.account_interface.set_usage(None)
             self.file_interface.set_storage_usage(None)
             return
+        if self._usage_thread is not None:
+            LOGGER.debug("main_window.cloud_usage.refresh.skipped_busy")
+            return
         LOGGER.info("main_window.cloud_usage.refresh.start")
-        try:
-            usage = self._file_browser.get_cloud_usage(self._auth_session.account_id)
-        except FileBrowserLoginRequiredError as exc:
-            LOGGER.info("main_window.cloud_usage.login_required")
-            self._show_login_required_error(str(exc))
-        except FileBrowserError as exc:
-            LOGGER.warning("main_window.cloud_usage.refresh.failed error=%s", exc)
-            self._set_status(f"空间信息刷新失败：{exc}")
-            InfoBar.warning(title="空间信息刷新失败", content=str(exc), parent=self)
-        else:
-            self._cloud_usage = usage
-            self.account_interface.set_usage(usage)
-            self.file_interface.set_storage_usage(usage)
-            self._set_status("空间信息已刷新")
-            LOGGER.info(
-                "main_window.cloud_usage.refresh.success used_bytes=%s total_bytes=%s",
-                usage.used_bytes,
-                usage.total_bytes,
-            )
+        account_id = self._auth_session.account_id
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.get_cloud_usage(account_id))
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_cloud_usage_succeeded)
+        worker.failed.connect(self._on_cloud_usage_failed)
+        worker.login_required.connect(self._on_cloud_usage_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_cloud_usage)
+
+        self._usage_thread = thread
+        self._usage_worker = worker
+        thread.start()
+
+    def _on_cloud_usage_succeeded(self, result: object) -> None:
+        usage = cast(WopanCloudUsage, result)
+        self._cloud_usage = usage
+        self.account_interface.set_usage(usage)
+        self.file_interface.set_storage_usage(usage)
+        self._set_status("空间信息已刷新")
+        LOGGER.info(
+            "main_window.cloud_usage.refresh.success used_bytes=%s total_bytes=%s",
+            usage.used_bytes,
+            usage.total_bytes,
+        )
+
+    def _on_cloud_usage_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.cloud_usage.refresh.failed error=%s", message)
+        self._set_status(f"空间信息刷新失败：{message}")
+        InfoBar.warning(title="空间信息刷新失败", content=message, parent=self)
+
+    def _on_cloud_usage_login_required(self, message: str) -> None:
+        LOGGER.info("main_window.cloud_usage.login_required")
+        self._show_login_required_error(message)
+
+    def _clear_cloud_usage(self) -> None:
+        self._usage_thread = None
+        self._usage_worker = None
 
     def refresh_all_information(self) -> None:
         """Reload account-side information and the currently opened directory."""
@@ -1841,37 +2045,102 @@ class MainWindow(_MainWindowBase):
         LOGGER.info("main_window.logout.requested has_session=%s", self._auth_session is not None)
         self.logout_requested.emit()
 
-    def refresh_current_directory(self) -> None:
-        """Load the current directory from the application file browser service."""
+    def refresh_current_directory(
+        self, after: Callable[[list[WopanItem], bool], None] | None = None
+    ) -> None:
+        """Load the current directory from the application file browser service.
+
+        ``after`` runs on the GUI thread with the fresh item list once the
+        refresh lands (including a trailing refresh after a busy skip); it is
+        dropped when the refresh fails. The callback also receives
+        ``still_current`` — False when the user navigated away after the
+        refresh was requested, so directory-dependent checks must be skipped.
+        Use this instead of reading ``_items`` right after this call — the
+        refresh is asynchronous.
+        """
         if self._file_browser is None:
             self._items = []
             self._set_status("请先登录")
             self._render_items()
             return
+        if after is not None:
+            self._after_refresh = (self.current_directory_id(), after)
+        if self._directory_thread is not None:
+            # A refresh is in flight; remember the latest intent so navigation
+            # during loading still lands on the current breadcrumb target.
+            self._directory_refresh_pending = True
+            LOGGER.debug("main_window.refresh.skipped_busy")
+            return
 
         parent_id = self.current_directory_id()
         LOGGER.info("main_window.refresh.start parent_id=%s", parent_id)
         self._set_status("正在加载...")
-        try:
-            self._items = self._file_browser.list_directory(parent_id)
-        except FileBrowserLoginRequiredError as exc:
-            self._items = []
-            message = str(exc)
-            LOGGER.info("main_window.refresh.login_required parent_id=%s", parent_id)
-            self._set_status(message)
-            self.login_required.emit(message)
-        except FileBrowserError as exc:
-            self._items = []
-            LOGGER.warning("main_window.refresh.failed parent_id=%s error=%s", parent_id, exc)
-            self._set_status(f"加载失败：{exc}")
-            InfoBar.error(title="加载失败", content=str(exc), parent=self)
-        else:
-            LOGGER.info(
-                "main_window.refresh.success parent_id=%s item_count=%s",
-                parent_id,
-                len(self._items),
-            )
+
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.list_directory(parent_id))
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_directory_refresh_succeeded)
+        worker.failed.connect(self._on_directory_refresh_failed)
+        worker.login_required.connect(self._on_directory_refresh_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_directory_refresh)
+
+        self._directory_thread = thread
+        self._directory_worker = worker
+        self._directory_parent_id = parent_id
+        thread.start()
+
+    def _on_directory_refresh_succeeded(self, result: object) -> None:
+        self._items = cast(list[WopanItem], result)
+        LOGGER.info(
+            "main_window.refresh.success parent_id=%s item_count=%s",
+            self._directory_parent_id,
+            len(self._items),
+        )
         self._render_items()
+        entry = self._after_refresh
+        self._after_refresh = None
+        if entry is not None:
+            requested_parent_id, after = entry
+            after(self._items, self.current_directory_id() == requested_parent_id)
+
+    def _on_directory_refresh_failed(self, message: str) -> None:
+        self._items = []
+        self._after_refresh = None
+        LOGGER.warning(
+            "main_window.refresh.failed parent_id=%s error=%s",
+            self._directory_parent_id,
+            message,
+        )
+        self._set_status(f"加载失败：{message}")
+        InfoBar.error(title="加载失败", content=message, parent=self)
+        self._render_items()
+
+    def _on_directory_refresh_login_required(self, message: str) -> None:
+        self._items = []
+        self._after_refresh = None
+        LOGGER.info(
+            "main_window.refresh.login_required parent_id=%s",
+            self._directory_parent_id,
+        )
+        self._set_status(message)
+        self.login_required.emit(message)
+        self._render_items()
+
+    def _clear_directory_refresh(self) -> None:
+        self._directory_thread = None
+        self._directory_worker = None
+        self._directory_parent_id = None
+        if self._directory_refresh_pending:
+            self._directory_refresh_pending = False
+            self.refresh_current_directory()
 
     def create_folder_with_name(self, name: str) -> None:
         """Create a folder in the current directory."""
@@ -1884,37 +2153,80 @@ class MainWindow(_MainWindowBase):
             self._set_status("请先登录")
             return
 
-        try:
-            parent_id = self.current_directory_id()
-            folder_name = _next_available_name(
-                requested_name,
-                existing_names={item.name for item in self._items},
+        if self._create_thread is not None:
+            LOGGER.debug("main_window.create_folder.skipped_busy")
+            return
+        parent_id = self.current_directory_id()
+        folder_name = _next_available_name(
+            requested_name,
+            existing_names={item.name for item in self._items},
+        )
+        LOGGER.info(
+            "main_window.create_folder.start parent_id=%s name_length=%s renamed=%s",
+            parent_id,
+            len(folder_name),
+            folder_name != requested_name,
+        )
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(
+            lambda: file_browser.create_folder(parent_id, folder_name)
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_create_folder_succeeded)
+        worker.failed.connect(self._on_create_folder_failed)
+        worker.login_required.connect(self._on_create_folder_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_create_folder)
+        self._create_thread = thread
+        self._create_worker = worker
+        self._create_parent_id = parent_id
+        self._create_folder_name = folder_name
+        thread.start()
+
+    def _on_create_folder_succeeded(self, result: object) -> None:
+        created_item = cast(WopanItem, result)
+        folder_name = self._create_folder_name or created_item.name
+        LOGGER.info("main_window.create_folder.success item_id=%s", created_item.item_id)
+        self.refresh_current_directory(
+            after=lambda items, still_current: self._report_create_visibility(
+                created_item, folder_name, still_current
             )
-            LOGGER.info(
-                "main_window.create_folder.start parent_id=%s name_length=%s renamed=%s",
-                parent_id,
-                len(folder_name),
-                folder_name != requested_name,
+        )
+
+    def _report_create_visibility(
+        self, created_item: WopanItem, folder_name: str, still_current: bool
+    ) -> None:
+        if still_current and not any(
+            item.item_id == created_item.item_id for item in self._items
+        ):
+            LOGGER.warning(
+                "main_window.create_folder.not_visible_after_refresh item_id=%s parent_id=%s",
+                created_item.item_id,
+                created_item.parent_id,
             )
-            created_item = self._file_browser.create_folder(parent_id, folder_name)
-        except FileBrowserLoginRequiredError as exc:
-            self._show_login_required_error(str(exc))
-        except FileBrowserError as exc:
-            LOGGER.warning("main_window.create_folder.failed error=%s", exc)
-            self._set_status(f"新建文件夹失败：{exc}")
-            InfoBar.error(title="新建文件夹失败", content=str(exc), parent=self)
+            self._set_status(f"已创建「{folder_name}」，但刷新后未在当前目录看到，请稍后再刷新")
         else:
-            LOGGER.info("main_window.create_folder.success item_id=%s", created_item.item_id)
-            self.refresh_current_directory()
-            if not any(item.item_id == created_item.item_id for item in self._items):
-                LOGGER.warning(
-                    "main_window.create_folder.not_visible_after_refresh item_id=%s parent_id=%s",
-                    created_item.item_id,
-                    parent_id,
-                )
-                self._set_status(f"已创建「{folder_name}」，但刷新后未在当前目录看到，请稍后再刷新")
-            else:
-                InfoBar.success(title="创建成功", content=f"已创建「{folder_name}」", parent=self)
+            InfoBar.success(title="创建成功", content=f"已创建「{folder_name}」", parent=self)
+
+    def _on_create_folder_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.create_folder.failed error=%s", message)
+        self._set_status(f"新建文件夹失败：{message}")
+        InfoBar.error(title="新建文件夹失败", content=message, parent=self)
+
+    def _on_create_folder_login_required(self, message: str) -> None:
+        self._show_login_required_error(message)
+
+    def _clear_create_folder(self) -> None:
+        self._create_thread = None
+        self._create_worker = None
+        self._create_parent_id = None
+        self._create_folder_name = None
 
     def rename_displayed_item(self, row: int, new_name: str) -> None:
         """Rename a displayed file or folder row."""
@@ -1930,15 +2242,40 @@ class MainWindow(_MainWindowBase):
             self._set_status("请先登录")
             return
 
-        try:
-            self._file_browser.rename_item(item, item_name)
-        except FileBrowserLoginRequiredError as exc:
-            self._show_login_required_error(str(exc))
-        except FileBrowserError as exc:
-            self._set_status(f"重命名失败：{exc}")
-            InfoBar.error(title="重命名失败", content=str(exc), parent=self)
-        else:
-            self.refresh_current_directory()
+        if self._rename_thread is not None:
+            LOGGER.debug("main_window.rename.skipped_busy")
+            return
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.rename_item(item, item_name))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_rename_succeeded)
+        worker.failed.connect(self._on_rename_failed)
+        worker.login_required.connect(self._on_rename_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_rename)
+        self._rename_thread = thread
+        self._rename_worker = worker
+        thread.start()
+
+    def _on_rename_succeeded(self, result: object) -> None:
+        self.refresh_current_directory()
+
+    def _on_rename_failed(self, message: str) -> None:
+        self._set_status(f"重命名失败：{message}")
+        InfoBar.error(title="重命名失败", content=message, parent=self)
+
+    def _on_rename_login_required(self, message: str) -> None:
+        self._show_login_required_error(message)
+
+    def _clear_rename(self) -> None:
+        self._rename_thread = None
+        self._rename_worker = None
 
     def delete_displayed_item(self, row: int) -> None:
         """Delete a displayed file or folder row."""
@@ -1949,15 +2286,40 @@ class MainWindow(_MainWindowBase):
             self._set_status("请先登录")
             return
 
-        try:
-            self._file_browser.delete_item(item)
-        except FileBrowserLoginRequiredError as exc:
-            self._show_login_required_error(str(exc))
-        except FileBrowserError as exc:
-            self._set_status(f"删除失败：{exc}")
-            InfoBar.error(title="删除失败", content=str(exc), parent=self)
-        else:
-            self.refresh_current_directory()
+        if self._delete_thread is not None:
+            LOGGER.debug("main_window.delete.skipped_busy")
+            return
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.delete_item(item))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_delete_succeeded)
+        worker.failed.connect(self._on_delete_failed)
+        worker.login_required.connect(self._on_delete_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_delete)
+        self._delete_thread = thread
+        self._delete_worker = worker
+        thread.start()
+
+    def _on_delete_succeeded(self, result: object) -> None:
+        self.refresh_current_directory()
+
+    def _on_delete_failed(self, message: str) -> None:
+        self._set_status(f"删除失败：{message}")
+        InfoBar.error(title="删除失败", content=message, parent=self)
+
+    def _on_delete_login_required(self, message: str) -> None:
+        self._show_login_required_error(message)
+
+    def _clear_delete(self) -> None:
+        self._delete_thread = None
+        self._delete_worker = None
 
     def move_displayed_item(self, row: int, target_parent_id: str) -> None:
         """Move a displayed file or folder row to another directory."""
@@ -1973,15 +2335,40 @@ class MainWindow(_MainWindowBase):
             self._set_status("请先登录")
             return
 
-        try:
-            self._file_browser.move_item(item, target_id)
-        except FileBrowserLoginRequiredError as exc:
-            self._show_login_required_error(str(exc))
-        except FileBrowserError as exc:
-            self._set_status(f"移动失败：{exc}")
-            InfoBar.error(title="移动失败", content=str(exc), parent=self)
-        else:
-            self.refresh_current_directory()
+        if self._move_thread is not None:
+            LOGGER.debug("main_window.move.skipped_busy")
+            return
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.move_item(item, target_id))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_move_succeeded)
+        worker.failed.connect(self._on_move_failed)
+        worker.login_required.connect(self._on_move_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_move)
+        self._move_thread = thread
+        self._move_worker = worker
+        thread.start()
+
+    def _on_move_succeeded(self, result: object) -> None:
+        self.refresh_current_directory()
+
+    def _on_move_failed(self, message: str) -> None:
+        self._set_status(f"移动失败：{message}")
+        InfoBar.error(title="移动失败", content=message, parent=self)
+
+    def _on_move_login_required(self, message: str) -> None:
+        self._show_login_required_error(message)
+
+    def _clear_move(self) -> None:
+        self._move_thread = None
+        self._move_worker = None
 
     def download_displayed_item(
         self,
@@ -2284,44 +2671,12 @@ class MainWindow(_MainWindowBase):
 
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_download_progress)
-        worker.status_changed.connect(
-            lambda status, record_id=task_id: self._on_download_status_changed(
-                status,
-                task_id=record_id,
-            )
-        )
-        worker.connections_changed.connect(
-            lambda active, maximum, record_id=task_id: self._on_download_connections_changed(
-                active,
-                maximum,
-                task_id=record_id,
-            )
-        )
-        worker.succeeded.connect(
-            lambda item_name, path, record_id=task_id: self._on_download_succeeded(
-                item_name,
-                path,
-                task_id=record_id,
-            )
-        )
-        worker.stopped.connect(
-            lambda status, record_id=task_id: self._on_download_stopped(
-                status,
-                task_id=record_id,
-            )
-        )
-        worker.failed.connect(
-            lambda message, record_id=task_id: self._on_download_failed(
-                message,
-                task_id=record_id,
-            )
-        )
-        worker.login_required.connect(
-            lambda message, record_id=task_id: self._on_download_login_required(
-                message,
-                task_id=record_id,
-            )
-        )
+        worker.status_changed.connect(self._on_download_status_changed)
+        worker.connections_changed.connect(self._on_download_connections_changed)
+        worker.succeeded.connect(self._on_download_succeeded)
+        worker.stopped.connect(self._on_download_stopped)
+        worker.failed.connect(self._on_download_failed)
+        worker.login_required.connect(self._on_download_login_required)
         worker.succeeded.connect(thread.quit)
         worker.stopped.connect(thread.quit)
         worker.failed.connect(thread.quit)
@@ -2380,28 +2735,13 @@ class MainWindow(_MainWindowBase):
             return
 
         thread = QThread(self)
-        worker = UploadWorker(self._file_browser, parent_id, local_path)
+        worker = UploadWorker(self._file_browser, parent_id, local_path, task_id)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
-        worker.succeeded.connect(
-            lambda item, record_id=task_id: self._on_upload_succeeded(
-                item,
-                task_id=record_id,
-            )
-        )
-        worker.failed.connect(
-            lambda message, record_id=task_id: self._on_upload_failed(
-                message,
-                task_id=record_id,
-            )
-        )
-        worker.login_required.connect(
-            lambda message, record_id=task_id: self._on_upload_login_required(
-                message,
-                task_id=record_id,
-            )
-        )
+        worker.succeeded.connect(self._on_upload_succeeded)
+        worker.failed.connect(self._on_upload_failed)
+        worker.login_required.connect(self._on_upload_login_required)
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
@@ -2422,7 +2762,6 @@ class MainWindow(_MainWindowBase):
         self,
         bytes_read: int,
         total_bytes: object,
-        *,
         task_id: str | None = None,
     ) -> None:
         total = total_bytes if isinstance(total_bytes, int) and total_bytes > 0 else None
@@ -2431,7 +2770,6 @@ class MainWindow(_MainWindowBase):
             self.transfer_interface.update_record(
                 "download",
                 record_id,
-                status="下载中",
                 bytes_done=bytes_read,
                 total_bytes=total,
             )
@@ -2440,7 +2778,7 @@ class MainWindow(_MainWindowBase):
             return
         self._set_status(f"正在下载：{_format_bytes(bytes_read)} / {_format_bytes(total)}")
 
-    def _on_download_status_changed(self, status: str, *, task_id: str | None = None) -> None:
+    def _on_download_status_changed(self, status: str, task_id: str | None = None) -> None:
         record_id = task_id or self._download_task_id
         if record_id is None:
             return
@@ -2457,7 +2795,6 @@ class MainWindow(_MainWindowBase):
         self,
         active_connections: int,
         max_connections: int,
-        *,
         task_id: str | None = None,
     ) -> None:
         record_id = task_id or self._download_task_id
@@ -2474,7 +2811,6 @@ class MainWindow(_MainWindowBase):
         self,
         item_name: str,
         local_path: str,
-        *,
         task_id: str | None = None,
     ) -> None:
         path = Path(local_path)
@@ -2497,13 +2833,13 @@ class MainWindow(_MainWindowBase):
         self._set_status(f"下载完成：{path.name}")
         InfoBar.success(title="下载完成", content=path.name, parent=self)
 
-    def _on_download_failed(self, message: str, *, task_id: str | None = None) -> None:
+    def _on_download_failed(self, message: str, task_id: str | None = None) -> None:
         LOGGER.warning("main_window.download.failed error=%s", message)
         self._mark_transfer_failed("download", task_id or self._download_task_id, message)
         self._set_status(f"下载失败：{message}")
         InfoBar.error(title="下载失败", content=message, parent=self)
 
-    def _on_download_stopped(self, status: str, *, task_id: str | None = None) -> None:
+    def _on_download_stopped(self, status: str, task_id: str | None = None) -> None:
         record_id = task_id or self._download_task_id
         if record_id is not None:
             self.transfer_interface.update_record(
@@ -2515,7 +2851,7 @@ class MainWindow(_MainWindowBase):
             )
         self._set_status(f"下载状态：{status}")
 
-    def _on_download_login_required(self, message: str, *, task_id: str | None = None) -> None:
+    def _on_download_login_required(self, message: str, task_id: str | None = None) -> None:
         self._mark_transfer_failed("download", task_id or self._download_task_id, message)
         self._show_login_required_error(message)
 
@@ -2528,7 +2864,7 @@ class MainWindow(_MainWindowBase):
         self._download_task_id = None
         self.update_operation_controls()
 
-    def _on_upload_succeeded(self, item: object, *, task_id: str | None = None) -> None:
+    def _on_upload_succeeded(self, item: object, task_id: str | None = None) -> None:
         if not isinstance(item, WopanItem):
             LOGGER.warning("main_window.upload.invalid_success_payload")
             self._on_upload_failed("上传结果无效", task_id=task_id)
@@ -2548,8 +2884,14 @@ class MainWindow(_MainWindowBase):
                 bytes_done=total or 0,
                 total_bytes=total,
             )
-        self.refresh_current_directory()
-        visible = any(
+        self.refresh_current_directory(
+            after=lambda items, still_current: self._report_upload_visibility(
+                item, still_current
+            )
+        )
+
+    def _report_upload_visibility(self, item: WopanItem, still_current: bool) -> None:
+        visible = not still_current or any(
             displayed_item.item_id == item.item_id
             or (item.download_id is not None and displayed_item.download_id == item.download_id)
             or displayed_item.name == item.name
@@ -2561,13 +2903,13 @@ class MainWindow(_MainWindowBase):
             return
         self._set_status(f"已上传「{item.name}」，但刷新后未在当前目录看到，请稍后再刷新")
 
-    def _on_upload_failed(self, message: str, *, task_id: str | None = None) -> None:
+    def _on_upload_failed(self, message: str, task_id: str | None = None) -> None:
         LOGGER.warning("main_window.upload.failed error=%s", message)
         self._mark_transfer_failed("upload", task_id or self._upload_task_id, message)
         self._set_status(f"上传失败：{message}")
         InfoBar.error(title="上传失败", content=message, parent=self)
 
-    def _on_upload_login_required(self, message: str, *, task_id: str | None = None) -> None:
+    def _on_upload_login_required(self, message: str, task_id: str | None = None) -> None:
         self._mark_transfer_failed("upload", task_id or self._upload_task_id, message)
         self._show_login_required_error(message)
 
@@ -2633,6 +2975,10 @@ class MainWindow(_MainWindowBase):
                 for task_id in normalized_ids:
                     remove_download_record(task_id)
         self.transfer_interface.remove_records(direction, normalized_ids)
+        if direction == "download":
+            for task_id in normalized_ids:
+                self._download_items_by_task.pop(task_id, None)
+                self._download_controls.pop(task_id, None)
 
     def _pause_download_task(self, task_id: str) -> None:
         control = self._download_controls.get(task_id)

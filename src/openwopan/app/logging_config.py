@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import faulthandler
 import logging
+import sys
+import threading
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import IO, Any
 
 from platformdirs import user_log_path
 
 from openwopan.storage.settings import APP_AUTHOR, APP_NAME, AppSettings
 
 LOG_FILE_NAME = "openwopan.log"
+CRASH_LOG_FILE_NAME = "openwopan-crash.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+LOGGER = logging.getLogger(__name__)
+_fault_handler_stream: IO[str] | None = None
 
 
 def app_log_path() -> Path:
@@ -50,3 +59,59 @@ def set_logging_level(level_name: str) -> None:
     logger.setLevel(level)
     for handler in logger.handlers:
         handler.setLevel(level)
+
+
+def install_crash_reporting(
+    log_path: Path,
+    on_crash: Callable[[Path], None] | None = None,
+) -> Path | None:
+    """Leave evidence in the logs when the process dies unexpectedly.
+
+    Unhandled Python exceptions are written to the rotating application log,
+    and native faults (e.g. Qt crashes in threads) are dumped to a crash file
+    next to it via faulthandler. Requires configure_logging() first so the
+    exception records reach a file instead of a discarded stderr.
+    """
+    global _fault_handler_stream
+    crash_path = log_path.parent / CRASH_LOG_FILE_NAME
+    try:
+        crash_path.parent.mkdir(parents=True, exist_ok=True)
+        _fault_handler_stream = open(crash_path, "a", encoding="utf-8")
+        faulthandler.enable(file=_fault_handler_stream)
+    except OSError:
+        LOGGER.warning("app.crash.faulthandler_unavailable")
+        return None
+
+    previous_hook = sys.excepthook
+    previous_thread_hook = threading.excepthook
+
+    def _excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
+        if not issubclass(exc_type, KeyboardInterrupt):
+            LOGGER.error("app.crash.unhandled_exception", exc_info=(exc_type, exc_value, exc_tb))
+            if on_crash is not None:
+                try:
+                    on_crash(log_path)
+                except Exception:
+                    LOGGER.warning("app.crash.dialog_failed", exc_info=True)
+        previous_hook(exc_type, exc_value, exc_tb)
+
+    def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
+        thread_name = getattr(args.thread, "name", None)
+        exc_value = args.exc_value
+        if exc_value is not None:
+            LOGGER.error(
+                "app.crash.thread_exception thread=%s",
+                thread_name,
+                exc_info=(args.exc_type, exc_value, args.exc_traceback),
+            )
+        else:
+            LOGGER.error(
+                "app.crash.thread_exception thread=%s exc_type=%s",
+                thread_name,
+                args.exc_type.__name__,
+            )
+        previous_thread_hook(args)
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+    return crash_path

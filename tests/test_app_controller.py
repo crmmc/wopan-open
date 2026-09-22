@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+from PySide6.QtCore import QObject
+from PySide6.QtCore import QThread as RealQThread
+from PySide6.QtWidgets import QApplication
+
+from openwopan.app import controller as controller_module
 from openwopan.app.bootstrap import AppDependencies
 from openwopan.app.controller import ApplicationController
 from openwopan.auth.session import AuthSession
@@ -11,6 +20,11 @@ from openwopan.storage.credentials import CredentialStore
 from openwopan.storage.settings import AppSettings
 from openwopan.ui.main_window import MainWindow
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+
+
+@pytest.fixture(autouse=True)
+def _sync_controller_main_window(sync_threads: None) -> None:
+    """Keep controller tests synchronous while directory refresh is worker-backed."""
 
 
 class FakeSignal:
@@ -134,6 +148,19 @@ def _build_harness(
         lambda: quit_calls.append("quit"),
     )
     return ControllerHarness(controller, main_window, login_window, coordinator, quit_calls)
+
+
+def _wait_until(
+    qapp: QApplication, predicate: Callable[[], bool], timeout: float = 5.0
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    qapp.processEvents()
+    return predicate()
 
 
 def test_controller_prompts_login_window(qapp: object) -> None:
@@ -449,3 +476,114 @@ def test_controller_logout_deletes_credentials_on_success(
 
     assert ("svc", "wopan-session:last-account-id") not in fake_keyring.values
     assert harness.login_window.shown is True
+
+
+def test_controller_complete_login_ignores_duplicate_in_flight(qapp: object) -> None:
+    harness = _build_harness()
+    harness.controller._login_thread = RealQThread()
+
+    harness.controller.complete_login(
+        "WoCloud-Web-Token=%2212345678-1234-1234-1234-123456789abc%22"
+    )
+
+    assert harness.coordinator.cookie_headers == []
+    harness.controller._login_thread = None
+
+
+def test_controller_restore_updates_main_window_on_gui_thread(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui_thread_id = threading.get_ident()
+    worker_thread_ids: list[int] = []
+    handler_thread_ids: list[int] = []
+
+    class _ThreadCapturingCoordinator(FakeLoginCoordinator):
+        def restore_last_session(self) -> RestoredWebLogin | None:
+            worker_thread_ids.append(threading.get_ident())
+            return super().restore_last_session()
+
+    class _ThreadCapturingWindow(MainWindow):
+        def set_auth_session(self, session: AuthSession) -> None:
+            handler_thread_ids.append(threading.get_ident())
+            super().set_auth_session(session)
+
+    coordinator = _ThreadCapturingCoordinator(
+        restored_login=RestoredWebLogin(
+            session=AuthSession(account_id="user-1", display_name="User One"),
+            cookie_header="WoCloud-Web-Token=%2212345678-1234-1234-1234-123456789abc%22",
+        )
+    )
+    dependencies = AppDependencies(
+        credential_store=CredentialStore(),
+        web_login_coordinator=coordinator,  # type: ignore[arg-type]
+        file_browser_factory=lambda _cookie, _settings: FakeFileBrowser(),  # type: ignore[arg-type]
+        settings=AppSettings(),
+    )
+    window = _ThreadCapturingWindow()
+    controller = ApplicationController(
+        dependencies,
+        window,
+        FakeLoginWindow,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(controller_module, "QThread", RealQThread)
+    monkeypatch.setattr(
+        controller_module.ControllerOperationWorker,
+        "moveToThread",
+        QObject.moveToThread,
+    )
+
+    controller.start()
+
+    assert _wait_until(qapp, lambda: controller._restore_thread is None)
+    assert worker_thread_ids
+    assert worker_thread_ids[0] != gui_thread_id
+    assert handler_thread_ids == [gui_thread_id]
+
+
+def test_controller_complete_login_updates_main_window_on_gui_thread(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui_thread_id = threading.get_ident()
+    worker_thread_ids: list[int] = []
+    handler_thread_ids: list[int] = []
+
+    class _ThreadCapturingCoordinator(FakeLoginCoordinator):
+        def complete(self, login_result: Any) -> AuthSession:
+            worker_thread_ids.append(threading.get_ident())
+            return super().complete(login_result)
+
+    class _ThreadCapturingWindow(MainWindow):
+        def set_auth_session(self, session: AuthSession) -> None:
+            handler_thread_ids.append(threading.get_ident())
+            super().set_auth_session(session)
+
+    coordinator = _ThreadCapturingCoordinator()
+    dependencies = AppDependencies(
+        credential_store=CredentialStore(),
+        web_login_coordinator=coordinator,  # type: ignore[arg-type]
+        file_browser_factory=lambda _cookie, _settings: FakeFileBrowser(),  # type: ignore[arg-type]
+        settings=AppSettings(),
+    )
+    window = _ThreadCapturingWindow()
+    controller = ApplicationController(
+        dependencies,
+        window,
+        FakeLoginWindow,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(controller_module, "QThread", RealQThread)
+    monkeypatch.setattr(
+        controller_module.ControllerOperationWorker,
+        "moveToThread",
+        QObject.moveToThread,
+    )
+
+    controller.complete_login(
+        "WoCloud-Web-Token=%2212345678-1234-1234-1234-123456789abc%22"
+    )
+
+    assert _wait_until(qapp, lambda: controller._login_thread is None)
+    assert worker_thread_ids
+    assert worker_thread_ids[0] != gui_thread_id
+    assert handler_thread_ids == [gui_thread_id]
