@@ -12,7 +12,11 @@ import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from openwopan.wopan.client import WopanClient
-from openwopan.wopan.errors import WopanBusinessError, WopanResponseError
+from openwopan.wopan.errors import (
+    WopanBusinessError,
+    WopanResponseError,
+    WopanUploadCancelledError,
+)
 from openwopan.wopan.models import WopanItemKind
 
 TOKEN = "1234567890abcdef-token"
@@ -306,6 +310,34 @@ def test_upload_file_gets_zone_and_posts_single_part(tmp_path: Path) -> None:
     assert len(file_info["batchNo"]) == 14
 
 
+def test_upload_file_retries_transient_upload_zone_gateway_error(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_text("upload-content")
+    zone_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal zone_attempts
+        if str(request.url).endswith("/wohome/dispatcher"):
+            zone_attempts += 1
+            if zone_attempts == 1:
+                return httpx.Response(504, request=request)
+            return _success_response({"url": "https://upload.example.test"})
+        return httpx.Response(
+            200,
+            json={"code": "0000", "data": {"fid": "fid-1"}, "msg": "ok"},
+        )
+
+    client = WopanClient(
+        COOKIE_HEADER,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    item = client.upload_file("folder-1", local_file, retry_max_attempts=1)
+
+    assert item.item_id == "fid-1"
+    assert zone_attempts == 2
+
+
 def test_upload_file_posts_multiple_parts_when_configured(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -352,6 +384,155 @@ def test_upload_file_posts_multiple_parts_when_configured(
         3: b"klmno",
         4: b"pq",
     }
+
+
+def test_upload_cancel_before_network_starts(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"data")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _success_response({"url": "https://upload.example.test"})
+
+    client = WopanClient(
+        COOKIE_HEADER, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(WopanUploadCancelledError):
+        client.upload_file("0", local_file, cancel_requested=lambda: True)
+
+    assert requests == []
+
+
+def test_upload_cancel_after_zone_request_does_not_start_part(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"data")
+    requests: list[httpx.Request] = []
+    cancelled = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal cancelled
+        requests.append(request)
+        cancelled = True
+        return _success_response({"url": "https://upload.example.test"})
+
+    client = WopanClient(
+        COOKIE_HEADER, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(WopanUploadCancelledError):
+        client.upload_file("0", local_file, cancel_requested=lambda: cancelled)
+
+    assert len(requests) == 1
+
+
+def test_upload_cancel_after_inflight_part_does_not_report_success(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"data")
+    cancelled = False
+    requests: list[httpx.Request] = []
+    progress: list[tuple[int, int]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal cancelled
+        requests.append(request)
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return _success_response({"url": "https://upload.example.test"})
+        cancelled = True
+        return httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-1"}})
+
+    client = WopanClient(
+        COOKIE_HEADER, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(WopanUploadCancelledError):
+        client.upload_file(
+            "0", local_file, cancel_requested=lambda: cancelled,
+            progress_callback=lambda done, total: progress.append((done, total)),
+        )
+
+    assert len(requests) == 2
+    assert progress == []
+
+
+def test_upload_cancel_queued_parts_before_they_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"abcdefghijklmnopq")
+    cancelled = False
+    part_requests: list[httpx.Request] = []
+    progress: list[tuple[int, int]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal cancelled
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return _success_response({"url": "https://upload.example.test"})
+        part_requests.append(request)
+        cancelled = True
+        return httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-1"}})
+
+    client = WopanClient(
+        COOKIE_HEADER, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(WopanUploadCancelledError):
+        client.upload_file(
+            "0", local_file, upload_part_size_mb=5, max_upload_threads=1,
+            cancel_requested=lambda: cancelled,
+            progress_callback=lambda done, total: progress.append((done, total)),
+        )
+
+    assert len(part_requests) == 1
+    assert progress == []
+
+
+def test_upload_cancel_prevents_part_retry_after_http_error(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"data")
+    cancelled = False
+    part_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal cancelled, part_attempts
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return _success_response({"url": "https://upload.example.test"})
+        part_attempts += 1
+        cancelled = True
+        return httpx.Response(503, request=request)
+
+    client = WopanClient(
+        COOKIE_HEADER, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(WopanUploadCancelledError):
+        client.upload_file("0", local_file, cancel_requested=lambda: cancelled)
+
+    assert part_attempts == 1
+
+
+def test_upload_cancel_prevents_zone_retry(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"data")
+    cancelled = False
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal cancelled
+        requests.append(request)
+        cancelled = True
+        return httpx.Response(504, request=request)
+
+    client = WopanClient(
+        COOKIE_HEADER, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+    with pytest.raises(WopanUploadCancelledError):
+        client.upload_file("0", local_file, cancel_requested=lambda: cancelled)
+
+    assert len(requests) == 1
 
 
 def test_upload_file_falls_back_to_default_zone_url(tmp_path: Path) -> None:

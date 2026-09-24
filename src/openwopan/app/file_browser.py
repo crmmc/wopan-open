@@ -34,7 +34,11 @@ from openwopan.tasks.upload import (
     scan_folder_tree,
 )
 from openwopan.wopan.client import ORIGIN, REFERER, ROOT_DIRECTORY_ID, WopanClient
-from openwopan.wopan.errors import WopanAuthenticationError, WopanError
+from openwopan.wopan.errors import (
+    WopanAuthenticationError,
+    WopanError,
+    WopanUploadCancelledError,
+)
 from openwopan.wopan.models import (
     DownloadInfo,
     WopanCloudUsage,
@@ -52,6 +56,10 @@ DownloadEventCallback = SchedulerEventCallback
 
 class FileBrowserError(Exception):
     """Base error for UI-facing file browser failures."""
+
+
+class FileBrowserUploadCancelledError(FileBrowserError):
+    """Raised when an upload was cooperatively cancelled."""
 
 
 class FileBrowserLoginRequiredError(FileBrowserError):
@@ -118,6 +126,7 @@ class FileBrowserBackend(Protocol):
         *,
         upload_name: str | None = None,
         progress_callback: UploadProgressCallback | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> WopanItem:
         """Upload one local file to a directory."""
 
@@ -127,6 +136,7 @@ class FileBrowserBackend(Protocol):
         local_root: Path,
         *,
         root_name: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> FolderUploadJob:
         """Create the cloud directory tree for a local folder upload."""
 
@@ -398,6 +408,7 @@ class FileBrowserService:
         *,
         upload_name: str | None = None,
         progress_callback: UploadProgressCallback | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> WopanItem:
         """Upload one local file to a directory."""
         if not parent_id:
@@ -406,11 +417,16 @@ class FileBrowserService:
             raise FileBrowserError("本地文件不存在")
         if not local_path.is_file():
             raise FileBrowserError("只能上传文件")
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserUploadCancelledError("上传已取消")
         if upload_name is not None:
             if not upload_name:
                 raise FileBrowserError("上传文件名称不能为空")
             if upload_name in self._existing_names(parent_id):
                 raise FileBrowserError("上传目标已存在，请刷新后重试")
+
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserUploadCancelledError("上传已取消")
 
         LOGGER.info(
             "file_browser.upload_file.start parent_id=%s file_name_length=%s",
@@ -419,6 +435,30 @@ class FileBrowserService:
         )
         try:
             if progress_callback is None:
+                if cancel_requested is None:
+                    item = self._call(
+                        lambda: self._client.upload_file(
+                            parent_id,
+                            local_path,
+                            upload_part_size_mb=self._settings.upload_part_size_mb,
+                            max_upload_threads=self._settings.max_upload_threads,
+                            retry_max_attempts=self._settings.retry_max_attempts,
+                            upload_name=upload_name,
+                        )
+                    )
+                else:
+                    item = self._call(
+                        lambda: self._client.upload_file(
+                            parent_id,
+                            local_path,
+                            upload_part_size_mb=self._settings.upload_part_size_mb,
+                            max_upload_threads=self._settings.max_upload_threads,
+                            retry_max_attempts=self._settings.retry_max_attempts,
+                            upload_name=upload_name,
+                            cancel_requested=cancel_requested,
+                        )
+                    )
+            elif cancel_requested is None:
                 item = self._call(
                     lambda: self._client.upload_file(
                         parent_id,
@@ -427,6 +467,7 @@ class FileBrowserService:
                         max_upload_threads=self._settings.max_upload_threads,
                         retry_max_attempts=self._settings.retry_max_attempts,
                         upload_name=upload_name,
+                        progress_callback=progress_callback,
                     )
                 )
             else:
@@ -439,6 +480,7 @@ class FileBrowserService:
                         retry_max_attempts=self._settings.retry_max_attempts,
                         upload_name=upload_name,
                         progress_callback=progress_callback,
+                        cancel_requested=cancel_requested,
                     )
                 )
         except httpx.HTTPStatusError as exc:
@@ -468,6 +510,7 @@ class FileBrowserService:
         local_root: Path,
         *,
         root_name: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> FolderUploadJob:
         """Create the cloud directory tree for a local folder upload.
 
@@ -481,6 +524,8 @@ class FileBrowserService:
             raise FileBrowserError("目标文件夹不能为空")
         if not local_root.name:
             raise FileBrowserError("上传文件夹不能为空")
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserUploadCancelledError("上传已取消")
         LOGGER.info(
             "file_browser.prepare_folder_upload.start parent_id=%s root_name_length=%s",
             parent_id,
@@ -497,6 +542,8 @@ class FileBrowserService:
             raise FileBrowserError(f"扫描本地文件夹失败：{exc}") from exc
 
         try:
+            if cancel_requested is not None and cancel_requested():
+                raise FileBrowserUploadCancelledError("上传已取消")
             existing_root_names = self._existing_names(parent_id)
             if root_name is None:
                 resolved_root_name = next_available_name(plan.root_name, existing_root_names)
@@ -506,6 +553,8 @@ class FileBrowserService:
                 if root_name in existing_root_names:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 resolved_root_name = root_name
+            if cancel_requested is not None and cancel_requested():
+                raise FileBrowserUploadCancelledError("上传已取消")
             root_item = self.create_folder(parent_id, resolved_root_name)
             dir_ids = {"": root_item.item_id}
             used_names: dict[str, set[str]] = {}
@@ -516,17 +565,23 @@ class FileBrowserService:
                 return used_names[rel_dir]
 
             for rel_path in plan.folders:
+                if cancel_requested is not None and cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
                 rel_parent, _, local_name = rel_path.rpartition("/")
                 parent_names = taken_names(rel_parent)
                 if root_name is not None and local_name in parent_names:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 folder_name = next_available_name(local_name, parent_names)
+                if cancel_requested is not None and cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
                 created = self.create_folder(dir_ids[rel_parent], folder_name)
                 parent_names.add(folder_name)
                 dir_ids[rel_path] = created.item_id
 
             planned_files: list[PlannedUploadFile] = []
             for planned in plan.files:
+                if cancel_requested is not None and cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
                 names = taken_names(planned.rel_dir)
                 if root_name is not None and planned.name in names:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
@@ -542,6 +597,8 @@ class FileBrowserService:
                 )
         except FileBrowserLoginRequiredError:
             raise
+        except FileBrowserUploadCancelledError:
+            raise
         except FileBrowserError as exc:
             LOGGER.warning(
                 "file_browser.prepare_folder_upload.failed error_type=%s",
@@ -549,6 +606,8 @@ class FileBrowserService:
             )
             raise FileBrowserError(f"创建目录失败：{exc}") from exc
 
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserUploadCancelledError("上传已取消")
         total_bytes = sum(planned.size for planned in planned_files)
         LOGGER.info(
             "file_browser.prepare_folder_upload.success parent_id=%s folder_count=%s "
@@ -586,6 +645,8 @@ class FileBrowserService:
         except WopanAuthenticationError as exc:
             LOGGER.info("file_browser.login_required")
             raise FileBrowserLoginRequiredError("登录已过期，请重新登录") from exc
+        except WopanUploadCancelledError as exc:
+            raise FileBrowserUploadCancelledError("上传已取消") from exc
         except WopanError as exc:
             LOGGER.warning("file_browser.protocol_error error=%s", exc)
             raise FileBrowserError(str(exc)) from exc
@@ -599,8 +660,9 @@ class FileBrowserService:
         return self._download_store.list_records()
 
     def remove_download_record(self, task_id: str) -> None:
-        """Remove a persisted download record and temporary state."""
-        self._download_store.delete(task_id)
+        """Remove a paused or finished download and its temporary state."""
+        if not self._download_scheduler.remove_record(task_id):
+            self._download_store.delete(task_id)
 
 
 def build_file_browser_service(

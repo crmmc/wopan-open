@@ -27,6 +27,7 @@ from openwopan.tasks.download import (
 
 LOGGER = logging.getLogger(__name__)
 _TERMINAL_STATUSES = frozenset({"已完成", "失败", "已取消"})
+REMOVE_WAIT_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +111,9 @@ class DownloadScheduler:
         self._active_connections: dict[str, int] = {}
         self._queue: deque[str] = deque()
         self._futures: dict[str, Future[DownloadResult]] = {}
+        self._removing: dict[str, threading.Event] = {}
+        self._removal_errors: dict[str, OSError] = {}
+        self._retired_ids: set[str] = set()
         self._closed = False
 
     def set_event_callback(self, callback: DownloadEventCallback | None) -> None:
@@ -121,7 +125,7 @@ class DownloadScheduler:
         """Persist and enqueue a task, returning its stable task id."""
         with self._lock:
             self._ensure_open()
-            if task.task_id in self._tasks:
+            if task.task_id in self._tasks or task.task_id in self._retired_ids:
                 raise ValueError(f"download task already exists: {task.task_id}")
             state = task.store.load(task.task_id) or DownloadTaskState(
                 task_id=task.task_id,
@@ -180,7 +184,7 @@ class DownloadScheduler:
         """Move a paused or failed task back to the FIFO queue."""
         with self._lock:
             state = self._state(task_id)
-            if state.status not in {"已暂停", "失败"}:
+            if state.status not in {"已暂停", "失败"} or task_id in self._removing:
                 return False
             state.status = "等待中"
             state.error = ""
@@ -208,6 +212,39 @@ class DownloadScheduler:
             self._start_queued_locked()
             return True
 
+    def remove_record(self, task_id: str) -> bool:
+        """Forget a paused or terminal task and delete its recoverable data."""
+        with self._lock:
+            state = self._states.get(task_id)
+            if state is None:
+                return False
+            if state.status != "已暂停" and state.status not in _TERMINAL_STATUSES:
+                raise ValueError("cannot remove an active download task")
+            if task_id in self._futures:
+                finished = self._removing.setdefault(task_id, threading.Event())
+            else:
+                self._delete_record_locked(task_id)
+                return True
+        if not finished.wait(REMOVE_WAIT_TIMEOUT_SECONDS):
+            with self._lock:
+                if not finished.is_set():
+                    self._removing.pop(task_id, None)
+                    raise TimeoutError("下载任务尚未退出，请稍后重试删除")
+        with self._lock:
+            error = self._removal_errors.pop(task_id, None)
+        if error is not None:
+            raise error
+        return True
+
+    def _delete_record_locked(self, task_id: str) -> None:
+        self._tasks[task_id].store.delete(task_id)
+        self._tasks.pop(task_id)
+        self._states.pop(task_id)
+        self._retired_ids.add(task_id)
+        finished = self._removing.pop(task_id, None)
+        if finished is not None:
+            finished.set()
+
     def state(self, task_id: str) -> DownloadTaskState:
         """Return a snapshot of one scheduler-owned task state."""
         with self._lock:
@@ -225,10 +262,12 @@ class DownloadScheduler:
                 return
             self._closed = True
             for control in self._controls.values():
-                control.request_cancel()
+                control.request_pause()
         self._pool.shutdown(wait=wait, cancel_futures=True)
 
     def _start_queued_locked(self) -> None:
+        if self._closed:
+            return
         while self._queue and len(self._futures) < self._max_concurrent_downloads:
             task_id = self._queue.popleft()
             state = self._states[task_id]
@@ -264,6 +303,9 @@ class DownloadScheduler:
         except Exception as exc:
             LOGGER.error("download.scheduler.task_failed task_id=%s", task_id)
             with self._lock:
+                if task_id in self._removing:
+                    self._finish_removing_locked(task_id)
+                    return
                 state = self._states[task_id]
                 state.status = "失败"
                 state.error = str(exc) if isinstance(exc, DownloadError) else "下载任务执行失败"
@@ -273,6 +315,9 @@ class DownloadScheduler:
                 self._start_queued_locked()
             return
         with self._lock:
+            if task_id in self._removing:
+                self._finish_removing_locked(task_id)
+                return
             state = self._states[task_id]
             state.status = result.status
             if result.status == "失败" and not state.error:
@@ -288,6 +333,15 @@ class DownloadScheduler:
             self._finish_locked(task_id)
             self._emit_state(task_id, result=result)
             self._start_queued_locked()
+
+    def _finish_removing_locked(self, task_id: str) -> None:
+        self._finish_locked(task_id)
+        try:
+            self._delete_record_locked(task_id)
+        except OSError as exc:
+            self._removal_errors[task_id] = exc
+            self._removing.pop(task_id).set()
+        self._start_queued_locked()
 
     def _finish_locked(self, task_id: str, result: DownloadResult | None = None) -> None:
         self._futures.pop(task_id, None)
@@ -324,7 +378,7 @@ class DownloadScheduler:
         active_connections: int | None = None,
         result: DownloadResult | None = None,
     ) -> None:
-        if self._on_event is None:
+        if self._on_event is None or task_id in self._removing:
             return
         state = self._states[task_id]
         current_connections = (

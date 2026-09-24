@@ -11,6 +11,7 @@ from openwopan.app.file_browser import (
     FileBrowserError,
     FileBrowserLoginRequiredError,
     FileBrowserService,
+    FileBrowserUploadCancelledError,
 )
 from openwopan.storage.settings import AppSettings
 from openwopan.tasks.download import (
@@ -20,7 +21,11 @@ from openwopan.tasks.download import (
     DownloadTaskStore,
 )
 from openwopan.tasks.scheduler import DownloadCallbacks, DownloadScheduler, DownloadTaskInput
-from openwopan.wopan.errors import WopanAuthenticationError, WopanBusinessError
+from openwopan.wopan.errors import (
+    WopanAuthenticationError,
+    WopanBusinessError,
+    WopanUploadCancelledError,
+)
 from openwopan.wopan.models import DownloadInfo, WopanCloudUsage, WopanItem, WopanItemKind
 
 
@@ -324,6 +329,62 @@ def test_file_browser_service_forwards_upload_progress(tmp_path: Path) -> None:
     assert client.uploaded_files == []
 
 
+def test_file_browser_service_cancels_before_cloud_preflight(tmp_path: Path) -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"data")
+
+    with pytest.raises(FileBrowserUploadCancelledError, match="上传已取消"):
+        service.upload_file(
+            "folder-1", local_path, upload_name="upload.txt", cancel_requested=lambda: True
+        )
+
+    assert client.requested_parent_ids == []
+    assert client.uploaded_files == []
+
+
+def test_file_browser_service_cancels_after_cloud_preflight(tmp_path: Path) -> None:
+    cancelled = False
+
+    class _PreflightClient(FakeClient):
+        def list_files(self, parent_id: str) -> list[WopanItem]:
+            nonlocal cancelled
+            items = super().list_files(parent_id)
+            cancelled = True
+            return items
+
+    client = _PreflightClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"data")
+
+    with pytest.raises(FileBrowserUploadCancelledError, match="上传已取消"):
+        service.upload_file(
+            "folder-1", local_path, upload_name="upload.txt",
+            cancel_requested=lambda: cancelled,
+        )
+
+    assert client.requested_parent_ids == ["folder-1"]
+    assert client.uploaded_files == []
+
+
+def test_file_browser_service_maps_upload_cancellation(tmp_path: Path) -> None:
+    client = FakeClient(WopanUploadCancelledError("protocol detail"))
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"data")
+
+    def requested() -> bool:
+        return False
+
+    with pytest.raises(FileBrowserUploadCancelledError, match="上传已取消") as error:
+        service.upload_file("0", local_path, cancel_requested=requested)
+
+    assert isinstance(error.value.__cause__, WopanUploadCancelledError)
+    assert client.upload_kwargs[0]["cancel_requested"] is requested
+
+
 def test_file_browser_service_updates_transfer_settings_for_future_uploads(
     tmp_path: Path,
 ) -> None:
@@ -603,6 +664,37 @@ def _make_local_tree(tmp_path: Path) -> Path:
     return root
 
 
+def test_prepare_folder_upload_stops_between_cloud_creates(tmp_path: Path) -> None:
+    client = FolderUploadFakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_root = _make_local_tree(tmp_path)
+    stopped = False
+    create_folder = client.create_folder
+
+    def stop_after_root(parent_id: str, name: str) -> WopanItem:
+        nonlocal stopped
+        item = create_folder(parent_id, name)
+        stopped = True
+        return item
+
+    client.create_folder = stop_after_root  # type: ignore[method-assign]
+    with pytest.raises(FileBrowserUploadCancelledError, match="上传已取消"):
+        service.prepare_folder_upload(
+            "0", local_root, root_name="photos", cancel_requested=lambda: stopped
+        )
+    assert client.created_folders == [("0", "photos")]
+
+
+def test_prepare_folder_upload_stops_before_cloud_create(tmp_path: Path) -> None:
+    client = FolderUploadFakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    with pytest.raises(FileBrowserUploadCancelledError, match="上传已取消"):
+        service.prepare_folder_upload(
+            "0", _make_local_tree(tmp_path), cancel_requested=lambda: True
+        )
+    assert client.created_folders == []
+
+
 def test_prepare_folder_upload_creates_tree_and_plans_files(tmp_path: Path) -> None:
     client = FolderUploadFakeClient()
     service = FileBrowserService(client)  # type: ignore[arg-type]
@@ -825,6 +917,12 @@ def test_file_browser_service_submits_and_controls_task(tmp_path: Path) -> None:
         assert service.pause_download(second) is True
         records = {record.task_id: record for record in service.download_records()}
         assert records[second].status == "已暂停"
+        service.remove_download_record(second)
+        assert second not in {record.task_id for record in service.download_records()}
+        with pytest.raises(KeyError):
+            service.resume_download(second)
+        replacement = service.submit_download(item, tmp_path / "second.txt")
+        assert replacement != second
         assert service.cancel_download(first) is True
     finally:
         release.set()

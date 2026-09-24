@@ -5,6 +5,10 @@ class WopanError(Exception):
     """Base error for WoPan protocol-layer failures."""
 
 
+class WopanUploadCancelledError(WopanError):
+    """Raised when an upload stops at a cooperative cancellation point."""
+
+
 class WopanResponseError(WopanError):
     """Raised when a WoPan response cannot be parsed as expected."""
 
