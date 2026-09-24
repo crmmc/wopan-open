@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import httpx
@@ -12,7 +13,13 @@ from openwopan.app.file_browser import (
     FileBrowserService,
 )
 from openwopan.storage.settings import AppSettings
-from openwopan.tasks.download import DownloadTaskState, DownloadTaskStore
+from openwopan.tasks.download import (
+    DownloadResult,
+    DownloadTaskControl,
+    DownloadTaskState,
+    DownloadTaskStore,
+)
+from openwopan.tasks.scheduler import DownloadCallbacks, DownloadScheduler, DownloadTaskInput
 from openwopan.wopan.errors import WopanAuthenticationError, WopanBusinessError
 from openwopan.wopan.models import DownloadInfo, WopanCloudUsage, WopanItem, WopanItemKind
 
@@ -272,7 +279,54 @@ def test_file_browser_service_uploads_file_to_parent(tmp_path: Path) -> None:
     assert item.parent_id == "folder-1"
 
 
-def test_file_browser_service_updates_transfer_settings_for_future_uploads(tmp_path: Path) -> None:
+def test_file_browser_service_forwards_upload_progress(tmp_path: Path) -> None:
+    class _ProgressClient(FakeClient):
+        def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
+            callback = kwargs.get("progress_callback")
+            assert callable(callback)
+            callback(2, 8)
+            return super().upload_file(parent_id, local_path, **kwargs)
+
+    client = _ProgressClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"content")
+    progress: list[tuple[int, int]] = []
+
+    service.upload_file(
+        "folder-1",
+        local_path,
+        progress_callback=lambda done, total: progress.append((done, total)),
+    )
+
+    assert progress == [(2, 8)]
+
+
+    class _ExistingNameClient(FakeClient):
+        def list_files(self, parent_id: str) -> list[WopanItem]:
+            return [
+                WopanItem(
+                    item_id="existing-file",
+                    name="upload.txt",
+                    kind=WopanItemKind.FILE,
+                    parent_id=parent_id,
+                )
+            ]
+
+    client = _ExistingNameClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"upload-content")
+
+    with pytest.raises(FileBrowserError, match="上传目标已存在"):
+        service.upload_file("folder-1", local_path, upload_name="upload.txt")
+
+    assert client.uploaded_files == []
+
+
+def test_file_browser_service_updates_transfer_settings_for_future_uploads(
+    tmp_path: Path,
+) -> None:
     client = FakeClient()
     service = FileBrowserService(client)  # type: ignore[arg-type]
     local_path = tmp_path / "upload.txt"
@@ -489,9 +543,7 @@ def test_file_browser_service_maps_upload_failures(
     tmp_path: Path, error: Exception, match: str
 ) -> None:
     class _FailingUploadClient(FakeClient):
-        def upload_file(
-            self, parent_id: str, local_path: Path, **_kwargs: object
-        ) -> WopanItem:
+        def upload_file(self, parent_id: str, local_path: Path, **_kwargs: object) -> WopanItem:
             raise error
 
     service = FileBrowserService(_FailingUploadClient())  # type: ignore[arg-type]
@@ -577,14 +629,28 @@ def test_prepare_folder_upload_creates_tree_and_plans_files(tmp_path: Path) -> N
 
 def test_prepare_folder_upload_renames_conflicting_root_folder(tmp_path: Path) -> None:
     client = FolderUploadFakeClient()
-    client.existing_names["0"] = {"photos", "photos (1)"}
+    client.existing_names["0"] = {"photos", "photos (copy)"}
     service = FileBrowserService(client)  # type: ignore[arg-type]
     local_root = _make_local_tree(tmp_path)
 
     job = service.prepare_folder_upload("0", local_root)
 
-    assert job.root_name == "photos (2)"
-    assert client.created_folders[0] == ("0", "photos (2)")
+    assert job.root_name == "photos (copy) (copy)"
+    assert client.created_folders[0] == ("0", "photos (copy) (copy)")
+
+
+def test_prepare_folder_upload_rejects_explicit_conflict_before_create(
+    tmp_path: Path,
+) -> None:
+    client = FolderUploadFakeClient()
+    client.existing_names["0"] = {"photos (copy)"}
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_root = _make_local_tree(tmp_path)
+
+    with pytest.raises(FileBrowserError, match="上传目标已存在"):
+        service.prepare_folder_upload("0", local_root, root_name="photos (copy)")
+
+    assert client.created_folders == []
 
 
 def test_prepare_folder_upload_renames_conflicting_subfolder_and_files(
@@ -601,12 +667,12 @@ def test_prepare_folder_upload_renames_conflicting_subfolder_and_files(
 
     assert client.created_folders == [
         ("0", "photos"),
-        ("dir-1", "相册 (1)"),
+        ("dir-1", "相册 (copy)"),
         ("dir-1", "空目录"),
     ]
     assert [(file.name, file.target_dir_id) for file in job.files] == [
-        ("top (1).txt", "dir-1"),
-        ("春节 (1).md", "dir-2"),
+        ("top (copy).txt", "dir-1"),
+        ("春节 (copy).md", "dir-2"),
     ]
 
 
@@ -629,7 +695,7 @@ def test_prepare_folder_upload_keeps_distinct_local_names_without_extra_lists(
 def test_prepare_folder_upload_dedupes_same_local_name_in_one_dir(tmp_path: Path) -> None:
     """同名冲突防御：同一目录内已占用名会推进计数，即使来自本地重名计划。"""
     client = FolderUploadFakeClient()
-    client.existing_names["dir-1"] = {"a.txt", "a (1).txt"}
+    client.existing_names["dir-1"] = {"a.txt", "a (copy).txt"}
     service = FileBrowserService(client)  # type: ignore[arg-type]
     root = tmp_path / "dup"
     root.mkdir()
@@ -637,7 +703,7 @@ def test_prepare_folder_upload_dedupes_same_local_name_in_one_dir(tmp_path: Path
 
     job = service.prepare_folder_upload("0", root)
 
-    assert [file.name for file in job.files] == ["a (2).txt"]
+    assert [file.name for file in job.files] == ["a (copy) (copy).txt"]
 
 
 def test_prepare_folder_upload_fails_without_partial_job_on_create_error(
@@ -675,8 +741,9 @@ def test_prepare_folder_upload_maps_scan_failure(
 ) -> None:
     service = FileBrowserService(FolderUploadFakeClient())  # type: ignore[arg-type]
 
-    with pytest.raises(FileBrowserError, match="扫描本地文件夹失败"):
-        service.prepare_folder_upload("0", tmp_path / "missing")
+    with caplog.at_level("WARNING", logger="openwopan.app.file_browser"):
+        with pytest.raises(FileBrowserError, match="扫描本地文件夹失败"):
+            service.prepare_folder_upload("0", tmp_path / "missing")
 
     # 日志只记错误类型，不携带本地路径（用户目录/文件名不进日志）
     scan_logs = [
@@ -721,3 +788,104 @@ def test_prepare_folder_upload_rejects_invalid_arguments(
 
     with pytest.raises(FileBrowserError, match=match):
         service.prepare_folder_upload(parent_id, local_root)
+
+
+def test_file_browser_service_submits_and_controls_task(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def execute(
+        task: DownloadTaskInput,
+        _control: DownloadTaskControl,
+        _callbacks: DownloadCallbacks,
+    ) -> DownloadResult:
+        started.set()
+        release.wait(1)
+        return DownloadResult("已完成", task.task_id, task.local_path)
+
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=execute)
+    service = FileBrowserService(
+        FakeClient(),
+        download_store=DownloadTaskStore(tmp_path / "store"),
+        download_scheduler=scheduler,
+    )
+    item = WopanItem(
+        item_id="file-1",
+        name="report.txt",
+        kind=WopanItemKind.FILE,
+        download_id="fid-1",
+    )
+
+    try:
+        first = service.submit_download(item, tmp_path / "first.txt")
+        assert started.wait(1)
+        second = service.submit_download(item, tmp_path / "second.txt")
+
+        assert first != second
+        assert service.pause_download(second) is True
+        records = {record.task_id: record for record in service.download_records()}
+        assert records[second].status == "已暂停"
+        assert service.cancel_download(first) is True
+    finally:
+        release.set()
+        service.close_downloads()
+
+
+def test_file_browser_service_allows_duplicate_submission_for_same_path(
+    tmp_path: Path,
+) -> None:
+    def execute(
+        task: DownloadTaskInput,
+        _control: DownloadTaskControl,
+        _callbacks: DownloadCallbacks,
+    ) -> DownloadResult:
+        return DownloadResult("已完成", task.task_id, task.local_path)
+
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=execute)
+    service = FileBrowserService(
+        FakeClient(),
+        download_store=DownloadTaskStore(tmp_path / "store"),
+        download_scheduler=scheduler,
+    )
+    item = WopanItem(
+        item_id="file-1",
+        name="report.txt",
+        kind=WopanItemKind.FILE,
+        download_id="fid-1",
+    )
+
+    try:
+        first = service.submit_download(item, tmp_path / "same.txt")
+        second = service.submit_download(item, tmp_path / "same.txt")
+    finally:
+        service.close_downloads()
+
+    assert first != second
+
+
+def test_file_browser_service_recovers_tasks_by_persisted_download_id(tmp_path: Path) -> None:
+    store = DownloadTaskStore(tmp_path / "store")
+    state = DownloadTaskState(
+        task_id="persisted-task",
+        file_name="report.txt",
+        save_path=tmp_path / "report.txt",
+        status="已暂停",
+        download_id="fid-persisted",
+    )
+    store.save(state)
+    client = FakeClient()
+    scheduler = DownloadScheduler(max_concurrent_downloads=1)
+    service = FileBrowserService(
+        client,
+        download_store=store,
+        download_scheduler=scheduler,  # type: ignore[arg-type]
+    )
+
+    try:
+        records = service.recover_downloads()
+
+        assert client.downloaded_item_ids == ["fid-persisted"]
+        assert records[0].task_id == "persisted-task"
+        assert records[0].status == "已暂停"
+    finally:
+        service.close_downloads()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
@@ -19,6 +20,13 @@ from openwopan.tasks.download import (
     download_url,
     make_download_task_id,
 )
+from openwopan.tasks.scheduler import (
+    DownloadEventCallback as SchedulerEventCallback,
+)
+from openwopan.tasks.scheduler import (
+    DownloadScheduler,
+    DownloadTaskInput,
+)
 from openwopan.tasks.upload import (
     FolderUploadJob,
     PlannedUploadFile,
@@ -27,12 +35,19 @@ from openwopan.tasks.upload import (
 )
 from openwopan.wopan.client import ORIGIN, REFERER, ROOT_DIRECTORY_ID, WopanClient
 from openwopan.wopan.errors import WopanAuthenticationError, WopanError
-from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import (
+    DownloadInfo,
+    WopanCloudUsage,
+    WopanItem,
+    WopanItemKind,
+)
 
 LOGGER = logging.getLogger(__name__)
 DownloadProgressCallback = Callable[[int, int | None], None]
+UploadProgressCallback = Callable[[int, int], None]
 DownloadStatusCallback = Callable[[DownloadStatus], None]
 DownloadConnectionCallback = Callable[[int, int], None]
+DownloadEventCallback = SchedulerEventCallback
 
 
 class FileBrowserError(Exception):
@@ -74,16 +89,45 @@ class FileBrowserBackend(Protocol):
     ) -> DownloadResult | None:
         """Download one file to a local path."""
 
+    def set_download_event_callback(self, callback: DownloadEventCallback | None) -> None:
+        """Attach the UI observer without exposing scheduler internals."""
+        ...
+
+    def submit_download(self, item: WopanItem, local_path: Path) -> str:
+        """Queue one file download without exposing its URL to callers."""
+
+    def pause_download(self, task_id: str) -> bool:
+        """Pause one download task."""
+
+    def resume_download(self, task_id: str) -> bool:
+        """Resume one download task."""
+
+    def cancel_download(self, task_id: str, *, cleanup: bool = False) -> bool:
+        """Cancel one download task."""
+
+    def recover_downloads(self) -> tuple[DownloadTaskRecord, ...]:
+        """Restore persisted download tasks."""
+
+    def download_records(self) -> tuple[DownloadTaskRecord, ...]:
+        """Return persisted download records."""
+
     def upload_file(
         self,
         parent_id: str,
         local_path: Path,
         *,
         upload_name: str | None = None,
+        progress_callback: UploadProgressCallback | None = None,
     ) -> WopanItem:
         """Upload one local file to a directory."""
 
-    def prepare_folder_upload(self, parent_id: str, local_root: Path) -> FolderUploadJob:
+    def prepare_folder_upload(
+        self,
+        parent_id: str,
+        local_root: Path,
+        *,
+        root_name: str | None = None,
+    ) -> FolderUploadJob:
         """Create the cloud directory tree for a local folder upload."""
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
@@ -99,15 +143,138 @@ class FileBrowserService:
         http_client: httpx.Client | None = None,
         settings: AppSettings | None = None,
         download_store: DownloadTaskStore | None = None,
+        download_event_callback: DownloadEventCallback | None = None,
+        download_scheduler: DownloadScheduler | None = None,
     ) -> None:
         self._client = client
         self._settings = settings or AppSettings()
         self._download_store = download_store or DownloadTaskStore()
+        self._download_scheduler = download_scheduler or DownloadScheduler(
+            max_concurrent_downloads=self._settings.max_concurrent_downloads,
+            on_event=download_event_callback,
+        )
         self._http_client = http_client or httpx.Client(
             headers={"Origin": ORIGIN, "Referer": REFERER},
             follow_redirects=True,
             timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
         )
+
+    def set_download_event_callback(self, callback: DownloadEventCallback | None) -> None:
+        """Attach the UI observer without exposing scheduler internals."""
+        self._download_scheduler.set_event_callback(callback)
+
+    def submit_download(self, item: WopanItem, local_path: Path) -> str:
+        """Resolve one file's download information and enqueue it."""
+        download_id = self._validate_download(item, local_path)
+        download_info = self._resolve_download_info(download_id)
+        task_id = make_download_task_id(download_id, local_path)
+        if self._download_store.load(task_id) is not None:
+            task_id = f"{task_id}-{uuid.uuid4().hex}"
+        task = self._build_download_task(
+            task_id=task_id,
+            file_name=item.name,
+            local_path=local_path,
+            download_id=download_id,
+            url=download_info.url,
+        )
+        try:
+            return self._download_scheduler.submit(task)
+        except ValueError:
+            task_id = f"{task_id}-{uuid.uuid4().hex}"
+            task = self._build_download_task(
+                task_id=task_id,
+                file_name=item.name,
+                local_path=local_path,
+                download_id=download_id,
+                url=download_info.url,
+            )
+            try:
+                return self._download_scheduler.submit(task)
+            except ValueError as exc:
+                raise FileBrowserError("下载任务已存在") from exc
+
+    def pause_download(self, task_id: str) -> bool:
+        """Pause one queued or active download task."""
+        return self._download_scheduler.pause(task_id)
+
+    def resume_download(self, task_id: str) -> bool:
+        """Resume one paused or failed download task."""
+        return self._download_scheduler.resume(task_id)
+
+    def cancel_download(self, task_id: str, *, cleanup: bool = False) -> bool:
+        """Cancel one queued or active download task."""
+        return self._download_scheduler.cancel(task_id, cleanup=cleanup)
+
+    def recover_downloads(self) -> tuple[DownloadTaskRecord, ...]:
+        """Resolve persisted download ids and requeue recoverable tasks."""
+        tasks: list[DownloadTaskInput] = []
+        for state in self._download_store.load_all():
+            if state.status in {"已完成", "已取消"}:
+                continue
+            if not state.download_id:
+                state.status = "失败"
+                state.error = "文件缺少下载标识，请刷新后重试"
+                self._download_store.save(state)
+                continue
+            try:
+                download_info = self._resolve_download_info(state.download_id)
+            except FileBrowserError as exc:
+                state.status = "失败"
+                state.error = str(exc)
+                self._download_store.save(state)
+                continue
+            tasks.append(
+                self._build_download_task(
+                    task_id=state.task_id,
+                    file_name=state.file_name,
+                    local_path=state.save_path,
+                    download_id=state.download_id,
+                    url=download_info.url,
+                )
+            )
+        self._download_scheduler.recover(tasks)
+        return self.download_records()
+
+    def close_downloads(self, *, wait: bool = True) -> None:
+        """Close the download scheduler and its worker pool."""
+        self._download_scheduler.close(wait=wait)
+
+    def _resolve_download_info(self, download_id: str) -> DownloadInfo:
+        return self._call(lambda: self._client.get_download_info(download_id))
+
+    def _build_download_task(
+        self,
+        *,
+        task_id: str,
+        file_name: str,
+        local_path: Path,
+        download_id: str,
+        url: str,
+    ) -> DownloadTaskInput:
+        def refresh_download_url() -> str:
+            return self._call(lambda: self._client.get_download_info(download_id)).url
+
+        return DownloadTaskInput(
+            task_id=task_id,
+            file_name=file_name,
+            local_path=local_path,
+            url=url,
+            download_id=download_id,
+            settings=self._settings,
+            store=self._download_store,
+            http_client=self._http_client,
+            refresh_url=refresh_download_url,
+        )
+
+    @staticmethod
+    def _validate_download(item: WopanItem, local_path: Path) -> str:
+        if item.kind is not WopanItemKind.FILE:
+            raise FileBrowserError("只能下载文件")
+        if not local_path.name:
+            raise FileBrowserError("保存路径不能为空")
+        if not item.download_id:
+            raise FileBrowserError("文件缺少下载标识，请刷新后重试")
+        return item.download_id
 
     def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
         """List a directory and map protocol authentication failures to UI state."""
@@ -230,6 +397,7 @@ class FileBrowserService:
         local_path: Path,
         *,
         upload_name: str | None = None,
+        progress_callback: UploadProgressCallback | None = None,
     ) -> WopanItem:
         """Upload one local file to a directory."""
         if not parent_id:
@@ -238,6 +406,11 @@ class FileBrowserService:
             raise FileBrowserError("本地文件不存在")
         if not local_path.is_file():
             raise FileBrowserError("只能上传文件")
+        if upload_name is not None:
+            if not upload_name:
+                raise FileBrowserError("上传文件名称不能为空")
+            if upload_name in self._existing_names(parent_id):
+                raise FileBrowserError("上传目标已存在，请刷新后重试")
 
         LOGGER.info(
             "file_browser.upload_file.start parent_id=%s file_name_length=%s",
@@ -245,16 +418,29 @@ class FileBrowserService:
             len(local_path.name),
         )
         try:
-            item = self._call(
-                lambda: self._client.upload_file(
-                    parent_id,
-                    local_path,
-                    upload_part_size_mb=self._settings.upload_part_size_mb,
-                    max_upload_threads=self._settings.max_upload_threads,
-                    retry_max_attempts=self._settings.retry_max_attempts,
-                    upload_name=upload_name,
+            if progress_callback is None:
+                item = self._call(
+                    lambda: self._client.upload_file(
+                        parent_id,
+                        local_path,
+                        upload_part_size_mb=self._settings.upload_part_size_mb,
+                        max_upload_threads=self._settings.max_upload_threads,
+                        retry_max_attempts=self._settings.retry_max_attempts,
+                        upload_name=upload_name,
+                    )
                 )
-            )
+            else:
+                item = self._call(
+                    lambda: self._client.upload_file(
+                        parent_id,
+                        local_path,
+                        upload_part_size_mb=self._settings.upload_part_size_mb,
+                        max_upload_threads=self._settings.max_upload_threads,
+                        retry_max_attempts=self._settings.retry_max_attempts,
+                        upload_name=upload_name,
+                        progress_callback=progress_callback,
+                    )
+                )
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
             LOGGER.warning("file_browser.upload_file.http_status_error status=%s", status_code)
@@ -276,7 +462,13 @@ class FileBrowserService:
         )
         return item
 
-    def prepare_folder_upload(self, parent_id: str, local_root: Path) -> FolderUploadJob:
+    def prepare_folder_upload(
+        self,
+        parent_id: str,
+        local_root: Path,
+        *,
+        root_name: str | None = None,
+    ) -> FolderUploadJob:
         """Create the cloud directory tree for a local folder upload.
 
         Creates every directory (root first, parent before child, empty dirs
@@ -305,8 +497,16 @@ class FileBrowserService:
             raise FileBrowserError(f"扫描本地文件夹失败：{exc}") from exc
 
         try:
-            root_name = next_available_name(plan.root_name, self._existing_names(parent_id))
-            root_item = self.create_folder(parent_id, root_name)
+            existing_root_names = self._existing_names(parent_id)
+            if root_name is None:
+                resolved_root_name = next_available_name(plan.root_name, existing_root_names)
+            else:
+                if not root_name:
+                    raise FileBrowserError("上传文件夹名称不能为空")
+                if root_name in existing_root_names:
+                    raise FileBrowserError("上传目标已存在，请刷新后重试")
+                resolved_root_name = root_name
+            root_item = self.create_folder(parent_id, resolved_root_name)
             dir_ids = {"": root_item.item_id}
             used_names: dict[str, set[str]] = {}
 
@@ -318,6 +518,8 @@ class FileBrowserService:
             for rel_path in plan.folders:
                 rel_parent, _, local_name = rel_path.rpartition("/")
                 parent_names = taken_names(rel_parent)
+                if root_name is not None and local_name in parent_names:
+                    raise FileBrowserError("上传目标已存在，请刷新后重试")
                 folder_name = next_available_name(local_name, parent_names)
                 created = self.create_folder(dir_ids[rel_parent], folder_name)
                 parent_names.add(folder_name)
@@ -326,6 +528,8 @@ class FileBrowserService:
             planned_files: list[PlannedUploadFile] = []
             for planned in plan.files:
                 names = taken_names(planned.rel_dir)
+                if root_name is not None and planned.name in names:
+                    raise FileBrowserError("上传目标已存在，请刷新后重试")
                 upload_name = next_available_name(planned.name, names)
                 names.add(upload_name)
                 planned_files.append(
@@ -356,7 +560,7 @@ class FileBrowserService:
         )
         return FolderUploadJob(
             root_item_id=root_item.item_id,
-            root_name=root_name,
+            root_name=resolved_root_name,
             files=tuple(planned_files),
             total_bytes=total_bytes,
         )

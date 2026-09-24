@@ -223,6 +223,22 @@ class DownloadTaskStore:
             return None
         return _read_task_state(raw)
 
+    def load_all(self) -> list[DownloadTaskState]:
+        """Load all valid persisted task states in creation order."""
+        tasks_path = self._root_path / "tasks"
+        if not tasks_path.exists():
+            return []
+        with self._lock:
+            paths = sorted(tasks_path.glob("*.json"))
+        states: list[DownloadTaskState] = []
+        for path in paths:
+            task_id = path.stem
+            state = self.load(task_id)
+            if state is not None:
+                states.append(state)
+        states.sort(key=lambda state: (state.created_at, state.task_id))
+        return states
+
     def save(self, state: DownloadTaskState) -> None:
         """Persist task metadata atomically."""
         state.updated_at = time.time()

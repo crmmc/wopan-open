@@ -9,8 +9,13 @@ import pytest
 
 from openwopan.tasks.upload import (
     JUNK_FILE_NAMES,
+    UploadBatchSummary,
+    find_upload_conflicts,
+    format_upload_summary,
     next_available_name,
+    resolve_upload_targets,
     scan_folder_tree,
+    scan_upload_inputs,
 )
 
 
@@ -128,15 +133,125 @@ def test_scan_folder_tree_rejects_non_directory(
     [
         ("report.txt", set(), "report.txt"),
         ("report.txt", {"无关.txt"}, "report.txt"),
-        ("report.txt", {"report.txt"}, "report (1).txt"),
-        ("report.txt", {"report.txt", "report (1).txt"}, "report (2).txt"),
-        ("photos", {"photos"}, "photos (1)"),
-        ("photos", {"photos", "photos (1)", "photos (2)"}, "photos (3)"),
-        ("archive.tar.gz", {"archive.tar.gz"}, "archive.tar (1).gz"),
-        ("报告.txt", {"报告.txt", "报告 (1).txt"}, "报告 (2).txt"),
+        ("report.txt", {"report.txt"}, "report (copy).txt"),
+        (
+            "report.txt",
+            {"report.txt", "report (copy).txt"},
+            "report (copy) (copy).txt",
+        ),
+        ("photos", {"photos"}, "photos (copy)"),
+        (
+            "photos",
+            {"photos", "photos (copy)", "photos (copy) (copy)"},
+            "photos (copy) (copy) (copy)",
+        ),
+        ("archive.tar.gz", {"archive.tar.gz"}, "archive.tar (copy).gz"),
+        (
+            "报告.txt",
+            {"报告.txt", "报告 (copy).txt"},
+            "报告 (copy) (copy).txt",
+        ),
     ],
 )
 def test_next_available_name_follows_duplicate_counter_format(
     requested: str, used: set[str], expected: str
 ) -> None:
     assert next_available_name(requested, used) == expected
+
+
+def test_resolve_upload_targets_skips_only_conflicting_paths(tmp_path: Path) -> None:
+    first = _write(tmp_path / "same.txt", b"one")
+    second = _write(tmp_path / "other.txt", b"two")
+    duplicate = _write(tmp_path / "elsewhere" / "same.txt", b"three")
+    paths = (first, second, duplicate)
+
+    assert find_upload_conflicts(paths, {"same.txt"}) == (first, duplicate)
+    targets = resolve_upload_targets(paths, {"same.txt"}, "skip")
+
+    assert [(target.local_path, target.upload_name) for target in targets] == [
+        (second, None),
+    ]
+
+
+def test_resolve_upload_targets_appends_copy_for_repeated_conflicts(tmp_path: Path) -> None:
+    first = _write(tmp_path / "report.txt", b"one")
+    second = _write(tmp_path / "other" / "report.txt", b"two")
+    third = _write(tmp_path / "third" / "report.txt", b"three")
+
+    targets = resolve_upload_targets(
+        (first, second, third),
+        {"report.txt", "report (copy).txt"},
+        "copy",
+    )
+
+    assert [(target.local_path, target.upload_name) for target in targets] == [
+        (first, "report (copy) (copy).txt"),
+        (second, "report (copy) (copy) (copy).txt"),
+        (third, "report (copy) (copy) (copy) (copy).txt"),
+    ]
+
+
+def test_resolve_upload_targets_rejects_unknown_resolution(tmp_path: Path) -> None:
+    path = _write(tmp_path / "report.txt")
+
+    with pytest.raises(ValueError, match="不支持的上传冲突策略"):
+        resolve_upload_targets((path,), {"report.txt"}, "invalid")  # type: ignore[arg-type]
+
+
+def test_scan_upload_inputs_deduplicates_and_bounds_preview(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    _write(root / "a.txt", b"123")
+    _write(root / "b.txt", b"1234")
+    direct = _write(tmp_path / "direct.txt", b"12")
+
+    summary = scan_upload_inputs((root, root, direct), preview_limit=2)
+
+    assert isinstance(summary, UploadBatchSummary)
+    assert summary.top_paths == (root, direct)
+    assert summary.file_count == 3
+    assert summary.folder_count == 1
+    assert summary.total_bytes == 9
+    assert len(summary.preview) == 2
+    assert summary.omitted_count == 2
+    assert "文件 3 个" in format_upload_summary(summary)
+
+
+def test_scan_upload_inputs_reserves_preview_for_top_level_items(tmp_path: Path) -> None:
+    root = tmp_path / "folder"
+    root.mkdir()
+    for index in range(25):
+        _write(root / f"{index:02d}.txt", b"x")
+    direct = _write(tmp_path / "duplicate.txt", b"x")
+
+    summary = scan_upload_inputs((root, direct))
+
+    assert summary.top_paths == (root, direct)
+    assert len(summary.preview) == 20
+    assert [entry.local_path for entry in summary.preview[:2]] == [root, direct]
+    assert summary.omitted_count == 7
+
+
+def test_scan_upload_inputs_skips_top_level_junk_and_symlink(tmp_path: Path) -> None:
+    junk = _write(tmp_path / ".DS_Store", b"junk")
+    target = _write(tmp_path / "target.txt", b"target")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+
+    summary = scan_upload_inputs((junk, link, target))
+
+    assert summary.top_paths == (target,)
+    assert summary.file_count == 1
+    assert [entry.local_path for entry in summary.preview] == [target]
+
+
+def test_scan_upload_inputs_reports_empty_folder_without_file_tasks(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    summary = scan_upload_inputs((empty,))
+
+    assert summary.file_count == 0
+    assert summary.folder_count == 1
+    assert summary.total_bytes == 0
+    assert summary.omitted_count == 0
