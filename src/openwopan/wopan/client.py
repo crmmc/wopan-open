@@ -24,10 +24,17 @@ from openwopan.wopan.errors import (
     WopanAuthenticationError,
     WopanBusinessError,
     WopanResponseError,
+    WopanUploadCancelledError,
 )
 from openwopan.wopan.models import DownloadInfo, WopanCloudUsage, WopanItem, WopanItemKind
 
 UploadProgressCallback = Callable[[int, int], None]
+
+
+def _check_upload_cancelled(cancel_requested: Callable[[], bool] | None) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise WopanUploadCancelledError("上传已取消")
+
 
 BASE_URL = "https://panservice.mail.wo.cn"
 CLIENT_ID = "1001000021"
@@ -436,6 +443,7 @@ class WopanClient:
         retry_max_attempts: int = 3,
         upload_name: str | None = None,
         progress_callback: UploadProgressCallback | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> WopanItem:
         """Upload a local file to a parent directory."""
         if not parent_id:
@@ -443,6 +451,7 @@ class WopanClient:
         if not local_path.is_file():
             raise ValueError("local_path must be an existing file")
 
+        _check_upload_cancelled(cancel_requested)
         file_size = local_path.stat().st_size
         file_name = upload_name if upload_name is not None else local_path.name
         part_size = _bounded_int(upload_part_size_mb, 5, 5, 16) * BYTES_PER_MB
@@ -453,7 +462,13 @@ class WopanClient:
         )
         max_attempts = _bounded_int(retry_max_attempts, 3, 0, 5) + 1
         upload_file_type = _guess_upload_file_type(file_name)
-        zone_url = self.get_upload_zone_url()
+        if cancel_requested is None:
+            zone_url = self.get_upload_zone_url(retry_max_attempts=retry_max_attempts)
+        else:
+            zone_url = self.get_upload_zone_url(
+                retry_max_attempts=retry_max_attempts, cancel_requested=cancel_requested
+            )
+        _check_upload_cancelled(cancel_requested)
         upload_url = f"{zone_url.rstrip('/')}/openapi/client/upload2C"
         unique_id = str(int(time.time() * 1000))
         token_key = _wohome_crypto_key(self._access_token)
@@ -489,6 +504,7 @@ class WopanClient:
         )
         try:
             if total_parts == 1:
+                _check_upload_cancelled(cancel_requested)
                 raw = self._upload_part(
                     upload_url,
                     form_data,
@@ -497,6 +513,7 @@ class WopanClient:
                     local_path.read_bytes(),
                     part_index=1,
                     max_attempts=max_attempts,
+                    cancel_requested=cancel_requested,
                 )
                 if progress_callback is not None:
                     progress_callback(file_size, file_size)
@@ -512,6 +529,7 @@ class WopanClient:
                     max_workers,
                     max_attempts,
                     progress_callback=progress_callback,
+                    cancel_requested=cancel_requested,
                 )
         except httpx.HTTPError:
             LOGGER.warning("wopan.upload_file.http_error parent_id=%s", parent_id)
@@ -520,6 +538,7 @@ class WopanClient:
             LOGGER.warning("wopan.upload_file.response_error parent_id=%s", parent_id)
             raise WopanResponseError("upload2C response cannot be decoded") from exc
 
+        _check_upload_cancelled(cancel_requested)
         code = str(raw.get("code") or "")
         if code != "0000":  # pragma: no cover - docs/testing-exemptions.md
             message = str(raw.get("msg") or "WoPan upload failed")
@@ -564,6 +583,7 @@ class WopanClient:
         max_workers: int,
         max_attempts: int,
         progress_callback: UploadProgressCallback | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if total_parts <= 0:
             raise WopanResponseError("upload2C multipart upload produced no response")
@@ -572,6 +592,7 @@ class WopanClient:
             futures: dict[Any, int] = {}
             file_size = local_path.stat().st_size
             for part_index in range(1, total_parts + 1):
+                _check_upload_cancelled(cancel_requested)
                 offset = (part_index - 1) * part_size
                 part_length = min(part_size, max(0, file_size - offset))
                 future = executor.submit(
@@ -585,11 +606,18 @@ class WopanClient:
                     part_size,
                     part_index,
                     max_attempts,
+                    cancel_requested,
                 )
                 futures[future] = part_length
             completed_bytes = 0
             for future in as_completed(futures):
-                raw = future.result()
+                _check_upload_cancelled(cancel_requested)
+                try:
+                    raw = future.result()
+                except Exception:
+                    _check_upload_cancelled(cancel_requested)
+                    raise
+                _check_upload_cancelled(cancel_requested)
                 completed_bytes += futures[future]
                 if progress_callback is not None:
                     progress_callback(completed_bytes, file_size)
@@ -609,7 +637,9 @@ class WopanClient:
         part_size: int,
         part_index: int,
         max_attempts: int,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        _check_upload_cancelled(cancel_requested)
         with local_path.open("rb") as file_obj:
             file_obj.seek(offset)
             content = file_obj.read(part_size)
@@ -621,6 +651,7 @@ class WopanClient:
             content,
             part_index,
             max_attempts,
+            cancel_requested,
         )
 
     def _upload_part(
@@ -632,6 +663,7 @@ class WopanClient:
         content: bytes,
         part_index: int,
         max_attempts: int,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         form_data = {
             **base_form_data,
@@ -640,6 +672,7 @@ class WopanClient:
         }
         last_error: Exception | None = None
         for _attempt in range(max_attempts):
+            _check_upload_cancelled(cancel_requested)
             try:
                 response = self._http_client.post(
                     upload_url,
@@ -651,6 +684,7 @@ class WopanClient:
                     data=form_data,
                     files={"file": (file_name, content, mime_type)},
                 )
+                _check_upload_cancelled(cancel_requested)
                 response.raise_for_status()
                 raw = response.json()
                 if not isinstance(raw, dict):
@@ -661,6 +695,7 @@ class WopanClient:
                     raise WopanBusinessError(code, message)
                 return raw
             except (httpx.HTTPError, WopanBusinessError) as exc:
+                _check_upload_cancelled(cancel_requested)
                 last_error = exc
             except ValueError as exc:
                 raise WopanResponseError("upload2C response cannot be decoded") from exc
@@ -668,14 +703,37 @@ class WopanClient:
             raise last_error
         raise WopanResponseError("upload2C upload part failed")
 
-    def get_upload_zone_url(self) -> str:
-        """Return the current upload zone URL."""
+    def get_upload_zone_url(
+        self, *, retry_max_attempts: int = 3, cancel_requested: Callable[[], bool] | None = None
+    ) -> str:
+        """Return the current upload zone URL, retrying transient gateway errors."""
         LOGGER.debug("wopan.get_upload_zone_url.start")
-        data = self._dispatch_wohome(
-            "GetZoneInfo",
-            {"appId": DEFAULT_UPLOAD_APP_ID},
-            body_extra={"key": True},
-        )
+        attempts = _bounded_int(retry_max_attempts, 3, 0, 5) + 1
+        for attempt in range(attempts):
+            _check_upload_cancelled(cancel_requested)
+            try:
+                data = self._dispatch_wohome(
+                    "GetZoneInfo",
+                    {"appId": DEFAULT_UPLOAD_APP_ID},
+                    body_extra={"key": True},
+                )
+                _check_upload_cancelled(cancel_requested)
+                break
+            except httpx.HTTPStatusError as exc:
+                _check_upload_cancelled(cancel_requested)
+                if exc.response.status_code not in {502, 503, 504} or attempt + 1 >= attempts:
+                    raise
+                LOGGER.warning(
+                    "wopan.get_upload_zone_url.transient_http_error status=%s attempt=%s",
+                    exc.response.status_code,
+                    attempt + 1,
+                )
+            except httpx.HTTPError:
+                _check_upload_cancelled(cancel_requested)
+                raise
+        else:  # pragma: no cover - loop always returns or raises
+            raise WopanResponseError("上传节点查询失败")
+        _check_upload_cancelled(cancel_requested)
         zone_url = str(data.get("url") or "").strip().rstrip("/")
         if not zone_url:
             zone_url = DEFAULT_UPLOAD_ZONE_URL

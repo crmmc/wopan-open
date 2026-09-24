@@ -299,7 +299,7 @@ def test_transfer_interface_matches_sibling_layout_invariants(qapp: QApplication
 
     assert transfer.top_bar_frame.objectName() == "frame"
     assert transfer.title_label.text() == "传输管理"
-    assert transfer._active_direction == "upload"
+    assert transfer._active_direction == "download"
     assert tuple(
         transfer.upload_filter_combo.itemText(index)
         for index in range(len(UPLOAD_STATUS_FILTERS))
@@ -308,8 +308,9 @@ def test_transfer_interface_matches_sibling_layout_invariants(qapp: QApplication
         transfer.download_filter_combo.itemText(index)
         for index in range(len(DOWNLOAD_STATUS_FILTERS))
     ) == DOWNLOAD_STATUS_FILTERS
-    assert transfer.download_frame.isHidden()
-    assert transfer.open_download_folder_button.isHidden()
+    assert transfer.upload_frame.isHidden()
+    assert not transfer.download_frame.isHidden()
+    assert not transfer.open_download_folder_button.isHidden()
 
     assert transfer.upload_table.columnCount() == len(TRANSFER_TABLE_HEADERS)
     assert [
@@ -322,6 +323,12 @@ def test_transfer_interface_matches_sibling_layout_invariants(qapp: QApplication
     )
     assert transfer.upload_batch_buttons["count"].text() == "已选 0 项"
     assert transfer.upload_batch_buttons["speed"].text() == "总速度: --"
+
+    transfer._on_segment_changed("upload")
+    assert transfer._active_direction == "upload"
+    assert not transfer.upload_frame.isHidden()
+    assert transfer.download_frame.isHidden()
+    assert transfer.open_download_folder_button.isHidden()
 
     transfer._on_segment_changed("download")
     assert transfer._active_direction == "download"

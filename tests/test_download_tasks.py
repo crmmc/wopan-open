@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 from pathlib import Path
+from typing import BinaryIO
 
 import httpx
 import pytest
@@ -638,6 +639,56 @@ def test_single_stream_stop_during_transfer(
         assert state is not None and state.status == expected_status
 
 
+@pytest.mark.parametrize("range_download", [False, True])
+@pytest.mark.parametrize("stop", ["已暂停", "已取消"])
+def test_stop_during_stream_read_is_not_reported_as_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, range_download: bool, stop: str
+) -> None:
+    monkeypatch.setattr(download, "BYTES_PER_MB", download.DOWNLOAD_CHUNK_SIZE // 4)
+    control = DownloadTaskControl()
+    statuses: list[str] = []
+    store = DownloadTaskStore(tmp_path / "store")
+
+    class InterruptedStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"x" * download.DOWNLOAD_CHUNK_SIZE
+            raise httpx.ReadError("response closed during pause")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(
+                200, headers={"Content-Length": str(download.DOWNLOAD_CHUNK_SIZE + 1)}
+            )
+        return httpx.Response(
+            206 if request.headers.get("Range") else 200,
+            stream=InterruptedStream(),
+        )
+
+    def progress(done: int, _total: int | None) -> None:
+        if done > 0:
+            if stop == "已暂停":
+                control.request_pause()
+            else:
+                control.request_cancel()
+
+    result = download_url(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        "https://download.example.test/file",
+        tmp_path / "out.bin",
+        settings=_range_settings(retries=0) if range_download else AppSettings(),
+        store=store,
+        task_id="t1",
+        file_name="out.bin",
+        callbacks=DownloadCallbacks(progress=progress, status=statuses.append),
+        control=control,
+    )
+    state = store.load("t1")
+    assert result.status == stop
+    assert statuses[-1] == stop
+    assert state is not None and state.status == stop
+    assert not (tmp_path / "out.bin").exists()
+
+
 def test_single_stream_handles_empty_chunks(tmp_path: Path) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=iter([b"", b"payload"]))
@@ -1194,39 +1245,34 @@ def test_read_task_state_parses_part_records() -> None:
 # -- _replace_output_file -----------------------------------------------------
 
 
-class _FakeEXDEV:
-    """Path.replace stand-in raising EXDEV on the first call only."""
-
-
-def test_replace_output_file_reraises_non_exdev_oserror(tmp_path: Path) -> None:
+def test_replace_output_file_reraises_non_exdev_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = tmp_path / "src"
     source.write_bytes(b"data")
     target = tmp_path / "dst"
-    real_replace = Path.replace
 
-    def replace(self: Path, other: str | Path) -> Path:
-        raise OSError(errno.EPERM, "permission denied")
+    def fail_link(_source: Path, _target: Path) -> None:
+        raise OSError(errno.EACCES, "permission denied")
 
-    original = Path.replace
-    Path.replace = replace  # type: ignore[method-assign]
-    try:
-        with pytest.raises(OSError):
-            _replace_output_file(source, target)
-    finally:
-        Path.replace = original  # type: ignore[method-assign]
-        assert real_replace
+    monkeypatch.setattr(download.os, "link", fail_link)
+    with pytest.raises(OSError, match="permission denied"):
+        _replace_output_file(source, target)
+    assert source.read_bytes() == b"data"
+    assert not target.exists()
 
 
 def _patch_replace_exdev(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_link = download.os.link
     calls: list[int] = []
 
-    def replace(self: Path, other: str | Path) -> Path:
+    def link(source: Path, target: Path) -> None:
         calls.append(1)
         if len(calls) == 1:
             raise OSError(errno.EXDEV, "cross-device link")
-        return Path(str(self)).rename(other)
+        real_link(source, target)
 
-    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(download.os, "link", link)
 
 
 def test_replace_output_file_copies_across_devices(
@@ -1242,7 +1288,7 @@ def test_replace_output_file_copies_across_devices(
 
     assert target.read_bytes() == b"cross-device"
     assert not source.exists()
-    assert not (tmp_path / "dst.tmp").exists()
+    assert not list(tmp_path.glob(".dst.*"))
 
 
 def test_replace_output_file_fails_on_copy_size_mismatch(
@@ -1265,7 +1311,8 @@ def test_replace_output_file_fails_on_copy_size_mismatch(
     with pytest.raises(OSError, match="跨盘拷贝大小不匹配"):
         _replace_output_file(source, target)
 
-    assert not (tmp_path / "dst.tmp").exists()
+    assert not target.exists()
+    assert not list(tmp_path.glob(".dst.*"))
 
 
 def test_replace_output_file_cleans_up_when_copy_fails(
@@ -1278,8 +1325,6 @@ def test_replace_output_file_cleans_up_when_copy_fails(
     source.write_bytes(b"data")
     target = tmp_path / "dst"
     _patch_replace_exdev(monkeypatch)
-    tmp_file = target.with_name("dst.tmp")
-    tmp_file.write_bytes(b"partial")
 
     def failing_copy(_src, _dst, **_kwargs):
         raise OSError("disk full")
@@ -1289,7 +1334,122 @@ def test_replace_output_file_cleans_up_when_copy_fails(
     with pytest.raises(OSError, match="disk full"):
         _replace_output_file(source, target)
 
-    assert not tmp_file.exists()
+    assert not target.exists()
+    assert not list(tmp_path.glob(".dst.*"))
+
+
+@pytest.mark.parametrize("range_download", [False, True])
+@pytest.mark.parametrize("create_during_download", [False, True])
+def test_download_never_overwrites_local_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    range_download: bool,
+    create_during_download: bool,
+) -> None:
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    content = b"abcdefghijklmnopq"
+    target = tmp_path / "out.bin"
+    existing = b"original local file"
+    store = DownloadTaskStore(tmp_path / "store")
+    if not create_during_download:
+        target.write_bytes(existing)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(content))})
+        if create_during_download and not target.exists():
+            target.write_bytes(existing)
+        if request.headers.get("Range"):
+            start, end = _parse_range(request.headers.get("Range"))
+            return httpx.Response(206, content=content[start : end + 1])
+        return httpx.Response(200, content=content)
+
+    with pytest.raises(DownloadError, match="下载目标已存在"):
+        download_url(
+            httpx.Client(transport=httpx.MockTransport(handler)),
+            "https://download.example.test/file",
+            target,
+            settings=_range_settings() if range_download else AppSettings(),
+            store=store,
+            task_id="t1",
+            file_name="out.bin",
+        )
+
+    assert target.read_bytes() == existing
+    state = store.load("t1")
+    assert state is not None and state.status == "失败"
+    if range_download:
+        assert state.parts
+
+
+def test_replace_output_file_rejects_cross_device_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "src"
+    source.write_bytes(b"download")
+    target = tmp_path / "dst"
+    real_link = download.os.link
+    attempts = 0
+
+    def link(src: Path, dst: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(errno.EXDEV, "cross-device")
+        target.write_bytes(b"other app")
+        real_link(src, dst)
+
+    monkeypatch.setattr(download.os, "link", link)
+    with pytest.raises(DownloadError, match="下载目标已存在"):
+        _replace_output_file(source, target)
+    assert target.read_bytes() == b"other app"
+    assert source.read_bytes() == b"download"
+    assert not list(tmp_path.glob(".dst.*"))
+
+
+@pytest.mark.parametrize("cross_device", [False, True])
+def test_replace_output_file_without_hardlink_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cross_device: bool
+) -> None:
+    source = tmp_path / "src"
+    source.write_bytes(b"download")
+    target = tmp_path / "dst"
+    attempts = 0
+
+    def unsupported_link(_src: Path, _dst: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if cross_device and attempts == 1:
+            raise OSError(errno.EXDEV, "cross-device")
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    monkeypatch.setattr(download.os, "link", unsupported_link)
+    _replace_output_file(source, target)
+    assert target.read_bytes() == b"download"
+    assert not source.exists()
+    assert not list(tmp_path.glob(".dst.*"))
+
+
+def test_replace_output_file_without_hardlink_cleans_failed_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "src"
+    source.write_bytes(b"download")
+    target = tmp_path / "dst"
+
+    def unsupported_link(_src: Path, _dst: Path) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    def broken_copy(_input: BinaryIO, output: BinaryIO, _size: int) -> None:
+        output.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(download.os, "link", unsupported_link)
+    monkeypatch.setattr(download.shutil, "copyfileobj", broken_copy)
+    with pytest.raises(OSError, match="disk full"):
+        _replace_output_file(source, target)
+    assert source.read_bytes() == b"download"
+    assert not target.exists()
 
 
 def test_remove_partial_file_swallows_os_errors(

@@ -63,7 +63,11 @@ def _sync_worker_tests(request: pytest.FixtureRequest) -> None:
     """Keep worker lifecycle tests synchronous except GUI-affinity regressions."""
     real_thread_tests = {
         "test_close_window_cancels_and_joins_running_download",
+        "test_close_window_closes_scheduler_without_waiting_on_gui_thread",
         "test_background_download_unexpected_failure_clears_real_thread",
+        "test_download_target_scan_runs_off_gui_thread",
+        "test_download_controls_and_record_removal_run_off_gui_thread",
+        "test_overlapping_download_submissions_keep_both_threads_tracked",
         "test_background_upload_updates_ui_on_gui_thread",
         "test_background_download_updates_ui_on_gui_thread",
         "test_refresh_directory_updates_ui_on_gui_thread",
@@ -211,11 +215,14 @@ class WorkerFileBrowser:
         local_root: Path,
         *,
         root_name: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> FolderUploadJob:
         self.prepared_uploads.append((parent_id, local_root))
         self.prepared_upload_names.append(root_name)
         if self.prepare_error is not None:
             raise self.prepare_error
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserError("上传已取消")
         plan = scan_folder_tree(local_root)
         files = tuple(
             PlannedUploadFile(
@@ -632,6 +639,42 @@ def test_upload_worker_forwards_progress_with_task_id(
     assert collector.events["progress"] == [(4, 10, "upload-1")]
 
 
+def test_upload_worker_stops_before_or_after_backend_call(
+    qapp: QApplication, tmp_path: Path,
+) -> None:
+    class _CancellingBrowser:
+        def __init__(self) -> None:
+            self.worker: UploadWorker | None = None
+            self.calls = 0
+
+        def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
+            self.calls += 1
+            assert self.worker is not None
+            self.worker.request_cancel()
+            return WopanItem(item_id="uploaded", name=local_path.name, kind=WopanItemKind.FILE)
+
+    browser = _CancellingBrowser()
+    worker = UploadWorker(browser, "0", tmp_path / "file.txt", "upload-1")  # type: ignore[arg-type]
+    browser.worker = worker
+    cancelled: list[str] = []
+    succeeded: list[object] = []
+    worker.cancelled.connect(cancelled.append)
+    worker.succeeded.connect(succeeded.append)
+    worker.request_cancel()
+    worker.run()
+    assert browser.calls == 0
+    assert cancelled == ["upload-1"]
+
+    worker = UploadWorker(browser, "0", tmp_path / "file.txt", "upload-2")  # type: ignore[arg-type]
+    browser.worker = worker
+    worker.cancelled.connect(cancelled.append)
+    worker.succeeded.connect(succeeded.append)
+    worker.run()
+    assert browser.calls == 1
+    assert cancelled == ["upload-1", "upload-2"]
+    assert succeeded == []
+
+
 def test_upload_worker_emits_success(qapp: QApplication, tmp_path: Path) -> None:
     browser = WorkerFileBrowser()
     local_path = tmp_path / "upload.txt"
@@ -974,6 +1017,28 @@ def test_close_window_cancels_waiting_folder_records(
     assert window.transfer_interface._find_record("upload", root_id).status == "已取消"
 
 
+def test_close_window_closes_scheduler_without_waiting_on_gui_thread(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    gui_thread_id = threading.get_ident()
+    close_calls: list[tuple[bool, int]] = []
+
+    def close_downloads(*, wait: bool = True) -> None:
+        close_calls.append((wait, threading.get_ident()))
+
+    monkeypatch.setattr(browser, "close_downloads", close_downloads, raising=False)
+    window = MainWindow(browser)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert event.isAccepted()
+    assert len(close_calls) == 1
+    assert close_calls[0][0] is False
+    assert close_calls[0][1] != gui_thread_id
+
+
 def test_close_window_without_active_transfer_is_noop(qapp: QApplication) -> None:
     window = MainWindow()
     event = QCloseEvent()
@@ -1168,8 +1233,12 @@ def test_background_download_unexpected_failure_clears_real_thread(
     assert _wait_until(qapp, lambda: window._directory_thread is None)
     window.download_displayed_item(1, tmp_path / "report.txt")
 
+    assert _wait_until(
+        qapp,
+        lambda: bool(window.transfer_interface.download_records)
+        and window.transfer_interface.download_records[0].status == "失败",
+    )
     assert _wait_until(qapp, lambda: window._download_thread is None)
-    assert window.transfer_interface.download_records[0].status == "失败"
     assert window.transfer_interface.download_records[0].error == "disk full"
     assert window.status_message() == "下载失败：disk full"
 
@@ -2015,6 +2084,216 @@ def test_prompt_download_item_asks_for_save_path_when_configured(
     assert _wait_until(qapp, lambda: window.status_message() == "下载完成：saved.txt")
 
 
+@pytest.mark.parametrize(
+    ("resolution", "expected_names"),
+    [
+        ("skip", []),
+        ("copy", ["report (1).txt", "report (2).txt"]),
+    ],
+)
+def test_download_target_conflicts_are_explicitly_resolved(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolution: str,
+    expected_names: list[str],
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    first = _file_item("file-1", "report.txt")
+    second = _file_item("file-2", "report.txt")
+    target = tmp_path / "report.txt"
+    target.write_text("existing")
+
+    class DecisionDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return resolution
+
+    monkeypatch.setattr(main_window_module, "DownloadConflictDialog", DecisionDialog)
+    window._submit_download_items([(first, target), (second, target)], run_in_background=False)
+
+    assert [call["local_path"].name for call in browser.download_calls] == expected_names
+    assert target.read_text() == "existing"
+    assert len(window.transfer_interface.download_records) == len(expected_names)
+
+
+@pytest.mark.parametrize(
+    ("button_text", "resolution"),
+    [("跳过冲突", "skip"), ("保留副本", "copy"), ("取消本批次", None)],
+)
+def test_download_conflict_dialog_exposes_safe_choices(
+    qapp: QApplication, button_text: str, resolution: str | None
+) -> None:
+    parent = QWidget()
+    dialog = main_window_module.DownloadConflictDialog(
+        (Path("/tmp/report.txt"), Path("/tmp/report.txt")), parent
+    )
+
+    button = next(
+        button for button in dialog.findChildren(QPushButton) if button.text() == button_text
+    )
+    button.click()
+
+    assert dialog.resolution() == resolution
+    expected = QDialog.DialogCode.Rejected if resolution is None else QDialog.DialogCode.Accepted
+    assert dialog.result() == expected
+
+
+def test_download_target_scan_runs_off_gui_thread(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    gui_thread = threading.get_ident()
+    scan_threads: list[int] = []
+    original = MainWindow._scan_download_target_names
+
+    def scan(items: list[tuple[WopanItem, Path]], automatic: bool) -> dict[Path, set[str]]:
+        scan_threads.append(threading.get_ident())
+        return original(items, automatic)
+
+    monkeypatch.setattr(window, "_scan_download_target_names", scan)
+    window._submit_download_items([(_file_item(), tmp_path / "new.txt")])
+
+    assert _wait_until(qapp, lambda: bool(browser.download_calls))
+    assert scan_threads and all(thread != gui_thread for thread in scan_threads)
+    assert _wait_until(qapp, lambda: window._download_target_thread is None)
+
+
+def test_download_controls_and_record_removal_run_off_gui_thread(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    task_id = window._create_download_record(_file_item(), tmp_path / "report.txt")
+    gui_thread = threading.get_ident()
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[tuple[str, int]] = []
+
+    def pause(tid: str) -> bool:
+        assert tid == task_id
+        calls.append(("pause", threading.get_ident()))
+        started.set()
+        assert release.wait(5)
+        return True
+
+    def resume(tid: str) -> bool:
+        assert tid == task_id
+        calls.append(("resume", threading.get_ident()))
+        return True
+
+    def cancel(tid: str, *, cleanup: bool) -> bool:
+        assert tid == task_id and cleanup
+        calls.append(("cancel", threading.get_ident()))
+        return True
+
+    def remove(tid: str) -> None:
+        assert tid == task_id
+        calls.append(("remove", threading.get_ident()))
+
+    monkeypatch.setattr(browser, "pause_download", pause, raising=False)
+    monkeypatch.setattr(browser, "resume_download", resume, raising=False)
+    monkeypatch.setattr(browser, "cancel_download", cancel, raising=False)
+    monkeypatch.setattr(browser, "remove_download_record", remove)
+    window._pause_download_task(task_id)
+    assert started.wait(5)
+    window._resume_download_task(task_id)
+    window._cancel_download_task(task_id)
+    window._remove_transfer_records("download", {task_id})
+    assert [name for name, _ in calls] == ["pause"]
+    assert window.transfer_interface._find_record("download", task_id) is not None
+
+    release.set()
+    assert _wait_until(qapp, lambda: window._download_operation_thread is None)
+    assert [name for name, _ in calls] == ["pause", "resume", "cancel", "remove"]
+    assert all(thread != gui_thread for _, thread in calls)
+    assert window.transfer_interface._find_record("download", task_id) is None
+
+
+def test_overlapping_download_submissions_keep_both_threads_tracked(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    started = threading.Event()
+    release = threading.Event()
+    submitted: list[tuple[str, Path]] = []
+
+    def submit(item: WopanItem, path: Path) -> str:
+        submitted.append((item.item_id, path))
+        if item.item_id == "first":
+            started.set()
+            assert release.wait(5)
+        return item.item_id
+
+    monkeypatch.setattr(browser, "submit_download", submit, raising=False)
+    window = MainWindow(browser)
+    window._submit_download_items(
+        [(_file_item("first", "report.txt"), tmp_path / "report.txt")], automatic=True
+    )
+    assert _wait_until(qapp, started.is_set)
+    window._submit_download_items(
+        [(_file_item("second", "report.txt"), tmp_path / "report.txt")], automatic=True
+    )
+    assert _wait_until(qapp, lambda: len(window._download_submit_threads) == 2)
+    release.set()
+    assert _wait_until(qapp, lambda: len(window.transfer_interface.download_records) == 2)
+    assert _wait_until(qapp, lambda: not window._download_submit_threads)
+    assert {record.task_id for record in window.transfer_interface.download_records} == {
+        "first", "second"
+    }
+    assert submitted == [
+        ("first", tmp_path / "report.txt"),
+        ("second", tmp_path / "report (1).txt"),
+    ]
+
+
+def test_close_ignores_late_download_submission_callbacks(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window._closing = True
+    window._on_download_submissions_succeeded(
+        [(_file_item(), tmp_path / "report.txt", "task-1", "")]
+    )
+    window._on_download_submissions_failed("unexpected failure")
+    assert window.transfer_interface.download_records == []
+    assert window.status_message() == "请先登录"
+
+
+def test_download_target_conflict_cancel_creates_no_tasks(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    target = tmp_path / "report.txt"
+    target.write_text("existing")
+
+    class CancelDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Rejected)
+
+        def resolution(self) -> None:
+            return None
+
+    monkeypatch.setattr(main_window_module, "DownloadConflictDialog", CancelDialog)
+    window._submit_download_items([(_file_item(), target)], run_in_background=False)
+
+    assert browser.download_calls == []
+    assert window.transfer_interface.download_records == []
+    assert window.status_message() == "已取消下载"
+
+
 def test_prompt_download_item_cancelled_by_user(
     qapp: QApplication,
     tmp_path: Path,
@@ -2426,6 +2705,122 @@ def test_transfer_terminal_update_flushes_and_renders_final_bytes(qapp: QApplica
     assert transfer.upload_table.item(0, 4).text() == "已完成"
 
 
+def test_removed_download_ignores_late_events(qapp: QApplication) -> None:
+    window = MainWindow()
+    task_id = "removed-download"
+    item = _file_item()
+    path = Path("/tmp/report.txt")
+    window._create_download_record(item, path, task_id=task_id, status="已暂停")
+    window._on_download_operation_succeeded(("remove", task_id, None))
+
+    paused_event = main_window_module.DownloadTaskEvent(task_id=task_id, status="已暂停")
+    window._on_download_event(paused_event)
+    assert window.transfer_interface._find_record("download", task_id) is None
+    assert task_id not in window._pending_download_events
+
+    window._on_download_submissions_succeeded([(item, path, task_id, "")])
+    running_event = main_window_module.DownloadTaskEvent(task_id=task_id, status="下载中")
+    window._on_download_event(running_event)
+    record = window.transfer_interface._find_record("download", task_id)
+    assert record is not None and record.status == "下载中"
+
+
+def test_main_window_download_events_coalesce_progress_and_connections(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow()
+    task_id = window._create_download_record(
+        _file_item(), Path("/tmp/report.txt"), task_id="download-event"
+    )
+    render_calls: list[str] = []
+    original_render = window.transfer_interface._render_download_table
+    monkeypatch.setattr(
+        window.transfer_interface,
+        "_render_download_table",
+        lambda: (render_calls.append("download"), original_render())[1],
+    )
+    scheduled: list[object] = []
+    monkeypatch.setattr(
+        main_window_module.QTimer,
+        "singleShot",
+        staticmethod(lambda _delay, callback: scheduled.append(callback)),
+    )
+
+    event = main_window_module.DownloadTaskEvent(
+        task_id=task_id,
+        status="下载中",
+        bytes_done=512,
+        total_bytes=2048,
+        active_connections=1,
+        max_connections=4,
+    )
+    window._on_download_event(event)
+    assert render_calls == ["download"]
+
+    window._on_download_event(
+        main_window_module.DownloadTaskEvent(
+            task_id=task_id,
+            status="下载中",
+            bytes_done=1024,
+            total_bytes=2048,
+            active_connections=2,
+            max_connections=4,
+        )
+    )
+
+    assert render_calls == ["download"]
+    assert len(scheduled) == 1
+    record = window.transfer_interface._find_record("download", task_id)
+    assert record is not None
+    assert record.bytes_done == 1024
+    assert record.active_connections == 2
+
+    scheduled[0]()
+    assert render_calls == ["download", "download"]
+
+
+@pytest.mark.parametrize("width", [800, 900])
+def test_download_action_buttons_keep_geometry_during_progress(
+    qapp: QApplication, width: int,
+) -> None:
+    transfer = TransferInterface()
+    transfer.resize(width, 500)
+    transfer.show()
+    transfer._on_segment_changed("download")
+    transfer.add_download_record(_make_record("d-1", status="下载中"))
+    transfer.add_download_record(_make_record("d-2", status="下载中"))
+    transfer.add_download_record(_make_record("d-3", status="已完成"))
+    qapp.processEvents()
+    table = transfer.download_table
+    widgets = [table.cellWidget(row, 5) for row in range(3)]
+    assert all(widget is not None for widget in widgets)
+
+    for done in (1024, 2048, 4096):
+        transfer.update_record("download", "d-1", bytes_done=done, active_connections=1)
+        transfer.flush_progress_render()
+        qapp.processEvents()
+        for row in range(3):
+            widget = table.cellWidget(row, 5)
+            assert widget is widgets[row]
+            cell = table.visualRect(table.model().index(row, 5))
+            for button in widget.findChildren(QWidget):
+                if button.toolTip() not in {"暂停", "继续", "取消", "删除"}:
+                    continue
+                top_left = button.mapTo(table.viewport(), QPoint(0, 0))
+                assert cell.contains(top_left)
+                assert cell.contains(top_left + QPoint(button.width() - 1, button.height() - 1))
+
+    transfer.update_record("download", "d-1", status="已暂停", can_resume=True)
+    assert table.cellWidget(0, 5) is not widgets[0]
+    assert table.cellWidget(1, 5) is widgets[1]
+    assert table.cellWidget(2, 5) is widgets[2]
+    resume_button = next(
+        child for child in table.cellWidget(0, 5).findChildren(QWidget)
+        if child.toolTip() == "继续"
+    )
+    assert resume_button.isEnabled()
+
+
 def test_transfer_status_update_renders_immediately(
     qapp: QApplication, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2534,6 +2929,76 @@ def test_transfer_download_action_buttons_follow_record_state(qapp: QApplication
     assert cancel_ids == ["d-1"]
 
 
+def test_transfer_upload_retry_action_is_available_only_for_failed_uploads(
+    qapp: QApplication,
+) -> None:
+    transfer = TransferInterface()
+    retry_ids: list[set[str]] = []
+    transfer.retry_upload_requested.connect(lambda ids: retry_ids.append(set(ids)))
+    transfer.add_upload_record(
+        _make_record("u-1", direction="upload", status="失败", upload_retryable=True)
+    )
+    transfer.add_upload_record(
+        _make_record("u-2", direction="upload", status="已完成", upload_retryable=True)
+    )
+
+    def action_button(row: int, tooltip: str):
+        widget = transfer.upload_table.cellWidget(row, 5)
+        for child in widget.findChildren(QWidget):
+            if child.toolTip() == tooltip:
+                return child
+        raise AssertionError(f"button {tooltip} not found in row {row}")
+
+    assert action_button(0, "重试").isEnabled()
+    assert not action_button(1, "重试").isEnabled()
+    action_button(0, "重试").click()
+    assert retry_ids == [{"u-1"}]
+
+
+def test_transfer_upload_batch_retry_emits_only_selected_failed_rows(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    retry_ids: list[set[str]] = []
+    transfer.retry_upload_requested.connect(lambda ids: retry_ids.append(set(ids)))
+    transfer.add_upload_record(
+        _make_record("u-1", direction="upload", status="失败", upload_retryable=True)
+    )
+    transfer.add_upload_record(
+        _make_record("u-2", direction="upload", status="上传中", upload_retryable=True)
+    )
+    transfer.upload_table.selectAll()
+    transfer._request_retry_selected_uploads()
+    assert retry_ids == [{"u-1"}]
+
+
+def test_transfer_defaults_to_download_tab(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    assert transfer._active_direction == "download"
+    assert transfer.download_frame.isVisibleTo(transfer)
+    assert not transfer.upload_frame.isVisibleTo(transfer)
+
+
+def test_transfer_upload_delete_can_request_waiting_and_active_rows(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    removed: list[tuple[str, set[str]]] = []
+    transfer.remove_records_requested.connect(
+        lambda direction, ids: removed.append((direction, set(ids)))
+    )
+    for task_id, status in (
+        ("queued", "等待中"),
+        ("running", "上传中"),
+        ("preparing", "创建目录中"),
+        ("finished", "已完成"),
+    ):
+        transfer.add_upload_record(_make_record(task_id, direction="upload", status=status))
+    for row in range(4):
+        widget = transfer.upload_table.cellWidget(row, 5)
+        delete = next(child for child in widget.findChildren(QWidget) if child.toolTip() == "删除")
+        assert delete.isEnabled()
+    transfer.upload_table.selectAll()
+    transfer._request_delete_selected("upload")
+    assert removed == [("upload", {"queued", "running", "preparing", "finished"})]
+
+
 def test_transfer_delete_selected_only_removes_terminal_rows(qapp: QApplication) -> None:
     transfer = TransferInterface()
     removed: list[tuple[str, set[str]]] = []
@@ -2542,11 +3007,23 @@ def test_transfer_delete_selected_only_removes_terminal_rows(qapp: QApplication)
     )
     transfer.add_download_record(_make_record("d-1", status="下载中"))
     transfer.add_download_record(_make_record("d-2", status="已完成"))
+    transfer.add_download_record(_make_record("d-3", status="已暂停"))
+    transfer.add_upload_record(_make_record("u-1", direction="upload", status="已暂停"))
 
     transfer.download_table.selectAll()
     transfer._request_delete_selected("download")
 
-    assert removed == [("download", {"d-2"})]
+    assert removed == [("download", {"d-2", "d-3"})]
+    widget = transfer.download_table.cellWidget(2, 5)
+    delete_button = next(
+        child for child in widget.findChildren(QWidget) if child.toolTip() == "删除"
+    )
+    assert delete_button.isEnabled()
+    upload_widget = transfer.upload_table.cellWidget(0, 5)
+    upload_delete = next(
+        child for child in upload_widget.findChildren(QWidget) if child.toolTip() == "删除"
+    )
+    assert upload_delete.isEnabled()
 
     transfer.download_table.clearSelection()
     transfer._request_delete_selected("download")
@@ -2836,6 +3313,37 @@ def test_enter_displayed_folder_ignores_invalid_rows(qapp: QApplication) -> None
     window.enter_displayed_folder(1)
 
     assert window.current_directory_id() == ROOT_DIRECTORY_ID
+
+
+def test_recover_multiple_download_records_renders_once(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    renders: list[int] = []
+    original = window.transfer_interface._render_download_table
+
+    def render() -> None:
+        renders.append(len(window.transfer_interface.download_records))
+        original()
+
+    monkeypatch.setattr(window.transfer_interface, "_render_download_table", render)
+    records = tuple(
+        SimpleNamespace(
+            task_id=f"persisted-{index}",
+            name=f"file-{index}.txt",
+            target_path=Path(f"/tmp/file-{index}.txt"),
+            status="等待中",
+            total_bytes=100,
+            bytes_done=20,
+            active_connections=0,
+            max_connections=1,
+            supports_resume=False,
+        )
+        for index in range(3)
+    )
+    window._on_download_recovery_succeeded(records)
+    assert renders == [3]
+    assert len(window.transfer_interface.download_records) == 3
 
 
 def test_load_persisted_download_records_without_browser(qapp: QApplication) -> None:
@@ -3755,6 +4263,472 @@ def test_folder_upload_stops_chaining_on_login_required(
     assert window._folder_upload_active is None
 
 
+@pytest.mark.parametrize("terminal", ["success", "failure", "login"])
+def test_removed_upload_ignores_late_terminal_result(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    task_id = window._create_upload_record(tmp_path / "file.txt")
+    unrelated = window._create_upload_record(tmp_path / "unrelated.txt")
+    window.transfer_interface.update_record("upload", task_id, status="上传中")
+    requests: list[bool] = []
+    window._upload_workers[task_id] = SimpleNamespace(
+        request_cancel=lambda: requests.append(True)
+    )  # type: ignore[assignment]
+    login: list[str] = []
+    window.login_required.connect(login.append)
+    monkeypatch.setattr(window, "refresh_current_directory", lambda **kwargs: None)
+    window._remove_transfer_records("upload", {task_id})
+
+    if terminal == "success":
+        window._on_upload_succeeded(_file_item(), task_id)
+    elif terminal == "failure":
+        window._on_upload_failed("upload failed", task_id)
+    else:
+        window._on_upload_login_required("登录已过期，请重新登录", task_id)
+
+    assert requests == [True]
+    assert window.transfer_interface._find_record("upload", task_id) is None
+    assert window.transfer_interface._find_record("upload", unrelated) is not None
+    if terminal == "login":
+        assert login == ["登录已过期，请重新登录"]
+
+
+@pytest.mark.parametrize("terminal", ["failure", "login"])
+def test_removed_preparing_folder_ignores_late_failure(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    window._folder_upload_record_id = root_id
+    window._folder_prepare_thread = QThread(window)  # type: ignore[assignment]
+    errors: list[str] = []
+    monkeypatch.setattr(
+        main_window_module.InfoBar, "error", lambda **kwargs: errors.append(kwargs["content"])
+    )
+    window._remove_transfer_records("upload", {root_id})
+    if terminal == "failure":
+        window._on_folder_upload_prepare_failed("late failure")
+    else:
+        window._on_folder_upload_prepare_login_required("登录已过期，请重新登录")
+
+    assert window.transfer_interface._find_record("upload", root_id) is None
+    assert errors == []
+
+
+def test_remove_waiting_folder_child_preserves_next_and_root(
+    qapp: QApplication, tmp_path: Path,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    queued_id = window._create_upload_record(tmp_path / "queued.txt")
+    next_id = window._create_upload_record(tmp_path / "next.txt")
+    window._folder_upload_record_id = root_id
+    window._folder_upload_active = QueuedUploadFile(
+        "active", tmp_path / "active.txt", "c", "active.txt"
+    )
+    window._upload_threads["active"] = QThread(window)
+    window._folder_upload_queue = [
+        QueuedUploadFile(queued_id, tmp_path / "queued.txt", "c", "queued.txt"),
+        QueuedUploadFile(next_id, tmp_path / "next.txt", "c", "next.txt"),
+    ]
+    window._remove_transfer_records("upload", {queued_id})
+    assert [queued.task_id for queued in window._folder_upload_queue] == [next_id]
+    assert window._folder_upload_cancel_count == 1
+    assert window.transfer_interface._find_record("upload", queued_id) is None
+    assert window.transfer_interface._find_record("upload", root_id) is not None
+    assert window.transfer_interface._find_record("upload", next_id) is not None
+
+
+def test_retry_waits_for_previous_worker_with_same_task_id(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    task_id = window._create_upload_record(tmp_path / "file.txt", parent_id="0")
+    previous = QThread(window)
+    window._upload_threads[task_id] = previous
+    window.transfer_interface.update_record("upload", task_id, status="失败")
+    launched: list[str] = []
+    monkeypatch.setattr(
+        window, "_launch_upload_task",
+        lambda parent, path, tid, **kwargs: launched.append(tid),
+    )
+
+    record = window.transfer_interface._find_record("upload", task_id)
+    assert record is not None
+    window._retry_upload_task(record)
+    window._start_next_upload_task()
+    assert window._upload_threads[task_id] is previous
+    assert [pending.task_id for pending in window._upload_pending] == [task_id]
+    assert launched == []
+
+    window._upload_threads.pop(task_id)
+    window._start_next_upload_task()
+    assert launched == [task_id]
+
+
+def test_remove_waiting_upload_does_not_start_or_remove_another_task(
+    qapp: QApplication, tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1)
+    )
+    first = window._create_upload_record(tmp_path / "first.txt")
+    second = window._create_upload_record(tmp_path / "second.txt")
+    window._upload_pending = [
+        PendingUploadTask("0", tmp_path / "first.txt", first, None, False),
+        PendingUploadTask("0", tmp_path / "second.txt", second, None, False),
+    ]
+    window._upload_threads["active"] = QThread(window)
+
+    window._remove_transfer_records("upload", {first})
+
+    assert [task.task_id for task in window._upload_pending] == [second]
+    assert window.transfer_interface._find_record("upload", first) is None
+    assert window.transfer_interface._find_record("upload", second) is not None
+
+
+def test_remove_running_upload_waits_for_terminal_signal(
+    qapp: QApplication, tmp_path: Path,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    task_id = window._create_upload_record(tmp_path / "running.txt")
+    other_id = window._create_upload_record(tmp_path / "other.txt")
+    window.transfer_interface.update_record("upload", task_id, status="上传中")
+    requested: list[bool] = []
+    window._upload_workers[task_id] = SimpleNamespace(
+        request_cancel=lambda: requested.append(True)
+    )  # type: ignore[assignment]
+
+    window._remove_transfer_records("upload", {task_id})
+    assert requested == [True]
+    assert window.transfer_interface._find_record("upload", task_id) is not None
+
+    window._on_upload_cancelled(task_id)
+    window._on_upload_progress(5, 10, task_id)
+    assert window.transfer_interface._find_record("upload", task_id) is None
+    assert window.transfer_interface._find_record("upload", other_id) is not None
+    assert task_id not in window._upload_removal_requested
+
+
+def test_batch_remove_pending_child_root_and_folder_never_starts_selected_folder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    child_id = window._create_upload_record(tmp_path / "child.txt")
+    selected_id = window._create_upload_record(tmp_path / "selected")
+    survivor_id = window._create_upload_record(tmp_path / "survivor")
+    window._folder_upload_record_id = root_id
+    window._folder_upload_active = QueuedUploadFile(
+        child_id, tmp_path / "child.txt", "c", "child.txt"
+    )
+    window._upload_pending = [
+        PendingUploadTask("c", tmp_path / "child.txt", child_id, "child.txt", False)
+    ]
+    window._folder_prepare_pending = [
+        PendingFolderUpload(tmp_path / "selected", "0", "selected", selected_id),
+        PendingFolderUpload(tmp_path / "survivor", "0", "survivor", survivor_id),
+    ]
+    started: list[str] = []
+    monkeypatch.setattr(
+        window, "upload_folder_to_current_directory",
+        lambda path, **kwargs: started.append(kwargs["_record_id"]),
+    )
+
+    window._remove_transfer_records("upload", {root_id, child_id, selected_id})
+
+    assert started == [survivor_id]
+    assert all(
+        window.transfer_interface._find_record("upload", tid) is None
+        for tid in (root_id, child_id, selected_id)
+    )
+    assert window.transfer_interface._find_record("upload", survivor_id) is not None
+
+
+def test_batch_remove_does_not_launch_selected_waiting_folder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    selected_id = window._create_upload_record(tmp_path / "selected")
+    survivor_id = window._create_upload_record(tmp_path / "survivor")
+    window._folder_upload_record_id = root_id
+    window._folder_prepare_pending = [
+        PendingFolderUpload(tmp_path / "selected", "0", "selected", selected_id),
+        PendingFolderUpload(tmp_path / "survivor", "0", "survivor", survivor_id),
+    ]
+    started: list[str] = []
+    monkeypatch.setattr(
+        window, "upload_folder_to_current_directory",
+        lambda path, **kwargs: started.append(kwargs["_record_id"]),
+    )
+
+    window._remove_transfer_records("upload", {root_id, selected_id})
+
+    assert started == [survivor_id]
+    assert window.transfer_interface._find_record("upload", root_id) is None
+    assert window.transfer_interface._find_record("upload", selected_id) is None
+
+
+def test_remove_active_folder_child_waits_then_drains(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    child_id = window._create_upload_record(tmp_path / "child.txt")
+    next_id = window._create_upload_record(tmp_path / "next.txt")
+    window._folder_upload_record_id = root_id
+    window._folder_upload_active = QueuedUploadFile(
+        child_id, tmp_path / "child.txt", "c", "child.txt"
+    )
+    window._folder_upload_queue = [
+        QueuedUploadFile(next_id, tmp_path / "next.txt", "c", "next.txt")
+    ]
+    requested: list[bool] = []
+    window._upload_workers[child_id] = SimpleNamespace(
+        request_cancel=lambda: requested.append(True)
+    )  # type: ignore[assignment]
+    window._upload_threads[child_id] = QThread(window)
+    started: list[str] = []
+    monkeypatch.setattr(
+        window, "_start_upload_task", lambda parent, path, tid, **kw: started.append(tid)
+    )
+
+    window._remove_transfer_records("upload", {child_id})
+    assert requested == [True]
+    assert window.transfer_interface._find_record("upload", child_id) is not None
+    window._on_upload_cancelled(child_id)
+    window._upload_workers.pop(child_id)
+    window._upload_threads.pop(child_id)
+    window._continue_folder_upload_queue()
+
+    assert window.transfer_interface._find_record("upload", child_id) is None
+    assert window._folder_upload_cancel_count == 1
+    assert started == [next_id]
+    assert window.transfer_interface._find_record("upload", root_id) is not None
+
+
+def test_remove_preparing_folder_waits_for_late_result_before_next_folder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    next_id = window._create_upload_record(tmp_path / "next")
+    window._folder_upload_record_id = root_id
+    window._folder_prepare_thread = QThread(window)  # type: ignore[assignment]
+    cancel_requested = threading.Event()
+    window._folder_prepare_cancel = cancel_requested
+    window._folder_prepare_pending = [
+        PendingFolderUpload(tmp_path / "next", "0", "next", next_id)
+    ]
+    started: list[str] = []
+    monkeypatch.setattr(
+        window, "upload_folder_to_current_directory",
+        lambda path, **kwargs: started.append(kwargs["_record_id"]),
+    )
+
+    window._remove_transfer_records("upload", {root_id})
+    assert cancel_requested.is_set()
+    assert started == []
+    assert window.transfer_interface._find_record("upload", root_id) is not None
+    assert "不会自动删除" in window.status_message()
+    window._on_folder_upload_prepared(object())
+    assert window.transfer_interface._find_record("upload", root_id) is None
+    assert started == []
+    window._clear_folder_prepare()
+    assert started == [next_id]
+
+
+def test_remove_running_folder_waits_for_child_then_starts_next_folder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    child_id = window._create_upload_record(tmp_path / "child.txt")
+    queued_id = window._create_upload_record(tmp_path / "queued.txt")
+    next_id = window._create_upload_record(tmp_path / "next")
+    window._folder_upload_record_id = root_id
+    window._folder_upload_target_dir_id = "different-directory"
+    window._folder_upload_active = QueuedUploadFile(
+        child_id, tmp_path / "child.txt", "c", "child.txt"
+    )
+    window._folder_upload_queue = [
+        QueuedUploadFile(queued_id, tmp_path / "queued.txt", "c", "queued.txt")
+    ]
+    window._folder_prepare_pending = [
+        PendingFolderUpload(tmp_path / "next", "0", "next", next_id)
+    ]
+    requested: list[bool] = []
+    window._upload_workers[child_id] = SimpleNamespace(
+        request_cancel=lambda: requested.append(True)
+    )  # type: ignore[assignment]
+    window._upload_threads[child_id] = QThread(window)
+    started: list[str] = []
+    monkeypatch.setattr(
+        window, "upload_folder_to_current_directory",
+        lambda path, **kwargs: started.append(kwargs["_record_id"]),
+    )
+
+    window._remove_transfer_records("upload", {root_id})
+    assert requested == [True]
+    assert window.transfer_interface._find_record("upload", root_id) is not None
+    assert window.transfer_interface._find_record("upload", child_id) is not None
+    assert window.transfer_interface._find_record("upload", queued_id) is None
+    assert started == []
+
+    window._on_upload_cancelled(child_id)
+    window._upload_workers.pop(child_id)
+    window._upload_threads.pop(child_id)
+    window._continue_folder_upload_queue()
+    assert window.transfer_interface._find_record("upload", root_id) is None
+    assert window.transfer_interface._find_record("upload", child_id) is None
+    assert started == [next_id]
+
+
+def test_successful_folder_child_retry_clears_root_failure(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    child_id = window._create_upload_record(tmp_path / "child.txt")
+    window._folder_upload_record_id = root_id
+    window.transfer_interface.update_record("upload", root_id, status="上传中")
+    window._folder_upload_child_ids = {child_id}
+    window._folder_upload_active = QueuedUploadFile(
+        child_id, tmp_path / "child.txt", "c", "child.txt"
+    )
+    monkeypatch.setattr(main_window_module.InfoBar, "error", lambda **kwargs: None)
+    monkeypatch.setattr(main_window_module.InfoBar, "info", lambda **kwargs: None)
+
+    window._on_upload_failed("暂时失败", child_id)
+    assert window._folder_upload_failure_count == 1
+    window._folder_upload_active = None
+    window._upload_workers[child_id] = SimpleNamespace(
+        request_cancel=lambda: None
+    )  # type: ignore[assignment]
+    window._finish_folder_upload()
+    assert window.transfer_interface._find_record("upload", root_id).status == "上传中"
+
+    window._on_upload_succeeded(_file_item(name="child.txt"), child_id)
+    window._upload_workers.pop(child_id)
+    window._finish_folder_upload()
+
+    assert window.transfer_interface._find_record("upload", root_id).status == "已完成"
+    assert window._folder_upload_failed_ids == set()
+
+
+def test_root_stays_active_until_retried_child_finishes(
+    qapp: QApplication, tmp_path: Path,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    retried_id = window._create_upload_record(tmp_path / "retried.txt")
+    window._folder_upload_record_id = root_id
+    window.transfer_interface.update_record("upload", root_id, status="上传中")
+    window._folder_upload_child_ids = {retried_id}
+    requests: list[bool] = []
+    window._upload_workers[retried_id] = SimpleNamespace(
+        request_cancel=lambda: requests.append(True)
+    )  # type: ignore[assignment]
+
+    window._finish_folder_upload()
+    assert window._folder_upload_record_id == root_id
+    assert window.transfer_interface._find_record("upload", root_id).status == "上传中"
+    window._remove_transfer_records("upload", {root_id})
+    assert requests == [True]
+    assert window.transfer_interface._find_record("upload", root_id) is not None
+
+    window._on_upload_cancelled(retried_id)
+    window._upload_workers.pop(retried_id)
+    window._finish_folder_upload()
+    assert window.transfer_interface._find_record("upload", root_id) is None
+
+
+def test_remove_folder_root_stops_retried_child_in_parallel(
+    qapp: QApplication, tmp_path: Path,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    retried_id = window._create_upload_record(tmp_path / "retried.txt")
+    active_id = window._create_upload_record(tmp_path / "active.txt")
+    window._folder_upload_record_id = root_id
+    window._folder_upload_child_ids = {retried_id, active_id}
+    window._folder_upload_active = QueuedUploadFile(
+        active_id, tmp_path / "active.txt", "cloud-root", "active.txt"
+    )
+    requested: list[str] = []
+    for task_id in (retried_id, active_id):
+        window._upload_workers[task_id] = SimpleNamespace(
+            request_cancel=lambda tid=task_id: requested.append(tid)
+        )  # type: ignore[assignment]
+        window._upload_threads[task_id] = QThread(window)
+
+    window._remove_transfer_records("upload", {root_id})
+    assert set(requested) == {retried_id, active_id}
+    assert window.transfer_interface._find_record("upload", root_id) is not None
+    window._on_upload_cancelled(retried_id)
+    window._upload_workers.pop(retried_id)
+    window._upload_threads.pop(retried_id)
+    window._finish_folder_upload()
+    assert window.transfer_interface._find_record("upload", root_id) is not None
+
+    window._on_upload_cancelled(active_id)
+    window._upload_workers.pop(active_id)
+    window._upload_threads.pop(active_id)
+    window._continue_folder_upload_queue()
+    assert window.transfer_interface._find_record("upload", root_id) is None
+    assert window._folder_upload_child_ids == set()
+
+
+def test_remove_folder_root_starts_next_waiting_folder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root_id = window._create_upload_record(tmp_path / "root")
+    child_id = window._create_upload_record(tmp_path / "child.txt")
+    next_id = window._create_upload_record(tmp_path / "next")
+    window._folder_upload_record_id = root_id
+    window._folder_upload_target_dir_id = "different-directory"
+    window._folder_upload_queue = [
+        QueuedUploadFile(child_id, tmp_path / "child.txt", "cloud-root", "child.txt")
+    ]
+    window._folder_prepare_pending = [
+        PendingFolderUpload(tmp_path / "next", "0", "next", next_id)
+    ]
+    started: list[str] = []
+    monkeypatch.setattr(
+        window, "upload_folder_to_current_directory",
+        lambda path, **kwargs: started.append(kwargs["_record_id"]),
+    )
+
+    window._remove_transfer_records("upload", {root_id})
+
+    assert window.transfer_interface._find_record("upload", root_id) is None
+    assert window.transfer_interface._find_record("upload", child_id) is None
+    assert window.transfer_interface._find_record("upload", next_id) is not None
+    assert started == [next_id]
+
+
+def test_remove_pending_folder_does_not_stop_active_folder(
+    qapp: QApplication, tmp_path: Path,
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    active_id = window._create_upload_record(tmp_path / "active")
+    waiting_id = window._create_upload_record(tmp_path / "waiting")
+    window._folder_upload_record_id = active_id
+    window._folder_prepare_pending = [
+        PendingFolderUpload(tmp_path / "waiting", "0", "waiting", waiting_id)
+    ]
+    window._remove_transfer_records("upload", {waiting_id})
+    assert window._folder_prepare_pending == []
+    assert window._folder_upload_record_id == active_id
+    assert window.transfer_interface._find_record("upload", active_id) is not None
+    assert window.transfer_interface._find_record("upload", waiting_id) is None
+
+
 def test_folder_upload_starts_next_pending_folder_after_queue_finishes(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3857,13 +4831,16 @@ def test_folder_prepare_login_failure_runs_next_independent_folder(
     attempts = 0
 
     def prepare_once_failed(
-        parent_id: str, root: Path, *, root_name: str | None = None
+        parent_id: str, root: Path, *, root_name: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> FolderUploadJob:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
-        return prepare(parent_id, root, root_name=root_name)
+        return prepare(
+            parent_id, root, root_name=root_name, cancel_requested=cancel_requested
+        )
 
     monkeypatch.setattr(browser, "prepare_folder_upload", prepare_once_failed)
     window.upload_folder_to_current_directory(
@@ -4072,6 +5049,41 @@ def test_upload_conflict_keeps_file_as_copy(
     assert observed_conflicts == [(local_path,)]
     assert browser.upload_names == ["report (copy).txt"]
     assert window.transfer_interface.upload_records[0].name == "report (copy).txt"
+
+
+def test_failed_renamed_upload_can_be_retried_with_same_target_name(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.upload_errors = [FileBrowserError("HTTP 504"), None]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_path = tmp_path / "report.txt"
+    local_path.write_text("duplicate")
+
+    class CopyDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "copy"
+
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", CopyDialog)
+    window.upload_file_to_current_directory(local_path)
+    record = window.transfer_interface.upload_records[0]
+    assert record.status == "失败"
+    assert record.upload_name == "report (copy).txt"
+
+    window.transfer_interface.upload_table.selectRow(0)
+    window.transfer_interface._request_retry_selected_uploads()
+
+    assert browser.upload_names == ["report (copy).txt", "report (copy).txt"]
+    assert window.transfer_interface.upload_records[0].status == "已完成"
 
 
 def test_upload_conflict_skip_creates_no_file_task(

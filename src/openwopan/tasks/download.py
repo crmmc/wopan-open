@@ -5,7 +5,9 @@ import hashlib
 import json
 import logging
 import math
+import os
 import shutil
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -464,6 +466,9 @@ def _download_with_ranges(
                 except RangeDownloadUnsupported:
                     raise
         _emit_connections(callbacks, 0, max_workers)
+        stop_result = control.stop_result()
+        if stop_result in ("paused", "cancelled"):
+            return _stop_range_download(stop_result, store, state, callbacks, control)
 
         for part, result in results:
             if result == "ok":
@@ -511,7 +516,11 @@ def _download_with_ranges(
         _mark_failed(store, latest, callbacks, "下载分片合并后大小不一致")
         raise DownloadError("下载分片合并后大小不一致")
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    _replace_output_file(merged_path, local_path)
+    try:
+        _replace_output_file(merged_path, local_path)
+    except DownloadError as exc:
+        _mark_failed(store, latest, callbacks, str(exc))
+        raise
     store.delete(latest.task_id)
     _emit_status(callbacks, "已完成")
     _emit_connections(callbacks, 0, max_workers)
@@ -542,7 +551,8 @@ def _download_single_stream(
     _emit_connections(callbacks, 1, 1)
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    part_path = local_path.with_name(f"{local_path.name}.part")
+    part_path = store.task_temp_dir(state.task_id) / "single.part"
+    part_path.parent.mkdir(parents=True, exist_ok=True)
     bytes_done = 0
     current_url = url
     refresh_count = 0
@@ -588,7 +598,7 @@ def _download_single_stream(
         expected = total_size
         if expected is not None and part_path.stat().st_size != expected:
             raise DownloadError("下载大小不一致")
-        part_path.replace(local_path)
+        _replace_output_file(part_path, local_path)
         store.delete(state.task_id)
         _emit_status(callbacks, "已完成")
         _emit_connections(callbacks, 0, 1)
@@ -603,6 +613,11 @@ def _download_single_stream(
         _mark_failed(store, state, callbacks, message)
         raise DownloadError(message) from exc
     except httpx.HTTPError as exc:
+        stop_result = control.stop_result()
+        if stop_result in ("paused", "cancelled"):
+            return _stop_single_download(
+                stop_result, store, state, callbacks, control, part_path
+            )
         _remove_partial_file(part_path)
         _mark_failed(store, state, callbacks, "网络错误")
         raise DownloadError("网络错误") from exc
@@ -679,6 +694,10 @@ def _download_range_part(
             _remove_partial_file(temp_path)
         except httpx.HTTPError:
             _remove_partial_file(temp_path)
+            stop_result = control.stop_result()
+            if stop_result is not None:
+                progress_callback(part.index, 0)
+                return stop_result
         except OSError:
             _remove_partial_file(temp_path)
         finally:
@@ -909,22 +928,50 @@ def _compute_md5(path: Path) -> str:
 
 
 def _replace_output_file(source_path: Path, target_path: Path) -> None:
+    """Publish a completed download only when the destination is still unoccupied."""
     try:
-        source_path.replace(target_path)
+        os.link(source_path, target_path)
+    except FileExistsError as exc:
+        raise DownloadError("下载目标已存在，请重新选择保存路径") from exc
     except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
-        tmp_path = target_path.with_name(f"{target_path.name}.tmp")
-        try:
-            shutil.copy2(source_path, tmp_path)
-            if tmp_path.stat().st_size != source_path.stat().st_size:
+        if exc.errno in {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            _copy_output_exclusive(source_path, target_path)
+        elif exc.errno == errno.EXDEV:
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{target_path.name}.", dir=target_path.parent
+            )
+            os.close(descriptor)
+            tmp_path = Path(name)
+            try:
+                shutil.copy2(source_path, tmp_path)
+                if tmp_path.stat().st_size != source_path.stat().st_size:
+                    raise OSError("跨盘拷贝大小不匹配")
+                try:
+                    os.link(tmp_path, target_path)
+                except FileExistsError as conflict:
+                    raise DownloadError("下载目标已存在，请重新选择保存路径") from conflict
+                except OSError as link_error:
+                    if link_error.errno not in {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                        raise
+                    _copy_output_exclusive(tmp_path, target_path)
+            finally:
                 tmp_path.unlink(missing_ok=True)
-                raise OSError("跨盘拷贝大小不匹配")
-            tmp_path.replace(target_path)
-            source_path.unlink(missing_ok=True)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
+        else:
             raise
+    source_path.unlink()
+
+
+def _copy_output_exclusive(source_path: Path, target_path: Path) -> None:
+    try:
+        output = target_path.open("xb")
+    except FileExistsError as exc:
+        raise DownloadError("下载目标已存在，请重新选择保存路径") from exc
+    try:
+        with output, source_path.open("rb") as input_file:
+            shutil.copyfileobj(input_file, output, DOWNLOAD_CHUNK_SIZE)
+    except BaseException:
+        target_path.unlink(missing_ok=True)
+        raise
 
 
 def _remove_partial_file(path: Path) -> None:
