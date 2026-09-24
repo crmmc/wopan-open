@@ -119,11 +119,18 @@ class FakeFileBrowser:
     ) -> None:
         self.downloaded_items.append((item.item_id, local_path))
 
-    def upload_file(self, parent_id: str, local_path: Path) -> WopanItem:
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+    ) -> WopanItem:
         self.uploaded_files.append((parent_id, local_path))
+        effective_name = upload_name if upload_name is not None else local_path.name
         uploaded = WopanItem(
             item_id="uploaded-file",
-            name=local_path.name,
+            name=effective_name,
             kind=WopanItemKind.FILE,
             parent_id=parent_id,
             download_id="uploaded-fid",
@@ -161,7 +168,13 @@ class LoginExpiredFileBrowser:
     ) -> None:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
-    def upload_file(self, parent_id: str, local_path: Path) -> WopanItem:
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+    ) -> WopanItem:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
@@ -185,11 +198,17 @@ class DelayedCreatedFolderBrowser(FakeFileBrowser):
 
 
 class DelayedUploadedFileBrowser(FakeFileBrowser):
-    def upload_file(self, parent_id: str, local_path: Path) -> WopanItem:
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+    ) -> WopanItem:
         self.uploaded_files.append((parent_id, local_path))
         return WopanItem(
             item_id="delayed-upload",
-            name=local_path.name,
+            name=upload_name if upload_name is not None else local_path.name,
             kind=WopanItemKind.FILE,
             parent_id=parent_id,
             download_id="delayed-fid",
@@ -596,7 +615,7 @@ def test_main_window_direct_upload_delegates_to_browser_and_refreshes(
     window.upload_file_to_current_directory(local_path, run_in_background=False)
 
     assert browser.uploaded_files == [(ROOT_DIRECTORY_ID, local_path)]
-    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, ROOT_DIRECTORY_ID]
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, ROOT_DIRECTORY_ID, ROOT_DIRECTORY_ID]
     assert [item.name for item in window.displayed_items()] == [
         "Folder",
         "report.txt",
@@ -632,7 +651,7 @@ def test_main_window_enables_upload_after_browser_attached(qapp: QApplication) -
 
     assert window.file_interface.upload_button_group.isEnabled()
     assert window.file_interface.upload_file_action.isEnabled()
-    assert not window.file_interface.upload_folder_action.isEnabled()
+    assert window.file_interface.upload_folder_action.isEnabled()
 
 
 def test_main_window_rejects_folder_download(qapp: QApplication, tmp_path: Path) -> None:
@@ -786,3 +805,55 @@ def test_main_window_move_prompt_reports_when_no_target_folder(qapp: QApplicatio
     window.prompt_move_item(0)
 
     assert window.status_message() == "没有可用的目标文件夹"
+
+
+class QueuedFileBrowser(FakeFileBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submitted_downloads: list[tuple[str, Path]] = []
+        self._download_callback = None
+
+    def set_download_event_callback(self, callback: object) -> None:
+        self._download_callback = callback
+
+    def recover_downloads(self) -> tuple[object, ...]:
+        return ()
+
+    def submit_download(self, item: WopanItem, local_path: Path) -> str:
+        self.submitted_downloads.append((item.item_id, local_path))
+        return f"queued-{len(self.submitted_downloads)}"
+
+
+def test_main_window_submits_multiple_selected_files_to_scheduler(
+    qapp: QApplication, tmp_path: Path, sync_threads: None
+) -> None:
+    browser = QueuedFileBrowser()
+    window = MainWindow(browser)
+    browser.set_download_event_callback(window._receive_download_event)
+    window.refresh_current_directory()
+    table = window.file_interface.file_table
+    table.selectRow(1)
+    table.selectRow(0)
+    window._submit_download_items(
+        [
+            (window.displayed_items()[1], tmp_path / "report.txt"),
+            (
+                WopanItem(
+                    item_id="file-2",
+                    name="other.txt",
+                    kind=WopanItemKind.FILE,
+                    download_id="fid-2",
+                ),
+                tmp_path / "other.txt",
+            ),
+        ]
+    )
+
+    assert browser.submitted_downloads == [
+        ("file-1", tmp_path / "report.txt"),
+        ("file-2", tmp_path / "other.txt"),
+    ]
+    assert [record.task_id for record in window.transfer_interface.download_records] == [
+        "queued-1",
+        "queued-2",
+    ]

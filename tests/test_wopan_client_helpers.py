@@ -145,7 +145,23 @@ def test_upload_part_retries_transient_business_error_then_succeeds(
     assert attempts.count(2) == 2  # part 2 retried once and then succeeded
 
 
-def test_upload_part_raises_after_retry_exhaustion(tmp_path: Path) -> None:
+def test_upload_file_reports_completed_progress(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"content")
+    progress: list[tuple[int, int]] = []
+
+    item = _upload_client(
+        _upload_handler(httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-1"}}))
+    ).upload_file(
+        "0",
+        local_file,
+        progress_callback=lambda done, total: progress.append((done, total)),
+    )
+
+    assert item.item_id == "fid-1"
+    assert progress == [(7, 7)]
+
+
     """整体失败语义：单片重试耗尽后整体上传失败。"""
     from openwopan.wopan.errors import WopanBusinessError
 

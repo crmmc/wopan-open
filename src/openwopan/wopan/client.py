@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,8 @@ from openwopan.wopan.errors import (
     WopanResponseError,
 )
 from openwopan.wopan.models import DownloadInfo, WopanCloudUsage, WopanItem, WopanItemKind
+
+UploadProgressCallback = Callable[[int, int], None]
 
 BASE_URL = "https://panservice.mail.wo.cn"
 CLIENT_ID = "1001000021"
@@ -432,6 +435,7 @@ class WopanClient:
         max_upload_threads: int = 16,
         retry_max_attempts: int = 3,
         upload_name: str | None = None,
+        progress_callback: UploadProgressCallback | None = None,
     ) -> WopanItem:
         """Upload a local file to a parent directory."""
         if not parent_id:
@@ -494,6 +498,8 @@ class WopanClient:
                     part_index=1,
                     max_attempts=max_attempts,
                 )
+                if progress_callback is not None:
+                    progress_callback(file_size, file_size)
             else:
                 raw = self._upload_parts_parallel(
                     upload_url,
@@ -505,6 +511,7 @@ class WopanClient:
                     total_parts,
                     max_workers,
                     max_attempts,
+                    progress_callback=progress_callback,
                 )
         except httpx.HTTPError:
             LOGGER.warning("wopan.upload_file.http_error parent_id=%s", parent_id)
@@ -556,28 +563,36 @@ class WopanClient:
         total_parts: int,
         max_workers: int,
         max_attempts: int,
+        progress_callback: UploadProgressCallback | None = None,
     ) -> dict[str, Any]:
+        if total_parts <= 0:
+            raise WopanResponseError("upload2C multipart upload produced no response")
         last_raw: dict[str, Any] | None = None
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
+            futures: dict[Any, int] = {}
+            file_size = local_path.stat().st_size
             for part_index in range(1, total_parts + 1):
                 offset = (part_index - 1) * part_size
-                futures.append(
-                    executor.submit(
-                        self._upload_file_part,
-                        upload_url,
-                        base_form_data,
-                        file_name,
-                        mime_type,
-                        local_path,
-                        offset,
-                        part_size,
-                        part_index,
-                        max_attempts,
-                    )
+                part_length = min(part_size, max(0, file_size - offset))
+                future = executor.submit(
+                    self._upload_file_part,
+                    upload_url,
+                    base_form_data,
+                    file_name,
+                    mime_type,
+                    local_path,
+                    offset,
+                    part_size,
+                    part_index,
+                    max_attempts,
                 )
+                futures[future] = part_length
+            completed_bytes = 0
             for future in as_completed(futures):
                 raw = future.result()
+                completed_bytes += futures[future]
+                if progress_callback is not None:
+                    progress_callback(completed_bytes, file_size)
                 last_raw = raw
         if last_raw is None:
             raise WopanResponseError("upload2C multipart upload produced no response")

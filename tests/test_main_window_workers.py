@@ -13,9 +13,19 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QPoint, Qt, QThread
+from PySide6.QtCore import QItemSelectionModel, QMimeData, QPoint, Qt, QThread, QUrl
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QDialog, QTreeWidgetItem, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QListWidget,
+    QPushButton,
+    QRadioButton,
+    QTreeWidgetItem,
+    QWidget,
+)
 
 import openwopan.ui.main_window as main_window_module
 from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError
@@ -24,16 +34,24 @@ from openwopan.tasks.download import DownloadTaskControl
 from openwopan.tasks.upload import (
     FolderUploadJob,
     PlannedUploadFile,
+    UploadBatchSummary,
+    UploadSummaryEntry,
     scan_folder_tree,
 )
 from openwopan.ui.main_window import (
     BrowserOperationWorker,
     DownloadWorker,
+    DroppableTableWidget,
     MainWindow,
     NameInputDialog,
+    PendingFolderUpload,
+    PendingUploadTask,
     PlaceholderInterface,
+    QueuedUploadFile,
     TransferInterface,
     TransferRecord,
+    UploadConflictDialog,
+    UploadSummaryDialog,
     UploadWorker,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
@@ -51,8 +69,14 @@ def _sync_worker_tests(request: pytest.FixtureRequest) -> None:
         "test_refresh_directory_updates_ui_on_gui_thread",
         "test_refresh_directory_ignores_in_flight_request",
         "test_create_folder_updates_ui_on_gui_thread",
+        "test_upload_drop_scans_off_gui_thread",
+        "test_upload_drop_uses_one_summary_for_conflict_decision",
+        "test_upload_drop_cancel_does_not_create_tasks",
+        "test_upload_drop_accepts_batch_with_partial_failure",
+        "test_upload_conflict_check_runs_off_gui_thread",
+        "test_close_ignores_late_upload_check_result",
     }
-    if request.node.name not in real_thread_tests:
+    if request.node.name.split("[", 1)[0] not in real_thread_tests:
         request.getfixturevalue("sync_threads")
 
 
@@ -100,6 +124,7 @@ class WorkerFileBrowser:
         self.upload_errors: list[Exception | None] = []
         self.prepare_error: Exception | None = None
         self.prepared_uploads: list[tuple[str, Path]] = []
+        self.prepared_upload_names: list[str | None] = []
         self.download_calls: list[dict[str, Any]] = []
         self.download_error = download_error
         self.removed_download_records: list[str] = []
@@ -180,8 +205,15 @@ class WorkerFileBrowser:
         self.items_by_parent[parent_id] = [*self.items_by_parent.get(parent_id, []), uploaded]
         return uploaded
 
-    def prepare_folder_upload(self, parent_id: str, local_root: Path) -> FolderUploadJob:
+    def prepare_folder_upload(
+        self,
+        parent_id: str,
+        local_root: Path,
+        *,
+        root_name: str | None = None,
+    ) -> FolderUploadJob:
         self.prepared_uploads.append((parent_id, local_root))
+        self.prepared_upload_names.append(root_name)
         if self.prepare_error is not None:
             raise self.prepare_error
         plan = scan_folder_tree(local_root)
@@ -196,7 +228,7 @@ class WorkerFileBrowser:
         )
         return FolderUploadJob(
             root_item_id="cloud-root",
-            root_name=plan.root_name,
+            root_name=root_name if root_name is not None else plan.root_name,
             files=files,
             total_bytes=sum(planned.size for planned in files),
         )
@@ -385,10 +417,16 @@ class _SignalCollector:
 class _UploadCollector:
     def __init__(self, worker: UploadWorker) -> None:
         self.events: dict[str, list[tuple]] = {
+            "progress": [],
             "succeeded": [],
             "failed": [],
             "login_required": [],
         }
+        worker.progress.connect(
+            lambda bytes_done, total_bytes, task_id: self.events["progress"].append(
+                (bytes_done, total_bytes, task_id)
+            )
+        )
         worker.succeeded.connect(
             lambda item, task_id: self.events["succeeded"].append((item, task_id))
         )
@@ -567,6 +605,31 @@ def test_upload_worker_reports_unexpected_error_without_raising(
 
     assert collector.events["failed"] == [("disk full", "upload-1")]
     assert collector.events["succeeded"] == []
+
+
+def test_upload_worker_forwards_progress_with_task_id(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    class _ProgressBrowser:
+        def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
+            callback = kwargs.get("progress_callback")
+            assert callable(callback)
+            callback(4, 10)
+            return WopanItem(
+                item_id="uploaded",
+                name=local_path.name,
+                kind=WopanItemKind.FILE,
+                parent_id=parent_id,
+            )
+
+    local_path = tmp_path / "upload.txt"
+    local_path.write_text("content")
+    worker = UploadWorker(_ProgressBrowser(), ROOT_DIRECTORY_ID, local_path, "upload-1")  # type: ignore[arg-type]
+    collector = _UploadCollector(worker)
+
+    worker.run()
+
+    assert collector.events["progress"] == [(4, 10, "upload-1")]
 
 
 def test_upload_worker_emits_success(qapp: QApplication, tmp_path: Path) -> None:
@@ -856,6 +919,61 @@ def test_close_window_cancels_and_joins_running_download(
         thread.wait(3000)
 
 
+def test_close_window_joins_every_task_keyed_upload_thread(qapp: QApplication) -> None:
+    window = MainWindow()
+    first = _RefusingThread()
+    second = _RefusingThread()
+    window._upload_threads = {"upload-1": first, "upload-2": second}  # type: ignore[assignment]
+    window._upload_thread = first  # type: ignore[assignment]
+    window._upload_task_id = "upload-1"
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert event.isAccepted()
+    assert first.quit_called and second.quit_called
+    assert first.wait_timeouts == [main_window_module.THREAD_JOIN_TIMEOUT_MS]
+    assert second.wait_timeouts == [main_window_module.THREAD_JOIN_TIMEOUT_MS]
+
+
+def test_close_window_cancels_waiting_folder_records(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    root = tmp_path / "active"
+    waiting = tmp_path / "waiting"
+    child = root / "child.txt"
+    next_child = root / "next.txt"
+    root.mkdir()
+    waiting.mkdir()
+    root_id = window._create_upload_record(root)
+    child_id = window._create_upload_record(child)
+    next_id = window._create_upload_record(next_child)
+    waiting_id = window._create_upload_record(waiting)
+    window.transfer_interface.update_record("upload", child_id, status="上传中")
+    window._folder_upload_record_id = root_id
+
+    window._folder_upload_active = QueuedUploadFile(child_id, child, "cloud-root", "child.txt")
+    window._folder_upload_queue = [
+        QueuedUploadFile(next_id, next_child, "cloud-root", "next.txt")
+    ]
+    window._folder_prepare_pending = [
+        PendingFolderUpload(waiting, ROOT_DIRECTORY_ID, "waiting", waiting_id)
+    ]
+
+    window.closeEvent(QCloseEvent())
+
+    assert [window.transfer_interface._find_record("upload", task_id).status for task_id in (
+        root_id, next_id, waiting_id
+    )] == ["已取消", "已取消", "已取消"]
+    assert window._folder_upload_queue == []
+    assert window._folder_prepare_pending == []
+    assert window.transfer_interface._find_record("upload", child_id).status == "上传中"
+    window._on_folder_upload_prepare_failed("关闭后的失败")
+    window._on_folder_upload_prepare_login_required("登录已过期，请重新登录")
+    assert window.transfer_interface._find_record("upload", root_id).status == "已取消"
+
+
 def test_close_window_without_active_transfer_is_noop(qapp: QApplication) -> None:
     window = MainWindow()
     event = QCloseEvent()
@@ -1104,7 +1222,7 @@ def test_background_upload_failure_marks_record_failed(
     sync_threads: None, tmp_path: Path
 ) -> None:
     browser = WorkerFileBrowser()
-    browser.upload_file = lambda parent_id, local_path: (_ for _ in ()).throw(
+    browser.upload_file = lambda parent_id, local_path, **_kwargs: (_ for _ in ()).throw(
         FileBrowserError("upload failed")
     )
     window = MainWindow(browser)
@@ -1209,13 +1327,18 @@ def test_start_download_task_reports_busy_state(qapp: QApplication) -> None:
     window._download_thread = None
 
 
-def test_start_upload_task_reports_busy_state(qapp: QApplication) -> None:
-    window = MainWindow(WorkerFileBrowser())
+def test_start_upload_task_accepts_new_task_while_upload_is_active(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
     window._upload_thread = QThread(window)
 
     window._start_upload_task(ROOT_DIRECTORY_ID, Path("/tmp/x.txt"), "upload-1")
+    window.update_operation_controls()
 
-    assert window.status_message() == "已有上传任务正在进行"
+    assert window.file_interface.upload_button_group.isEnabled()
+    assert window.file_interface.upload_folder_action.isEnabled()
+    assert browser.uploaded_files == [(ROOT_DIRECTORY_ID, Path("/tmp/x.txt"))]
+    assert window.status_message() == "上传完成：x.txt"
     window._upload_thread = None
 
 
@@ -1533,7 +1656,20 @@ def test_download_with_callbacks_without_browser_returns(
     assert window.status_message() == "请先登录"
 
 
-def test_upload_success_handler_rejects_invalid_payload(qapp: QApplication) -> None:
+def test_upload_progress_updates_transfer_record(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    task_id = window._create_upload_record(tmp_path / "upload.bin", size=10)
+
+    window._on_upload_progress(4, 10, task_id)
+
+    record = window.transfer_interface._find_record("upload", task_id)
+    assert record is not None
+    assert record.bytes_done == 4
+    assert record.total_bytes == 10
+
+
     window = MainWindow(WorkerFileBrowser())
     window._create_upload_record(Path("/tmp/upload.txt"))
     record = window.transfer_interface.upload_records[0]
@@ -2928,10 +3064,16 @@ class _OperationOutcomeBrowser(WorkerFileBrowser):
             raise self.error
         return SimpleNamespace(status="已完成")
 
-    def upload_file(self, parent_id: str, local_path: Path) -> WopanItem:
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+    ) -> WopanItem:
         if self.error is not None:
             raise self.error
-        return super().upload_file(parent_id, local_path)
+        return super().upload_file(parent_id, local_path, upload_name=upload_name)
 
 
 @pytest.mark.parametrize(
@@ -3430,7 +3572,10 @@ def test_folder_upload_shows_summary_and_refreshes_target_directory(
 
     assert spy.calls[-1] == ("info", "上传完成", "成功 2 个，失败 0 个")
     # 结束时当前目录刷新一次（单文件路径的逐文件刷新不适用队列文件）
-    assert browser.requested_parent_ids[requested_before:] == [ROOT_DIRECTORY_ID]
+    assert browser.requested_parent_ids[requested_before:] == [
+        ROOT_DIRECTORY_ID,
+        ROOT_DIRECTORY_ID,
+    ]
 
 
 def test_folder_upload_skips_final_refresh_after_navigation(
@@ -3467,18 +3612,123 @@ def test_folder_upload_continues_after_single_file_failure(
     window.upload_folder_to_current_directory(local_root)
 
     records = _upload_records(window)
-    assert [record.status for record in records] == ["已完成", "失败", "已完成"]
+    assert [record.status for record in records] == ["失败", "失败", "已完成"]
+    assert records[0].error == "成功 1 个，失败 1 个"
     assert records[1].error == "网络错误"
     assert ("error", "上传失败", "网络错误") in spy.calls
     assert spy.calls[-1] == ("warning", "上传完成", "成功 1 个，失败 1 个")
     assert len(browser.uploaded_files) == 2
 
 
+def test_ordinary_upload_login_failure_does_not_clear_folder_queue(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    ordinary_path = tmp_path / "ordinary.txt"
+    ordinary_path.write_text("ordinary")
+    folder_root = tmp_path / "folder"
+    folder_root.mkdir()
+    ordinary_task_id = window._create_upload_record(ordinary_path)
+    window._folder_upload_active = QueuedUploadFile(
+        "folder-active", folder_root / "child.txt", "cloud-root", "child.txt"
+    )
+    window._folder_upload_queue = [
+        QueuedUploadFile("folder-pending", folder_root / "next.txt", "cloud-root", "next.txt")
+    ]
+    window._folder_prepare_pending = [
+        PendingFolderUpload(folder_root, "pinned-parent", "folder", "pending-folder")
+    ]
+    window._folder_upload_target_dir_id = "pinned-parent"
+
+    window._on_upload_login_required("登录已过期，请重新登录", task_id=ordinary_task_id)
+
+    assert window.transfer_interface._find_record("upload", ordinary_task_id).status == "失败"
+    assert window._folder_upload_active is not None
+    assert window._folder_upload_active.task_id == "folder-active"
+    assert [queued.task_id for queued in window._folder_upload_queue] == ["folder-pending"]
+    assert window._folder_prepare_pending == [
+        PendingFolderUpload(folder_root, "pinned-parent", "folder", "pending-folder")
+    ]
+    assert window._folder_upload_target_dir_id == "pinned-parent"
+
+
+def test_folder_upload_joins_shared_fifo_behind_waiting_files(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1))
+    ordinary = tmp_path / "ordinary.txt"
+    child = tmp_path / "child.txt"
+    window._upload_thread = QThread(window)  # type: ignore[assignment]
+    window._upload_pending = [
+        PendingUploadTask(ROOT_DIRECTORY_ID, ordinary, "ordinary", None, False)
+    ]
+    window._folder_upload_queue = [
+        QueuedUploadFile("folder-child", child, "cloud-root", "child.txt")
+    ]
+
+    window._continue_folder_upload_queue()
+
+    assert [pending.task_id for pending in window._upload_pending] == [
+        "ordinary", "folder-child"
+    ]
+    assert window._folder_upload_active is not None
+    assert window._folder_upload_active.task_id == "folder-child"
+    window._upload_thread = None
+    started: list[str] = []
+
+    def launch(_parent: str, _path: Path, task_id: str, **_kwargs: object) -> None:
+        started.append(task_id)
+        window._upload_threads[task_id] = QThread(window)
+
+    monkeypatch.setattr(window, "_launch_upload_task", launch)
+    window._start_next_upload_task()
+    assert started == ["ordinary"]
+    window._upload_threads.pop("ordinary")
+    window._start_next_upload_task()
+    assert started == ["ordinary", "folder-child"]
+    window._upload_threads.clear()
+    window._folder_upload_active = None
+    window._folder_upload_queue.clear()
+
+
+def test_folder_prepare_login_failure_preserves_other_pending_folder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    first_id = window._create_upload_record(first)
+    second_id = window._create_upload_record(second)
+    window._folder_upload_record_id = first_id
+    window._folder_prepare_pending = [
+        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", second_id)
+    ]
+    started: list[tuple[Path, dict[str, object]]] = []
+    monkeypatch.setattr(
+        window,
+        "upload_folder_to_current_directory",
+        lambda path, **kwargs: started.append((path, kwargs)),
+    )
+
+    window._on_folder_upload_prepare_login_required("登录已过期，请重新登录")
+
+    assert window.transfer_interface._find_record("upload", first_id).status == "失败"
+    assert window.transfer_interface._find_record("upload", second_id).status == "等待中"
+    assert window._folder_prepare_pending == [
+        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", second_id)
+    ]
+    window._clear_folder_prepare()
+    assert started[0][0] == second
+    assert started[0][1]["_record_id"] == second_id
+
+
 def test_folder_upload_stops_chaining_on_login_required(
     qapp: QApplication,
     tmp_path: Path,
 ) -> None:
-    """AC6：登录态失效停止排队，未开始记录保持等待中。"""
+    """AC6：登录态失效停止排队，未开始记录明确失败。"""
     browser = WorkerFileBrowser()
     browser.upload_errors = [None, FileBrowserLoginRequiredError("登录已过期，请重新登录")]
     window = MainWindow(browser)
@@ -3493,7 +3743,9 @@ def test_folder_upload_stops_chaining_on_login_required(
     assert observed_messages == ["登录已过期，请重新登录"]
     records = _upload_records(window)
     assert [record.name for record in records] == ["相册", "春节.md", "结尾.txt", "说明.txt"]
-    assert [record.status for record in records] == ["已完成", "已完成", "失败", "等待中"]
+    assert [record.status for record in records] == ["失败", "已完成", "失败", "失败"]
+    assert records[0].error == "登录已过期，请重新登录"
+    assert records[-1].error == "登录已过期，请重新登录"
     # 登录失效的文件已尝试但不计入成功；第三个文件从未开始
     assert browser.uploaded_files == [
         (f"cloud-{ROOT_DIRECTORY_ID}-2024", local_root / "2024" / "春节.md"),
@@ -3501,6 +3753,50 @@ def test_folder_upload_stops_chaining_on_login_required(
     ]
     assert window._folder_upload_queue == []
     assert window._folder_upload_active is None
+
+
+def test_folder_upload_starts_next_pending_folder_after_queue_finishes(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    second = tmp_path / "second"
+    second.mkdir()
+    third = tmp_path / "third"
+    third.mkdir()
+    started: list[tuple[Path, dict[str, object]]] = []
+    monkeypatch.setattr(
+        window,
+        "upload_folder_to_current_directory",
+        lambda path, **kwargs: started.append((path, kwargs)),
+    )
+    window._folder_upload_active = QueuedUploadFile(
+        "active", second / "active.txt", "cloud-root", "active.txt"
+    )
+    window._folder_prepare_pending = [
+        PendingFolderUpload(second, "pinned-second", "Second", "second-task"),
+        PendingFolderUpload(third, "pinned-third", "Third", "third-task"),
+    ]
+
+    window._clear_folder_prepare()
+    assert started == []
+    assert [pending.local_path for pending in window._folder_prepare_pending] == [second, third]
+
+    window._finish_folder_upload()
+
+    assert started == [
+        (
+            second,
+            {
+                "root_name": "Second",
+                "_conflict_checked": True,
+                "_parent_id": "pinned-second",
+                "_record_id": "second-task",
+            },
+        )
+    ]
+    assert window._folder_prepare_pending == [
+        PendingFolderUpload(third, "pinned-third", "Third", "third-task")
+    ]
 
 
 def test_folder_upload_prepare_failure_reports_and_skips_file_records(
@@ -3544,6 +3840,44 @@ def test_folder_upload_prepare_login_required_marks_record_failed(
     assert browser.uploaded_files == []
 
 
+def test_folder_prepare_login_failure_runs_next_independent_folder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    waiting_id = window._create_upload_record(second)
+    window._folder_prepare_pending = [
+        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", waiting_id)
+    ]
+    prepare = browser.prepare_folder_upload
+    attempts = 0
+
+    def prepare_once_failed(
+        parent_id: str, root: Path, *, root_name: str | None = None
+    ) -> FolderUploadJob:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+        return prepare(parent_id, root, root_name=root_name)
+
+    monkeypatch.setattr(browser, "prepare_folder_upload", prepare_once_failed)
+    window.upload_folder_to_current_directory(
+        first, root_name="first", _conflict_checked=True
+    )
+
+    assert attempts == 2
+    records = _upload_records(window)
+    assert [record.status for record in records] == ["已完成", "失败"]
+    assert records[0].task_id == waiting_id
+    assert records[1].error == "登录已过期，请重新登录"
+    assert browser.prepared_uploads == [(ROOT_DIRECTORY_ID, second)]
+
+
 def test_folder_upload_without_files_finishes_with_empty_summary(
     qapp: QApplication,
     tmp_path: Path,
@@ -3565,11 +3899,10 @@ def test_folder_upload_without_files_finishes_with_empty_summary(
     assert [record.status for record in records] == ["已完成"]
 
 
-def test_folder_upload_rejects_while_upload_slot_busy(
+def test_folder_upload_entry_remains_usable_while_upload_is_active(
     qapp: QApplication,
     tmp_path: Path,
 ) -> None:
-    """F2：槽位占用（单文件上传或目录准备中）时拒绝新的文件夹上传。"""
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -3577,15 +3910,35 @@ def test_folder_upload_rejects_while_upload_slot_busy(
 
     window._upload_thread = QThread(window)  # type: ignore[assignment]
     window.upload_folder_to_current_directory(local_root)
-    assert window.status_message() == "已有上传任务正在进行"
-    assert browser.prepared_uploads == []
+    assert browser.prepared_uploads == [(ROOT_DIRECTORY_ID, local_root)]
     window._upload_thread = None
 
     window._folder_prepare_thread = QThread(window)  # type: ignore[assignment]
     window.upload_folder_to_current_directory(local_root)
-    assert window.status_message() == "已有上传任务正在进行"
-    assert browser.prepared_uploads == []
+    pending = window._folder_prepare_pending[0]
+    assert pending.local_path == local_root
+    assert pending.parent_id == ROOT_DIRECTORY_ID
+    assert pending.root_name == local_root.name
+    assert pending.record_id in {
+        record.task_id for record in window.transfer_interface.upload_records
+    }
+
     window._folder_prepare_thread = None
+    window._folder_prepare_pending.clear()
+
+    window._folder_upload_queue = [
+        QueuedUploadFile("upload-1", local_root / "file.txt", "cloud-root", "file.txt")
+    ]
+    window.upload_folder_to_current_directory(local_root)
+    pending = window._folder_prepare_pending[0]
+    assert pending.local_path == local_root
+    assert pending.parent_id == ROOT_DIRECTORY_ID
+    assert pending.root_name == local_root.name
+    assert pending.record_id in {
+        record.task_id for record in window.transfer_interface.upload_records
+    }
+
+    window._folder_upload_queue.clear()
 
 
 def test_folder_upload_defers_until_single_upload_slot_frees(
@@ -3594,7 +3947,9 @@ def test_folder_upload_defers_until_single_upload_slot_frees(
 ) -> None:
     """准备完成时槽位被单文件上传占用：先排队，槽位释放后自动继续。"""
     browser = WorkerFileBrowser()
-    window = MainWindow(browser)
+    window = MainWindow(
+        browser, settings=AppSettings(max_concurrent_uploads=1)
+    )
     window.refresh_current_directory()
     local_root = _make_folder_tree(tmp_path)
     job = browser.prepare_folder_upload(ROOT_DIRECTORY_ID, local_root)
@@ -3602,7 +3957,10 @@ def test_folder_upload_defers_until_single_upload_slot_frees(
     window._upload_thread = QThread(window)  # type: ignore[assignment]
     window._folder_upload_target_dir_id = ROOT_DIRECTORY_ID
     window._on_folder_upload_prepared(job)
-    assert len(window._folder_upload_queue) == len(job.files)
+    assert len(window._folder_upload_queue) == len(job.files) - 1
+    assert [task.task_id for task in window._upload_pending] == [
+        window._folder_upload_active.task_id
+    ]
     assert browser.uploaded_files == []
 
     window._upload_thread = None
@@ -3634,3 +3992,897 @@ def test_upload_folder_to_current_directory_rejects_empty_folder_name(
 
     assert window.status_message() == "上传文件夹不能为空"
     assert browser.prepared_uploads == []
+
+
+def test_upload_tasks_respect_concurrent_upload_limit(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser, settings=AppSettings(max_concurrent_uploads=1))
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first")
+    second.write_text("second")
+    first_task_id = window._create_upload_record(first)
+    second_task_id = window._create_upload_record(second)
+    window._upload_thread = QThread(window)  # type: ignore[assignment]
+
+    window._start_upload_task(ROOT_DIRECTORY_ID, second, second_task_id)
+
+    assert [pending.task_id for pending in window._upload_pending] == [second_task_id]
+    assert browser.uploaded_files == []
+    window._upload_thread = None
+    window._start_next_upload_task()
+
+    assert browser.uploaded_files == [(ROOT_DIRECTORY_ID, second)]
+    assert window.transfer_interface._find_record("upload", second_task_id).status == "已完成"
+    assert first_task_id != second_task_id
+
+
+def test_upload_enqueue_status_is_confirmation(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    messages: list[str] = []
+    set_status = window._set_status
+
+    def record_status(message: str) -> None:
+        messages.append(message)
+        set_status(message)
+
+    monkeypatch.setattr(window, "_set_status", record_status)
+    window.upload_file_to_current_directory(tmp_path / "single.txt")
+    assert "已添加「single.txt」上传任务" in messages
+    assert not any(message.startswith("正在上传") for message in messages)
+    assert window.transfer_interface.upload_records[0].status == "已完成"
+
+    messages.clear()
+    window.upload_folder_to_current_directory(_make_folder_tree(tmp_path))
+    assert "已添加 2 个上传任务" in messages
+    assert not any(message.startswith("正在上传") for message in messages)
+    assert [record.status for record in window.transfer_interface.upload_records[-2:]] == [
+        "已完成", "已完成"
+    ]
+
+
+def test_upload_conflict_keeps_file_as_copy(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_path = tmp_path / "report.txt"
+    local_path.write_text("duplicate")
+    observed_conflicts: list[tuple[Path, ...]] = []
+
+    class CopyDialog:
+        def __init__(self, conflicts: tuple[Path, ...], _parent: QWidget) -> None:
+            observed_conflicts.append(conflicts)
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "copy"
+
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", CopyDialog)
+    window.upload_file_to_current_directory(local_path)
+
+    assert observed_conflicts == [(local_path,)]
+    assert browser.upload_names == ["report (copy).txt"]
+    assert window.transfer_interface.upload_records[0].name == "report (copy).txt"
+
+
+def test_upload_conflict_skip_creates_no_file_task(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_path = tmp_path / "report.txt"
+    local_path.write_text("duplicate")
+
+    class SkipDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "skip"
+
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", SkipDialog)
+    window.upload_file_to_current_directory(local_path)
+
+    assert browser.uploaded_files == []
+    assert window.transfer_interface.upload_records == []
+    assert "已跳过 1 个冲突项目" in window.status_message()
+
+
+def test_upload_folder_conflict_passes_copy_root_name_before_prepare(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = tmp_path / "Folder"
+    local_root.mkdir()
+    (local_root / "child.txt").write_text("child")
+
+    class CopyDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "copy"
+
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", CopyDialog)
+    window.upload_folder_to_current_directory(local_root)
+
+    assert browser.prepared_upload_names == ["Folder (copy)"]
+    assert window.transfer_interface.upload_records[0].name == "Folder (copy)"
+
+
+def test_batch_upload_conflict_skip_keeps_non_conflicting_task(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    conflicting = tmp_path / "report.txt"
+    non_conflicting = tmp_path / "new.txt"
+    conflicting.write_text("duplicate")
+    non_conflicting.write_text("new")
+
+    class SkipDialog:
+        def __init__(self, conflicts: tuple[Path, ...], _parent: QWidget) -> None:
+            assert conflicts == (conflicting,)
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "skip"
+
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", SkipDialog)
+    window._submit_upload_paths((conflicting, non_conflicting))
+
+    assert browser.uploaded_files == [(ROOT_DIRECTORY_ID, non_conflicting)]
+    assert browser.upload_names == ["new.txt"]
+    assert [record.name for record in window.transfer_interface.upload_records] == [
+        "new.txt"
+    ]
+
+
+def test_upload_conflict_cancel_creates_no_folder_or_record(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = tmp_path / "Folder"
+    local_root.mkdir()
+
+    class CancelDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Rejected)
+
+        def resolution(self) -> None:
+            return None
+
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", CancelDialog)
+    window.upload_folder_to_current_directory(local_root)
+
+    assert browser.prepared_uploads == []
+    assert window.transfer_interface.upload_records == []
+    assert window.status_message() == "已取消上传"
+
+
+def test_upload_conflict_check_runs_off_gui_thread(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    gui_thread_id = threading.get_ident()
+    list_thread_ids: list[int] = []
+    original_list_directory = browser.list_directory
+
+    def list_directory(parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+        list_thread_ids.append(threading.get_ident())
+        return original_list_directory(parent_id)
+
+    browser.list_directory = list_directory  # type: ignore[method-assign]
+    local_path = tmp_path / "new.txt"
+    local_path.write_text("new")
+    window.upload_file_to_current_directory(local_path)
+
+    assert _wait_until(
+        qapp,
+        lambda: window._upload_conflict_thread is None and not window._upload_threads,
+    )
+    assert list_thread_ids and all(thread_id != gui_thread_id for thread_id in list_thread_ids)
+
+
+def test_upload_folder_menu_action_starts_selected_folder(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    root = _make_folder_tree(tmp_path)
+    monkeypatch.setattr(main_window_module, "QFileDialog", FakeFileDialog)
+    FakeFileDialog.existing_directory = str(root)
+
+    assert window.file_interface.upload_folder_action.isEnabled()
+    window.file_interface.upload_folder_action.trigger()
+
+    assert browser.prepared_uploads == [(ROOT_DIRECTORY_ID, root)]
+    assert len(browser.uploaded_files) == 2
+
+
+def test_download_button_submits_all_selected_files(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID].append(_file_item("file-2", "second.txt"))
+    window = MainWindow(
+        browser, settings=AppSettings(default_download_path=tmp_path, ask_download_location=True)
+    )
+    window.refresh_current_directory()
+    table = window.file_interface.file_table
+    table.selectRow(1)
+    selection = table.selectionModel()
+    assert selection is not None
+    selection.select(
+        table.model().index(2, 0),
+        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    assert window.selected_download_rows() == [1, 2]
+    monkeypatch.setattr(main_window_module, "QFileDialog", FakeFileDialog)
+    FakeFileDialog.existing_directory = str(tmp_path)
+
+    window.file_interface.download_button.click()
+
+    assert {record.name for record in window.transfer_interface.download_records} == {
+        "report.txt", "second.txt"
+    }
+    assert {call["local_path"] for call in browser.download_calls} == {
+        tmp_path / "report.txt", tmp_path / "second.txt"
+    }
+
+
+def test_refresh_button_does_not_pass_clicked_bool_as_callback(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    before = len(browser.requested_parent_ids)
+
+    window.file_interface.refresh_button.click()
+
+    assert len(browser.requested_parent_ids) == before + 1
+    assert window._after_refresh is None
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+
+
+def test_upload_summary_dialog_bounded_expanded_preview(qapp: QApplication) -> None:
+    parent = QWidget()
+    summary = UploadBatchSummary(
+        top_paths=(Path("/tmp/folder"),),
+        file_count=40,
+        folder_count=1,
+        total_bytes=100,
+        preview=tuple(
+            UploadSummaryEntry(Path(f"/tmp/folder/{i}.txt"), f"{i}.txt", "文件", 5)
+            for i in range(20)
+        ),
+        omitted_count=21,
+    )
+    dialog = UploadSummaryDialog(summary, "云端目录", parent)
+    dialog.show()
+    qapp.processEvents()
+    previews = dialog.findChildren(QListWidget)
+
+    assert len(previews) == 1
+    assert previews[0].isVisibleTo(dialog)
+    assert previews[0].count() == 21
+    assert previews[0].item(20).text() == "另有 21 项"
+    assert dialog.findChildren(QCheckBox) == []
+    assert dialog.findChildren(QRadioButton) == []
+    assert dialog.resolution() == "copy"
+    assert "云端目录" in dialog.findChildren(main_window_module.BodyLabel)[1].text()
+
+
+def test_upload_summary_dialog_keeps_labels_compact_when_enlarged(qapp: QApplication) -> None:
+    parent = QWidget()
+    conflict = Path("/tmp/conflict.txt")
+    summary = UploadBatchSummary(
+        top_paths=(conflict,),
+        file_count=1,
+        folder_count=0,
+        total_bytes=8,
+        preview=(UploadSummaryEntry(conflict, "conflict.txt", "文件", 8),),
+        omitted_count=0,
+    )
+    dialog = UploadSummaryDialog(summary, "云端目录", parent, conflicts=(conflict,))
+    dialog.resize(900, 750)
+    dialog.show()
+    qapp.processEvents()
+    preview = dialog.findChild(QListWidget)
+    labels = dialog.findChildren(main_window_module.BodyLabel)
+    buttons = dialog.findChild(QDialogButtonBox)
+    choices = dialog.findChildren(QRadioButton)
+
+    assert preview is not None and buttons is not None
+    assert len(dialog.findChildren(QListWidget)) == 1
+    assert dialog.findChildren(QCheckBox) == []
+    assert len(choices) == 2
+    assert "1 个同名" in " ".join(label.text() for label in labels)
+    assert preview.item(0).text().startswith("（重复）conflict.txt")
+    assert preview.isVisibleTo(dialog) and preview.height() > 200
+    assert all(label.height() <= label.sizeHint().height() + 2 for label in labels)
+    assert buttons.geometry().top() - labels[-1].geometry().bottom() < 32
+    confirm = buttons.button(QDialogButtonBox.StandardButton.Ok)
+    assert confirm is not None and not confirm.isEnabled()
+    copy = next(button for button in choices if button.text() == "保留副本")
+    copy.click()
+    assert confirm.isEnabled()
+    assert dialog.resolution() == "copy"
+    skip = next(button for button in choices if button.text() == "跳过冲突")
+    skip.click()
+    assert dialog.resolution() == "skip"
+    assert not confirm.isEnabled()
+
+
+def test_upload_summary_dialog_bounds_conflict_preview(qapp: QApplication) -> None:
+    parent = QWidget()
+    conflicts = tuple(Path(f"/tmp/{index}.txt") for index in range(25))
+    preview_entries = tuple(
+        UploadSummaryEntry(path, path.name, "文件", 1) for path in conflicts[:20]
+    )
+    summary = UploadBatchSummary(conflicts, 25, 0, 25, preview_entries, 5)
+    dialog = UploadSummaryDialog(summary, "云端目录", parent, conflicts=conflicts)
+    previews = dialog.findChildren(QListWidget)
+    assert len(previews) == 1
+    assert previews[0].count() == 21
+    assert all(previews[0].item(index).text().startswith("（重复）") for index in range(20))
+    assert previews[0].item(20).text() == "另有 5 项"
+    confirm = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok)
+    assert not confirm.isEnabled()
+
+
+def test_upload_summary_marks_only_conflicting_top_level_entry(qapp: QApplication) -> None:
+    parent = QWidget()
+    folder = Path("/tmp/folder")
+    child = folder / "child.txt"
+    other = Path("/tmp/other.txt")
+    summary = UploadBatchSummary(
+        (folder, other), 2, 1, 2,
+        (
+            UploadSummaryEntry(folder, "folder", "文件夹", 0),
+            UploadSummaryEntry(child, "folder/child.txt", "文件", 1),
+            UploadSummaryEntry(other, "other.txt", "文件", 1),
+        ),
+        0,
+    )
+    dialog = UploadSummaryDialog(summary, "云端目录", parent, conflicts=(folder,))
+    preview = dialog.findChild(QListWidget)
+
+    assert [preview.item(index).text().startswith("（重复）") for index in range(3)] == [
+        True, False, False,
+    ]
+
+
+def test_upload_summary_marks_late_conflict_after_large_folder(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    for index in range(25):
+        (folder / f"{index:02d}.txt").write_text("content")
+    duplicate = tmp_path / "duplicate.txt"
+    duplicate.write_text("content")
+    summary = main_window_module.scan_upload_inputs((folder, duplicate))
+    parent = QWidget()
+
+    dialog = UploadSummaryDialog(summary, "云端目录", parent, conflicts=(duplicate,))
+    preview = dialog.findChild(QListWidget)
+
+    assert preview.count() == 21
+    assert any(
+        preview.item(index).text().startswith("（重复）duplicate.txt")
+        for index in range(20)
+    )
+    assert preview.item(20).text() == "另有 7 项"
+
+
+def test_upload_conflict_queue_waits_for_open_confirmation(qapp: QApplication) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    window._upload_conflict_dialog_open = True
+    pending = ((Path("/tmp/new.txt"),), ROOT_DIRECTORY_ID, True, None)
+    window._upload_conflict_pending.append(pending)
+
+    window._clear_upload_conflict_check()
+
+    assert window._upload_conflict_pending == [pending]
+    assert window._upload_conflict_thread is None
+
+
+@pytest.mark.parametrize(
+    ("resolution", "expected_names"),
+    [
+        ("skip", ["new.txt"]),
+        ("copy", ["report (copy).txt", "new.txt"]),
+        (None, []),
+    ],
+)
+def test_upload_drop_uses_one_summary_for_conflict_decision(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolution: str | None,
+    expected_names: list[str],
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    conflicting = tmp_path / "report.txt"
+    other = tmp_path / "new.txt"
+    conflicting.write_text("duplicate")
+    other.write_text("new")
+    dialogs: list[tuple[int, tuple[Path, ...]]] = []
+
+    class SummaryDialog:
+        def __init__(
+            self, summary: UploadBatchSummary, _target: str, _parent: QWidget, *,
+            conflicts: tuple[Path, ...],
+        ) -> None:
+            dialogs.append((summary.file_count, conflicts))
+
+        def exec(self) -> int:
+            return int(
+                QDialog.DialogCode.Accepted if resolution is not None
+                else QDialog.DialogCode.Rejected
+            )
+
+        def resolution(self) -> str | None:
+            return resolution
+
+    def unexpected_conflict_dialog(*_args: object) -> None:
+        raise AssertionError("drag-drop must not open a second dialog")
+
+    monkeypatch.setattr(main_window_module, "UploadSummaryDialog", SummaryDialog)
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", unexpected_conflict_dialog)
+    window.handle_upload_drop((conflicting, other))
+
+    assert _wait_until(qapp, lambda: window._scan_thread is None and bool(dialogs))
+    assert dialogs == [(2, (conflicting,))]
+    assert browser.upload_names == expected_names
+    assert [record.name for record in window.transfer_interface.upload_records] == expected_names
+    assert ROOT_DIRECTORY_ID in browser.requested_parent_ids
+
+
+def test_upload_summary_rejects_navigation_during_confirmation(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_file = tmp_path / "new.txt"
+    local_file.write_text("new")
+    summary = main_window_module.scan_upload_inputs((local_file,))
+
+    class NavigateDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            window._breadcrumb.append(
+                main_window_module.BreadcrumbEntry("folder-1", "Folder")
+            )
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "copy"
+
+    monkeypatch.setattr(main_window_module, "UploadSummaryDialog", NavigateDialog)
+    window._submit_upload_paths(summary.top_paths, summary=summary)
+
+    assert browser.uploaded_files == []
+    assert window.transfer_interface.upload_records == []
+    assert window.status_message() == "目录已变化，请重新提交上传任务"
+
+
+def test_upload_summary_not_shown_when_name_check_fails(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_file = tmp_path / "new.txt"
+    local_file.write_text("new")
+    summary = main_window_module.scan_upload_inputs((local_file,))
+
+    def list_fails(_parent: str) -> list[WopanItem]:
+        raise FileBrowserError("检查失败")
+
+    def unexpected_dialog(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("cloud name check must finish before the dialog")
+
+    monkeypatch.setattr(browser, "list_directory", list_fails)
+    monkeypatch.setattr(main_window_module, "UploadSummaryDialog", unexpected_dialog)
+    window._submit_upload_paths(summary.top_paths, summary=summary)
+
+    assert window.transfer_interface.upload_records == []
+    assert window.status_message() == "检查上传名称失败：检查失败"
+
+
+@pytest.mark.parametrize(
+    ("button_text", "resolution"),
+    [("跳过冲突", "skip"), ("保留副本", "copy"), ("取消本批次", None)],
+)
+def test_upload_conflict_dialog_bounded_preview_and_choice(
+    qapp: QApplication, button_text: str, resolution: str | None
+) -> None:
+    parent = QWidget()
+    dialog = UploadConflictDialog(tuple(Path(f"/tmp/{i}.txt") for i in range(25)), parent)
+    preview = dialog.findChild(QListWidget)
+    assert preview is not None
+    assert preview.count() == 21
+    assert preview.item(20).text() == "另有 5 项"
+    button = next(
+        button for button in dialog.findChildren(QPushButton) if button.text() == button_text
+    )
+    button.click()
+    assert dialog.resolution() == resolution
+    expected = QDialog.DialogCode.Rejected if resolution is None else QDialog.DialogCode.Accepted
+    assert dialog.result() == expected
+
+
+class _DropEvent:
+    def __init__(self, mime_data: QMimeData) -> None:
+        self._mime_data = mime_data
+        self.accepted = False
+
+    def mimeData(self) -> QMimeData:
+        return self._mime_data
+
+    def acceptProposedAction(self) -> None:
+        self.accepted = True
+
+    def ignore(self) -> None:
+        self.accepted = False
+
+
+def test_file_table_rejects_mixed_local_and_remote_drop(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    parent = QWidget()
+    table = DroppableTableWidget(parent)
+    dropped: list[tuple[Path, ...]] = []
+    table.paths_dropped.connect(dropped.append)
+    local_path = tmp_path / "drop.txt"
+    local_path.write_text("content")
+    mime_data = QMimeData()
+    mime_data.setUrls([QUrl.fromLocalFile(str(local_path)), QUrl("https://example.test/file")])
+    event = _DropEvent(mime_data)
+
+    table.dragEnterEvent(event)
+    table.dragMoveEvent(event)
+    table.dropEvent(event)
+
+    assert not event.accepted
+    assert dropped == []
+
+
+def test_file_table_accepts_local_file_drop(
+    qapp: QApplication, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    parent = QWidget()
+    table = DroppableTableWidget(parent)
+    dropped: list[tuple[Path, ...]] = []
+    table.paths_dropped.connect(dropped.append)
+    mime_data = QMimeData()
+    local_path = tmp_path / "drop.txt"
+    local_path.write_text("content")
+    mime_data.setUrls([QUrl.fromLocalFile(str(local_path))])
+    event = _DropEvent(mime_data)
+
+    with caplog.at_level("INFO", logger=main_window_module.LOGGER.name):
+        table.dragEnterEvent(event)
+        table.dragMoveEvent(event)
+        table.dropEvent(event)
+
+    assert event.accepted
+    assert dropped == [(local_path,)]
+    assert [record.message for record in caplog.records] == [
+        "main_window.upload_drop.received count=1",
+        "main_window.upload_drop.dispatched count=1",
+    ]
+    assert str(local_path) not in caplog.text
+
+
+def test_upload_drop_cancel_does_not_create_tasks(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "drop.txt"
+    local_path.write_text("content")
+
+    class CancelDialog:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Rejected)
+
+    monkeypatch.setattr(main_window_module, "UploadSummaryDialog", CancelDialog)
+    window.handle_upload_drop((local_path,))
+
+    assert _wait_until(qapp, lambda: window._scan_thread is None)
+    assert browser.uploaded_files == []
+    assert window.transfer_interface.upload_records == []
+    assert window.status_message() == "已取消上传"
+
+
+def test_upload_drop_accepts_batch_with_partial_failure(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.upload_errors = [FileBrowserError("one failed"), None]
+    window = MainWindow(browser)
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first")
+    second.write_text("second")
+
+    class AcceptDialog:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "copy"
+
+    monkeypatch.setattr(main_window_module, "UploadSummaryDialog", AcceptDialog)
+    window.handle_upload_drop((first, second))
+
+    assert _wait_until(
+        qapp,
+        lambda: window._scan_thread is None
+        and not window._upload_threads
+        and all(
+            record.status in {"失败", "已完成"}
+            for record in window.transfer_interface.upload_records
+        ),
+    )
+    assert [record.status for record in window.transfer_interface.upload_records] == [
+        "失败",
+        "已完成",
+    ]
+
+    assert len(browser.uploaded_files) == 2
+    assert window.status_message() in {
+        "正在加载...",
+        "上传失败：one failed",
+        "上传完成：second.txt",
+    }
+
+
+def test_upload_drop_scans_off_gui_thread(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    gui_thread_id = threading.get_ident()
+    scan_thread_ids: list[int] = []
+    local_path = tmp_path / "drop.txt"
+    local_path.write_text("content")
+
+    original_scan = main_window_module.scan_upload_inputs
+
+    def scan(paths: tuple[Path, ...]) -> object:
+        scan_thread_ids.append(threading.get_ident())
+        return original_scan(paths)
+
+    class CancelDialog:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Rejected)
+
+    monkeypatch.setattr(main_window_module, "scan_upload_inputs", scan)
+    monkeypatch.setattr(main_window_module, "UploadSummaryDialog", CancelDialog)
+    with caplog.at_level("INFO", logger=main_window_module.LOGGER.name):
+        window.handle_upload_drop((local_path,))
+        assert _wait_until(
+            qapp,
+            lambda: window._scan_thread is None
+            and window._upload_conflict_thread is None
+            and window.status_message() == "已取消上传",
+        )
+
+    assert scan_thread_ids and scan_thread_ids[0] != gui_thread_id
+    events = [record.message.split()[0] for record in caplog.records]
+    assert events == [
+        "main_window.upload_scan.start",
+        "main_window.upload_scan.success",
+        "main_window.upload_conflict_check.start",
+        "main_window.upload_conflict_check.success",
+    ]
+    assert str(local_path) not in caplog.text
+
+
+@pytest.mark.parametrize("entry", ["drop", "picker"])
+def test_close_ignores_late_upload_check_result(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "report.txt"
+    local_path.write_text("content")
+    started = threading.Event()
+    dialogs: list[str] = []
+
+    class UnexpectedDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            dialogs.append("opened")
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Rejected)
+
+        def resolution(self) -> None:
+            return None
+
+    if entry == "drop":
+        original_scan = main_window_module.scan_upload_inputs
+
+        def slow_scan(paths: tuple[Path, ...]) -> UploadBatchSummary:
+            started.set()
+            time.sleep(0.05)
+            return original_scan(paths)
+
+        monkeypatch.setattr(main_window_module, "scan_upload_inputs", slow_scan)
+        monkeypatch.setattr(main_window_module, "UploadSummaryDialog", UnexpectedDialog)
+        window.handle_upload_drop((local_path,))
+    else:
+        original_list = browser.list_directory
+
+        def slow_list(parent_id: str) -> list[WopanItem]:
+            started.set()
+            time.sleep(0.05)
+            return original_list(parent_id)
+
+        monkeypatch.setattr(browser, "list_directory", slow_list)
+        monkeypatch.setattr(main_window_module, "UploadConflictDialog", UnexpectedDialog)
+        window._submit_upload_paths((local_path,))
+
+    assert started.wait(2)
+    window.close()
+    assert _wait_until(
+        qapp,
+        lambda: window._scan_thread is None and window._upload_conflict_thread is None,
+    )
+    assert window._closing
+    assert dialogs == []
+    assert browser.uploaded_files == []
+    assert window.transfer_interface.upload_records == []
+
+
+def test_close_during_upload_summary_cannot_submit(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "new.txt"
+    local_path.write_text("content")
+    summary = main_window_module.scan_upload_inputs((local_path,))
+
+    class CloseAndAcceptDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            window.close()
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "copy"
+
+    monkeypatch.setattr(main_window_module, "UploadSummaryDialog", CloseAndAcceptDialog)
+    window._submit_upload_paths(summary.top_paths, summary=summary)
+
+    assert window._closing
+    assert browser.uploaded_files == []
+    assert window.transfer_interface.upload_records == []
+
+
+def test_picker_conflict_rejects_navigation_during_dialog(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "report.txt"
+    local_path.write_text("content")
+
+    class NavigateAndCopyDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            window._breadcrumb.append(
+                main_window_module.BreadcrumbEntry("folder-1", "Folder")
+            )
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "copy"
+
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", NavigateAndCopyDialog)
+    window._submit_upload_paths((local_path,))
+
+    assert browser.uploaded_files == []
+    assert window.transfer_interface.upload_records == []
+    assert window.status_message() == "目录已变化，请重新提交上传任务"
+
+
+def test_close_during_picker_conflict_cannot_submit(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "report.txt"
+    local_path.write_text("content")
+
+    class CloseAndCopyDialog:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            window.close()
+            return int(QDialog.DialogCode.Accepted)
+
+        def resolution(self) -> str:
+            return "copy"
+
+    monkeypatch.setattr(main_window_module, "UploadConflictDialog", CloseAndCopyDialog)
+    window._submit_upload_paths((local_path,))
+
+    assert window._closing
+    assert browser.uploaded_files == []
+    assert window.transfer_interface.upload_records == []
+
+
+def test_close_ignores_late_upload_check_failures(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    window.close()
+    status = window.status_message()
+    login_messages: list[str] = []
+    window.login_required.connect(login_messages.append)
+
+    def unexpected_error(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("closed window must not show an error")
+
+    monkeypatch.setattr(main_window_module.InfoBar, "error", unexpected_error)
+    window._on_upload_scan_failed("late failure")
+    window._on_upload_conflict_check_failed("late failure")
+    window._on_upload_conflict_check_login_required("late login failure")
+    window._submit_upload_paths((Path("/tmp/late.txt"),))
+
+    assert window.status_message() == status
+    assert login_messages == []
+    assert window._upload_conflict_pending == []
