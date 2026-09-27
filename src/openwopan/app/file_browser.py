@@ -666,6 +666,7 @@ class FileBrowserService:
             updated = store.update(state.task_id, _mark_upload_interrupted)
             records.append(_upload_state_record(updated))
         return tuple(records)
+
     def prepare_folder_upload(
         self,
         parent_id: str,
