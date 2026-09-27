@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -21,6 +22,12 @@ from openwopan.tasks.download import (
     DownloadTaskStore,
 )
 from openwopan.tasks.scheduler import DownloadCallbacks, DownloadScheduler, DownloadTaskInput
+from openwopan.tasks.upload import (
+    UploadTaskState,
+    UploadTaskStore,
+    make_upload_task_id,
+)
+from openwopan.wopan.client import UploadResumeContext
 from openwopan.wopan.errors import (
     WopanAuthenticationError,
     WopanBusinessError,
@@ -987,3 +994,642 @@ def test_file_browser_service_recovers_tasks_by_persisted_download_id(tmp_path: 
         assert records[0].status == "已暂停"
     finally:
         service.close_downloads()
+
+
+# ---------------------------------------------------------------------------
+# Upload resume: persisted sessions, terminal-state semantics, recovery
+# ---------------------------------------------------------------------------
+
+
+class ResumeAwareUploadClient(FakeClient):
+    """Fake client that replays scripted part results before failing/succeeding."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.part_results: list[tuple[int, str]] = []
+        self.upload_failure: Exception | None = None
+
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        **kwargs: object,
+    ) -> WopanItem:
+        self.uploaded_files.append((parent_id, local_path))
+        self.upload_kwargs.append(kwargs)
+        resume = kwargs.get("resume")
+        if isinstance(resume, UploadResumeContext) and resume.on_part_result is not None:
+            for part_index, fid in self.part_results:
+                resume.on_part_result(part_index, fid)
+        if self.upload_failure is not None:
+            raise self.upload_failure
+        return WopanItem(
+            item_id="uploaded-file",
+            name=local_path.name,
+            kind=WopanItemKind.FILE,
+            parent_id=parent_id,
+            download_id="uploaded-fid",
+            size=local_path.stat().st_size,
+        )
+
+
+def _resume_service(
+    tmp_path: Path,
+    client: ResumeAwareUploadClient | None = None,
+    store: UploadTaskStore | None = None,
+) -> tuple[FileBrowserService, ResumeAwareUploadClient, UploadTaskStore]:
+    resolved_client = client or ResumeAwareUploadClient()
+    resolved_store = store or UploadTaskStore(tmp_path / "uploads")
+    service = FileBrowserService(
+        resolved_client,  # type: ignore[arg-type]
+        settings=AppSettings(upload_part_size_mb=5),
+        upload_store=resolved_store,
+    )
+    return service, resolved_client, resolved_store
+
+
+def _three_part_file(tmp_path: Path) -> Path:
+    local_path = tmp_path / "report.bin"
+    local_path.write_bytes(b"012345678901234")
+    return local_path
+
+
+def _state(store: UploadTaskStore, task_id: str) -> UploadTaskState | None:
+    return store.load(task_id)
+
+
+def test_service_upload_records_parts_and_keeps_state_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1 前半：分片确认即落盘；失败保留已完成分片。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1"), (2, "fid-2")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError, match="busy"):
+        service.upload_file("folder-1", local_path)
+
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    state = _state(store, task_id)
+    assert state is not None
+    assert state.completed_indexes == [1, 2]
+    assert state.fid == "fid-1"
+    assert state.status == "失败"
+    assert "busy" in state.error
+    first_resume = client.upload_kwargs[0]["resume"]
+    assert isinstance(first_resume, UploadResumeContext)
+    assert first_resume.completed_indexes == frozenset()
+    assert first_resume.known_fid == ""
+    assert client.upload_kwargs[0]["upload_part_size_mb"] == 5
+
+
+def test_service_upload_retry_reuses_session_and_skips_completed_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1 后半 + AC2：重试复用 uniqueId/batchNo，仅发剩余分片。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1"), (2, "fid-2")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+
+    # 第二个 (3, fid-3) 模拟重复确认，覆盖去重分支
+    client.part_results = [(3, "fid-3"), (3, "fid-3")]
+    client.upload_failure = None
+    item = service.upload_file("folder-1", local_path)
+
+    first_resume = client.upload_kwargs[0]["resume"]
+    second_resume = client.upload_kwargs[1]["resume"]
+    assert isinstance(first_resume, UploadResumeContext)
+    assert isinstance(second_resume, UploadResumeContext)
+    assert second_resume.completed_indexes == frozenset({1, 2})
+    assert second_resume.known_fid == "fid-1"
+    assert second_resume.unique_id == first_resume.unique_id
+    assert second_resume.batch_no == first_resume.batch_no
+    assert item.item_id == "uploaded-file"
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    assert _state(store, task_id) is None
+
+
+def test_service_upload_discards_state_on_file_size_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3 size 变化：旧进度清除，全新 uniqueId。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, _store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+    first_resume = client.upload_kwargs[0]["resume"]
+
+    local_path.write_bytes(b"012345678901234-changed")
+    client.upload_failure = None
+    service.upload_file("folder-1", local_path)
+
+    second_resume = client.upload_kwargs[1]["resume"]
+    assert second_resume.completed_indexes == frozenset()
+    assert second_resume.unique_id != first_resume.unique_id
+
+
+def test_service_upload_discards_state_on_mtime_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3 mtime 变化：旧进度清除，全新 uniqueId。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, _store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+    first_resume = client.upload_kwargs[0]["resume"]
+
+    stat = local_path.stat()
+    os.utime(local_path, (stat.st_atime, stat.st_mtime + 30))
+    client.upload_failure = None
+    service.upload_file("folder-1", local_path)
+
+    second_resume = client.upload_kwargs[1]["resume"]
+    assert second_resume.completed_indexes == frozenset()
+    assert second_resume.unique_id != first_resume.unique_id
+
+
+def test_service_upload_discards_state_when_part_plan_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC6 分片计划变化：丢弃旧进度，全新会话。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, _store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+    first_resume = client.upload_kwargs[0]["resume"]
+
+    service.update_settings(AppSettings(upload_part_size_mb=10))
+    client.upload_failure = None
+    service.upload_file("folder-1", local_path)
+
+    second_resume = client.upload_kwargs[1]["resume"]
+    assert second_resume.completed_indexes == frozenset()
+    assert second_resume.unique_id != first_resume.unique_id
+
+
+def test_service_upload_discards_state_older_than_max_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC6 超 24h：丢弃旧进度，全新会话。"""
+    import json as _json
+
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+    first_resume = client.upload_kwargs[0]["resume"]
+
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    path = store.task_path(task_id)
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    data["updated_at"] = time.time() - 25 * 3600
+    path.write_text(_json.dumps(data), encoding="utf-8")
+
+    client.upload_failure = None
+    service.upload_file("folder-1", local_path)
+
+    second_resume = client.upload_kwargs[1]["resume"]
+    assert second_resume.completed_indexes == frozenset()
+    assert second_resume.unique_id != first_resume.unique_id
+
+
+def test_service_upload_short_circuits_when_all_parts_and_fid_known(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC4 前半：全部分片已完成且有 fid，零网络直接返回。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    local_path = tmp_path / "report.txt"
+    local_path.write_bytes(b"012345678901234")
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    state = UploadTaskState(
+        task_id=task_id,
+        file_name="report.txt",
+        local_path=local_path,
+        parent_id="folder-1",
+        upload_name=None,
+        file_size=15,
+        file_mtime=local_path.stat().st_mtime,
+        part_size=5,
+        total_parts=3,
+        unique_id="1690000000000",
+        batch_no="20260101010101",
+        fid="fid-full",
+        completed_indexes=[1, 2, 3],
+    )
+    store.save(state)
+
+    item = service.upload_file("folder-1", local_path)
+
+    assert client.uploaded_files == []
+    assert item.item_id == "fid-full"
+    assert item.name == "report.txt"
+    assert item.file_type == "4"
+    assert _state(store, task_id) is None
+
+
+def test_service_upload_deletes_state_on_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC5 取消：持久化状态删除后原样抛出。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanUploadCancelledError("cancelled")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserUploadCancelledError, match="上传已取消"):
+        service.upload_file("folder-1", local_path)
+
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    assert _state(store, task_id) is None
+
+
+def test_service_recovers_interrupted_uploads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC7：中断任务归一为可重试行；已完成/缺文件残留清理。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, _client, store = _resume_service(tmp_path)
+    existing = tmp_path / "kept.bin"
+    existing.write_bytes(b"data")
+    resumable = UploadTaskState(
+        task_id="kept-task",
+        file_name="kept.bin",
+        local_path=existing,
+        parent_id="folder-1",
+        upload_name=None,
+        file_size=4,
+        file_mtime=1.0,
+        part_size=5,
+        total_parts=3,
+        unique_id="u1",
+        batch_no="b1",
+        completed_indexes=[1],
+    )
+    store.save(resumable)
+    finished = UploadTaskState(
+        task_id="finished-task",
+        file_name="done.bin",
+        local_path=tmp_path / "done.bin",
+        parent_id="folder-1",
+        upload_name=None,
+        file_size=1,
+        file_mtime=1.0,
+        part_size=5,
+        total_parts=1,
+        unique_id="u2",
+        batch_no="b2",
+        status="已完成",
+    )
+    store.save(finished)
+    missing = UploadTaskState(
+        task_id="missing-task",
+        file_name="gone.bin",
+        local_path=tmp_path / "gone.bin",
+        parent_id="folder-1",
+        upload_name=None,
+        file_size=1,
+        file_mtime=1.0,
+        part_size=5,
+        total_parts=1,
+        unique_id="u3",
+        batch_no="b3",
+    )
+    store.save(missing)
+
+    records = service.recover_uploads()
+
+    assert [record.task_id for record in records] == ["kept-task"]
+    record = records[0]
+    assert record.status == "失败"
+    assert record.resumable is True
+    assert record.completed_parts == 1
+    assert record.total_parts == 3
+    assert "应用中断" in record.error
+    assert "1/3" in record.error
+    assert _state(store, "kept-task") is not None
+    assert _state(store, "kept-task").status == "失败"  # type: ignore[union-attr]
+    assert _state(store, "finished-task") is None
+    assert _state(store, "missing-task") is None
+
+
+def test_service_recovers_nothing_without_store() -> None:
+    service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
+
+    assert service.recover_uploads() == ()
+
+
+def test_service_upload_without_store_keeps_legacy_behavior(tmp_path: Path) -> None:
+    """不注入 store 时：kwargs 无 resume，行为与旧版完全一致。"""
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"data")
+
+    service.upload_file("folder-1", local_path)
+
+    assert "resume" not in client.upload_kwargs[0]
+    assert service.recover_uploads() == ()
+
+
+class LegacyKeywordUploadClient(FakeClient):
+    """Backend without the resume keyword."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.received: list[dict[str, object]] = []
+
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+        progress_callback=None,  # type: ignore[no-untyped-def]
+        cancel_requested=None,  # type: ignore[no-untyped-def]
+    ) -> WopanItem:
+        self.received.append(
+            {
+                "upload_name": upload_name,
+                "progress_callback": progress_callback,
+                "cancel_requested": cancel_requested,
+            }
+        )
+        return WopanItem(
+            item_id="legacy-file",
+            name=local_path.name,
+            kind=WopanItemKind.FILE,
+            parent_id=parent_id,
+            download_id="legacy-fid",
+            size=local_path.stat().st_size,
+        )
+
+
+class OlderUploadClient(LegacyKeywordUploadClient):
+    """Backend without the cancel_requested keyword either."""
+
+    def upload_file(  # type: ignore[override]
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None = None,
+        progress_callback=None,  # type: ignore[no-untyped-def]
+    ) -> WopanItem:
+        self.received.append({"upload_name": upload_name, "progress_callback": progress_callback})
+        return WopanItem(
+            item_id="older-file",
+            name=local_path.name,
+            kind=WopanItemKind.FILE,
+            parent_id=parent_id,
+            download_id="older-fid",
+            size=local_path.stat().st_size,
+        )
+
+
+class OldestUploadClient(FakeClient):
+    """Backend accepting only the historical keywords."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.received: list[dict[str, object]] = []
+
+    def upload_file(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_part_size_mb: int = 5,
+        max_upload_threads: int = 16,
+        retry_max_attempts: int = 3,
+        upload_name: str | None = None,
+    ) -> WopanItem:
+        self.received.append({"upload_name": upload_name})
+        return WopanItem(
+            item_id="oldest-file",
+            name=local_path.name,
+            kind=WopanItemKind.FILE,
+            parent_id=parent_id,
+            download_id="oldest-fid",
+            size=local_path.stat().st_size,
+        )
+
+
+def test_service_upload_degrades_kwargs_for_older_backends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """resume/cancel_requested/progress_callback 逐级降级重试。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    client = OldestUploadClient()
+    service, _resolved, _store = _resume_service(tmp_path, client=client)
+    service._upload_store = UploadTaskStore(tmp_path / "uploads2")
+    local_path = _three_part_file(tmp_path)
+
+    item = service.upload_file(
+        "folder-1",
+        local_path,
+        progress_callback=lambda done, total: None,
+        cancel_requested=lambda: False,
+    )
+
+    assert item.item_id == "oldest-file"
+    assert client.received[-1] == {"upload_name": None}
+
+
+class VolatileStore(UploadTaskStore):
+    """Store whose update always loses the race against a concurrent delete."""
+
+    def update(self, task_id: str, change):  # type: ignore[no-untyped-def]
+        raise KeyError(f"unknown upload task: {task_id}")
+
+
+@pytest.mark.parametrize(
+    ("failure", "match"),
+    [
+        (None, None),
+        (WopanBusinessError("9999", "busy"), "busy"),
+    ],
+    ids=["success", "failure"],
+)
+def test_service_upload_tolerates_state_deleted_during_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception | None,
+    match: str | None,
+) -> None:
+    """分片回调与终态写入撞上并发删除：吞掉 KeyError，不改变对外结果。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    client = ResumeAwareUploadClient()
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = failure
+    service = FileBrowserService(
+        client,  # type: ignore[arg-type]
+        settings=AppSettings(upload_part_size_mb=5),
+        upload_store=VolatileStore(tmp_path / "uploads"),
+    )
+    local_path = _three_part_file(tmp_path)
+
+    if match is None:
+        item = service.upload_file("folder-1", local_path)
+        assert item.item_id == "uploaded-file"
+    else:
+        with pytest.raises(FileBrowserError, match=match):
+            service.upload_file("folder-1", local_path)
+
+
+def test_service_upload_rejects_empty_upload_name(tmp_path: Path) -> None:
+    service, client, _store = _resume_service(tmp_path)
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"data")
+
+    with pytest.raises(FileBrowserError, match="上传文件名称不能为空"):
+        service.upload_file("folder-1", local_path, upload_name="")
+
+    assert client.uploaded_files == []
+
+
+def test_service_upload_maps_stat_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _client, _store = _resume_service(tmp_path)
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"data")
+    real_stat = Path.stat
+    calls = {"count": 0}
+
+    def counted_stat(self: Path, *args: object, **kwargs: object) -> object:
+        calls["count"] += 1
+        if calls["count"] >= 3:
+            raise OSError("stat denied")
+        return real_stat(self)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", counted_stat)
+
+    with pytest.raises(FileBrowserError, match="无法读取本地文件"):
+        service.upload_file("folder-1", local_path)
+
+
+class BareUploadClient(FakeClient):
+    """Backend accepting nothing beyond the positional arguments."""
+
+    def upload_file(self, parent_id: str, local_path: Path) -> WopanItem:
+        return WopanItem(
+            item_id="bare-file",
+            name=local_path.name,
+            kind=WopanItemKind.FILE,
+            parent_id=parent_id,
+            download_id="bare-fid",
+            size=local_path.stat().st_size,
+        )
+
+
+def test_service_upload_reraises_type_error_without_droppable_kwargs(
+    tmp_path: Path,
+) -> None:
+    client = BareUploadClient()
+    service, _resolved, store = _resume_service(tmp_path, client=client)
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(TypeError):
+        service.upload_file(
+            "folder-1",
+            local_path,
+            progress_callback=lambda done, total: None,
+        )
+
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    state = _state(store, task_id)
+    assert state is not None
+    assert state.status == "失败"
+
+
+def test_service_recovered_record_carries_upload_name_for_retry_key(
+    tmp_path: Path,
+) -> None:
+    """恢复记录显式携带 upload_name，retry 派生的持久化键与原会话一致。"""
+    service, _client, store = _resume_service(tmp_path)
+    named_path = tmp_path / "kept.bin"
+    named_path.write_bytes(b"data")
+    named_task_id = make_upload_task_id("folder-1", named_path, "renamed.bin")
+    store.save(
+        UploadTaskState(
+            task_id=named_task_id,
+            file_name="renamed.bin",
+            local_path=named_path,
+            parent_id="folder-1",
+            upload_name="renamed.bin",
+            file_size=4,
+            file_mtime=1.0,
+            part_size=5,
+            total_parts=3,
+            unique_id="u9",
+            batch_no="b9",
+            completed_indexes=[1],
+        )
+    )
+    anonymous_path = tmp_path / "plain.bin"
+    anonymous_path.write_bytes(b"data")
+    anonymous_task_id = make_upload_task_id("folder-1", anonymous_path, None)
+    store.save(
+        UploadTaskState(
+            task_id=anonymous_task_id,
+            file_name="plain.bin",
+            local_path=anonymous_path,
+            parent_id="folder-1",
+            upload_name=None,
+            file_size=4,
+            file_mtime=1.0,
+            part_size=5,
+            total_parts=3,
+            unique_id="u8",
+            batch_no="b8",
+            completed_indexes=[1],
+        )
+    )
+
+    records = service.recover_uploads()
+
+    by_id = {record.task_id: record for record in records}
+    assert by_id[named_task_id].upload_name == "renamed.bin"
+    assert by_id[anonymous_task_id].upload_name is None
+    # retry 以记录中的 upload_name 显式重传时，派生键命中原会话状态
+    assert (
+        make_upload_task_id(
+            by_id[named_task_id].target_parent_id,
+            by_id[named_task_id].local_path,
+            by_id[named_task_id].upload_name,
+        )
+        == named_task_id
+    )
+    assert (
+        make_upload_task_id(
+            by_id[anonymous_task_id].target_parent_id,
+            by_id[anonymous_task_id].local_path,
+            by_id[anonymous_task_id].upload_name,
+        )
+        == anonymous_task_id
+    )

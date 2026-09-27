@@ -92,6 +92,7 @@ from openwopan.tasks.upload import (
     FolderUploadJob,
     UploadBatchSummary,
     UploadConflictResolution,
+    UploadTaskRecord,
     find_upload_conflicts,
     format_upload_summary,
     resolve_upload_targets,
@@ -2304,6 +2305,8 @@ class MainWindow(_MainWindowBase):
         self._download_submit_paths: dict[QThread, set[Path]] = {}
         self._download_reserved_targets: set[Path] = set()
         self._download_recovery_thread: QThread | None = None
+        self._upload_recovery_thread: QThread | None = None
+        self._upload_recovery_worker: BrowserOperationWorker | None = None
         self._download_recovery_worker: BrowserOperationWorker | None = None
         self._download_close_thread: QThread | None = None
         self._download_close_worker: BrowserOperationWorker | None = None
@@ -2442,6 +2445,7 @@ class MainWindow(_MainWindowBase):
             (self._download_thread, "download", None),
             (self._download_target_thread, "download_target", None),
             (self._download_recovery_thread, "download_recovery", None),
+            (self._upload_recovery_thread, "upload_recovery", None),
             (self._download_close_thread, "download_close", None),
             (self._download_operation_thread, "download_operation", None),
             (self._scan_thread, "upload_scan", None),
@@ -2620,6 +2624,7 @@ class MainWindow(_MainWindowBase):
             self._recover_downloads()
         else:
             self._load_persisted_download_records()
+        self._recover_uploads()
         self.refresh_root()
         self.refresh_cloud_usage()
 
@@ -5144,6 +5149,62 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._download_recovery_thread = None
         self._download_recovery_worker = None
+
+    def _recover_uploads(self) -> None:
+        if self._file_browser is None:
+            return
+        recover = getattr(self._file_browser, "recover_uploads", None)
+        if not callable(recover):
+            return
+        thread = QThread(self)
+        worker = BrowserOperationWorker(recover)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_upload_recovery_succeeded)
+        worker.failed.connect(self._on_upload_recovery_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_upload_recovery)
+        self._upload_recovery_thread = thread
+        self._upload_recovery_worker = worker
+        thread.start()
+
+    def _on_upload_recovery_succeeded(self, result: object) -> None:
+        if not isinstance(result, tuple) or self._closing:
+            return
+        for persisted in result:
+            self._add_persisted_upload_record(persisted)
+        if result:
+            self.transfer_interface.flush_progress_render()
+            self.transfer_interface._render_upload_table()
+
+    def _on_upload_recovery_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.upload.recovery.failed error=%s", message)
+        self._set_status(f"恢复上传任务失败：{message}")
+
+    def _clear_upload_recovery(self) -> None:
+        self._delete_finished_thread()
+        self._upload_recovery_thread = None
+        self._upload_recovery_worker = None
+
+    def _add_persisted_upload_record(self, persisted: object) -> None:
+        required = ("task_id", "name", "local_path", "target_parent_id", "status")
+        if not all(hasattr(persisted, attribute) for attribute in required):
+            return
+        persisted_record = cast(UploadTaskRecord, persisted)
+        record = TransferRecord(
+            task_id=persisted_record.task_id,
+            direction="upload",
+            name=persisted_record.name,
+            size=getattr(persisted_record, "file_size", None),
+            target_path=persisted_record.local_path,
+            status=persisted_record.status,
+            error=str(getattr(persisted_record, "error", "") or ""),
+            upload_parent_id=persisted_record.target_parent_id,
+            upload_name=getattr(persisted_record, "upload_name", None),
+            upload_retryable=bool(getattr(persisted_record, "resumable", False)),
+        )
+        self.transfer_interface.add_upload_record(record)
 
     def _load_persisted_download_records(self) -> None:
         if self._file_browser is None:
