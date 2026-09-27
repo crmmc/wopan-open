@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -14,7 +15,9 @@ from openwopan.wopan import client as client_module
 from openwopan.wopan.client import WopanClient
 from openwopan.wopan.errors import (
     WopanAuthenticationError,
+    WopanBusinessError,
     WopanResponseError,
+    WopanUploadCancelledError,
 )
 from openwopan.wopan.models import WopanItemKind
 
@@ -692,3 +695,624 @@ def test_upload_file_keeps_local_name_without_upload_name(tmp_path: Path) -> Non
     assert fields["fileName"] == "local-name.txt"
     assert b'filename="local-name.txt"' in body
     assert b"text/plain" in body
+
+
+# -- resumable upload (UploadResumeContext) ------------------------------------
+
+
+def _multipart_field(body: bytes, name: str) -> str:
+    marker = f'name="{name}"'.encode()
+    start = body.find(marker) + len(marker)
+    value_start = body.find(b"\r\n\r\n", start) + 4
+    value_end = body.find(b"\r\n", value_start)
+    return body[value_start:value_end].decode()
+
+
+def _decrypt_file_info(body: bytes) -> dict[str, object]:
+    import json as _json
+
+    from cryptography.hazmat.primitives.ciphers import Cipher as _Cipher
+    from cryptography.hazmat.primitives.ciphers import algorithms as _algorithms
+
+    encrypted = _multipart_field(body, "fileInfo")
+    cipher = _Cipher(_algorithms.AES(TOKEN[:16].encode()), modes.CBC(IV))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(base64.b64decode(encrypted)) + decryptor.finalize()
+    decoded = _json.loads(padded[: -padded[-1]].decode())
+    assert isinstance(decoded, dict)
+    return decoded
+
+
+def _upload_capture_handler(
+    responses: dict[int, object] | None = None,
+) -> tuple[object, list[dict[str, str]], list[bytes]]:
+    requests: list[dict[str, str]] = []
+    bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return _success_response({"url": "https://upload.example.test"})
+        body = request.content
+        bodies.append(body)
+        requests.append(
+            {
+                "partIndex": _multipart_field(body, "partIndex"),
+                "uniqueId": _multipart_field(body, "uniqueId"),
+                "fileSize": _multipart_field(body, "fileSize"),
+                "totalPart": _multipart_field(body, "totalPart"),
+            }
+        )
+        part_index = int(requests[-1]["partIndex"])
+        response = (responses or {}).get(part_index)
+        if isinstance(response, Exception):
+            raise response
+        if response is None:
+            return httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-1"}})
+        return response
+
+    return handler, requests, bodies
+
+
+def _recovery_handler(
+    listing: object,
+    *,
+    upload_responses: dict[int, object] | None = None,
+    on_upload_request: Callable[[], None] | None = None,
+) -> tuple[object, list[str]]:
+    """Split wohome dispatcher calls by key: GetZoneInfo vs QueryAllFiles.
+
+    ``requests`` records one tag per HTTP call: ``dispatcher:<key>`` for the
+    encrypted dispatcher protocol and ``upload:<partIndex>`` for upload2C.
+    """
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/wohome/dispatcher"):
+            payload = json.loads(request.content.decode())
+            key = str(payload["header"]["key"])
+            requests.append(f"dispatcher:{key}")
+            if key == "QueryAllFiles":
+                return _success_response(listing)
+            return _success_response({"url": "https://upload.example.test"})
+        part_index = int(_multipart_field(request.content, "partIndex"))
+        requests.append(f"upload:{part_index}")
+        if on_upload_request is not None:
+            on_upload_request()
+        response = (upload_responses or {}).get(part_index)
+        if isinstance(response, Exception):
+            raise response
+        if response is None:
+            return httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-1"}})
+        return response
+
+    return handler, requests
+
+
+# UAT listing fixture: entry-1 is the finished upload (name+size+fid match).
+_RESUME_LISTING = {
+    "systemDirs": [],
+    "files": [
+        {"id": "entry-1", "fid": "fid-recovered", "name": "report.bin", "type": "1", "size": 15},
+        {"id": "entry-2", "fid": "fid-other", "name": "other.bin", "type": "1", "size": 15},
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("file_size", "part_mb", "expected_part_size", "expected_total_parts"),
+    [
+        (0, 5, 5 * 1024 * 1024, 1),
+        (5 * 1024 * 1024 + 1, 5, 5 * 1024 * 1024, 2),
+        (1, 4, 5 * 1024 * 1024, 1),
+        (1, 99, 16 * 1024 * 1024, 1),
+    ],
+)
+def test_resolve_upload_part_plan_is_single_source(
+    file_size: int, part_mb: int, expected_part_size: int, expected_total_parts: int
+) -> None:
+    part_size, total_parts = client_module.resolve_upload_part_plan(file_size, part_mb)
+
+    assert part_size == expected_part_size
+    assert total_parts == expected_total_parts
+
+
+def test_upload_file_with_resume_sends_only_pending_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1/AC2：续传复用会话字段，仅发送未完成分片。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests, bodies = _upload_capture_handler()
+    part_results: list[tuple[int, str]] = []
+    resume = client_module.UploadResumeContext(
+        unique_id="1690000000000",
+        batch_no="20260101010101",
+        completed_indexes=frozenset({1}),
+        known_fid="",
+        on_part_result=lambda index, fid: part_results.append((index, fid)),
+    )
+
+    item = _upload_client(handler).upload_file(
+        "folder-1",
+        local_file,
+        upload_part_size_mb=5,
+        max_upload_threads=2,
+        resume=resume,
+    )
+
+    assert [request["partIndex"] for request in requests] == ["2", "3"]
+    assert {request["uniqueId"] for request in requests} == {"1690000000000"}
+    assert {request["fileSize"] for request in requests} == {"15"}
+    assert {request["totalPart"] for request in requests} == {"3"}
+    for body in bodies:
+        file_info = _decrypt_file_info(body)
+        assert file_info["batchNo"] == "20260101010101"
+        assert file_info["fileSize"] == 15
+    assert sorted(part_results) == [(2, "fid-1"), (3, "fid-1")]
+    assert item.item_id == "fid-1"
+
+
+def test_upload_file_prefers_first_response_with_fid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, _requests, _bodies = _upload_capture_handler(
+        responses={
+            2: httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-2"}}),
+            3: httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-3"}}),
+        }
+    )
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1}),
+    )
+
+    # max_upload_threads=1 保证完成顺序等于提交顺序，first-with-fid 结果确定
+    item = _upload_client(handler).upload_file(
+        "folder-1", local_file, upload_part_size_mb=5, max_upload_threads=1, resume=resume
+    )
+
+    assert item.item_id == "fid-2"
+
+
+def test_upload_file_with_resume_reports_seeded_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, _requests, _bodies = _upload_capture_handler()
+    progress: list[tuple[int, int]] = []
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1}),
+    )
+
+    _upload_client(handler).upload_file(
+        "folder-1",
+        local_file,
+        upload_part_size_mb=5,
+        max_upload_threads=2,
+        progress_callback=lambda done, total: progress.append((done, total)),
+        resume=resume,
+    )
+
+    assert progress[-1] == (15, 15)
+    assert sorted(progress) == [(10, 15), (15, 15)]
+
+
+def test_upload_file_resume_filters_out_of_range_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests, _bodies = _upload_capture_handler()
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1, 7, 0, -2}),
+    )
+
+    _upload_client(handler).upload_file(
+        "folder-1", local_file, upload_part_size_mb=5, max_upload_threads=2, resume=resume
+    )
+
+    assert sorted(request["partIndex"] for request in requests) == ["2", "3"]
+
+
+def test_upload_file_all_parts_done_recovers_fid_from_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UAT 修正：全片完成但缺 fid 时不再重发末片，改为目录查询取回 fid。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests = _recovery_handler(_RESUME_LISTING)
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1, 2, 3}),
+        known_fid="",
+    )
+
+    item = _upload_client(handler).upload_file(
+        "folder-1", local_file, upload_part_size_mb=5, max_upload_threads=2, resume=resume
+    )
+
+    # 只有 QueryAllFiles dispatcher 请求：无 GetZoneInfo、无 upload2C 分片请求
+    assert requests == ["dispatcher:QueryAllFiles"]
+    assert item.item_id == "fid-recovered"
+    assert item.download_id == "fid-recovered"
+    assert item.name == "report.bin"
+    assert item.size == 15
+    assert item.parent_id == "folder-1"
+    assert item.kind is WopanItemKind.FILE
+    assert item.file_type == client_module.guess_upload_file_type("report.bin")
+
+
+def test_upload_file_all_parts_done_listing_miss_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """全片完成但目录查询未命中 → 抛出带清晰信息的 WopanResponseError。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests = _recovery_handler({"systemDirs": [], "files": []})
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1, 2, 3}),
+        known_fid="",
+    )
+
+    with pytest.raises(WopanResponseError, match="未找到对应文件"):
+        _upload_client(handler).upload_file(
+            "folder-1", local_file, upload_part_size_mb=5, max_upload_threads=2, resume=resume
+        )
+
+    assert requests == ["dispatcher:QueryAllFiles"]
+
+
+def test_upload_file_resume_with_known_fid_skips_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests, _bodies = _upload_capture_handler()
+    progress: list[tuple[int, int]] = []
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1, 2, 3}),
+        known_fid="known-fid",
+    )
+
+    item = _upload_client(handler).upload_file(
+        "folder-1",
+        local_file,
+        upload_part_size_mb=5,
+        progress_callback=lambda done, total: progress.append((done, total)),
+        resume=resume,
+    )
+
+    # handler 只在 upload2C 请求时记录，requests 为空即零上传网络请求
+    assert requests == []
+    assert item.item_id == "known-fid"
+    assert item.file_type == client_module.guess_upload_file_type("report.bin")
+    assert progress == [(15, 15)]
+
+
+def test_upload_file_single_part_resume_recovers_fid_from_listing(tmp_path: Path) -> None:
+    """单片路径同样接入目录查询自愈（替换原"重发末片"兜底）。"""
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"content")
+    handler, requests = _recovery_handler(
+        {
+            "systemDirs": [],
+            "files": [
+                {
+                    "id": "entry-1",
+                    "fid": "fid-single",
+                    "name": "report.txt",
+                    "type": "1",
+                    "size": 7,
+                },
+            ],
+        }
+    )
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1}),
+        known_fid="",
+    )
+
+    item = _upload_client(handler).upload_file("0", local_file, resume=resume)
+
+    assert requests == ["dispatcher:QueryAllFiles"]
+    assert item.item_id == "fid-single"
+
+
+def test_upload_file_single_part_resume_with_fid_skips_network(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"content")
+    handler, requests, _bodies = _upload_capture_handler()
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1}),
+        known_fid="single-fid",
+    )
+
+    item = _upload_client(handler).upload_file("0", local_file, resume=resume)
+
+    assert requests == []
+    assert item.item_id == "single-fid"
+    assert item.size == 7
+
+
+def test_upload_file_all_parts_done_recovery_reports_final_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """目录查询自愈成功后回调满额进度（替换原"重发末片"进度兜底）。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests = _recovery_handler(_RESUME_LISTING)
+    progress: list[tuple[int, int]] = []
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1, 2, 3}),
+        known_fid="",
+    )
+
+    _upload_client(handler).upload_file(
+        "folder-1",
+        local_file,
+        upload_part_size_mb=5,
+        progress_callback=lambda done, total: progress.append((done, total)),
+        resume=resume,
+    )
+
+    assert requests == ["dispatcher:QueryAllFiles"]
+    assert progress == [(15, 15)]
+
+
+@pytest.mark.parametrize("with_progress", [True, False])
+def test_upload_file_resume_part_failure_recovers_from_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_progress: bool
+) -> None:
+    """失败路径自愈 a)：续传分片失败后目录查询命中 → 整体按成功返回。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests = _recovery_handler(
+        _RESUME_LISTING,
+        upload_responses={2: httpx.Response(200, json={"code": "9999", "msg": "busy"})},
+    )
+    progress: list[tuple[int, int]] = []
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1}),
+    )
+
+    item = _upload_client(handler).upload_file(
+        "folder-1",
+        local_file,
+        upload_part_size_mb=5,
+        max_upload_threads=1,
+        retry_max_attempts=0,
+        progress_callback=(
+            (lambda done, total: progress.append((done, total))) if with_progress else None
+        ),
+        resume=resume,
+    )
+
+    assert item.item_id == "fid-recovered"
+    if with_progress:
+        assert progress == [(15, 15)]
+    else:
+        assert progress == []
+    assert "upload:2" in requests
+    assert requests.count("dispatcher:QueryAllFiles") == 1
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        {"systemDirs": [], "files": []},
+        {
+            "systemDirs": [],
+            "files": [
+                {"id": "e1", "fid": "fid-old", "name": "report.bin", "type": "1", "size": 14},
+            ],
+        },
+        {
+            "systemDirs": [],
+            "files": [
+                {"id": "e1", "name": "report.bin", "type": "1", "size": 15},
+            ],
+        },
+        {
+            "systemDirs": [],
+            "files": [
+                {"id": "d1", "name": "report.bin", "type": "0"},
+            ],
+        },
+    ],
+    ids=["empty", "size-mismatch", "no-fid", "same-name-folder"],
+)
+def test_upload_file_resume_failure_keeps_original_error_when_listing_misses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: object
+) -> None:
+    """失败路径自愈 b)/e)：未命中（含同名不同 size / 无 fid / 同名目录）→ 原异常保留。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests = _recovery_handler(
+        listing,
+        upload_responses={2: httpx.Response(200, json={"code": "9999", "msg": "busy"})},
+    )
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1}),
+    )
+
+    with pytest.raises(WopanBusinessError, match="busy"):
+        _upload_client(handler).upload_file(
+            "folder-1",
+            local_file,
+            upload_part_size_mb=5,
+            max_upload_threads=1,
+            retry_max_attempts=0,
+            resume=resume,
+        )
+
+    assert requests.count("dispatcher:QueryAllFiles") == 1
+
+
+def test_upload_file_resume_failure_keeps_original_error_when_listing_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """失败路径自愈：目录查询自身失败（响应不可解析）不得掩盖原上传异常。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, requests = _recovery_handler(
+        {"files": "oops"},  # QueryAllFiles field-not-list → list_files 抛 WopanResponseError
+        upload_responses={2: httpx.Response(200, json={"code": "9999", "msg": "busy"})},
+    )
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1}),
+    )
+
+    with pytest.raises(WopanBusinessError, match="busy"):
+        _upload_client(handler).upload_file(
+            "folder-1",
+            local_file,
+            upload_part_size_mb=5,
+            max_upload_threads=1,
+            retry_max_attempts=0,
+            resume=resume,
+        )
+
+    assert requests.count("dispatcher:QueryAllFiles") == 1
+
+
+def test_upload_file_cancelled_error_propagates_without_listing_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """失败路径自愈 c)：WopanUploadCancelledError 不触发目录查询、原样传播。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"content")
+    state = {"cancelled": False}
+
+    def cancel_requested() -> bool:
+        return state["cancelled"]
+
+    def mark_cancelled() -> None:
+        state["cancelled"] = True
+
+    handler, requests = _recovery_handler(_RESUME_LISTING, on_upload_request=mark_cancelled)
+    resume = client_module.UploadResumeContext(unique_id="u", batch_no="b")
+
+    with pytest.raises(WopanUploadCancelledError):
+        _upload_client(handler).upload_file(
+            "0", local_file, resume=resume, cancel_requested=cancel_requested
+        )
+
+    # 取消即传播：即使目录里有完全匹配的文件也不做查询
+    assert "dispatcher:QueryAllFiles" not in requests
+
+
+def test_upload_file_fresh_failure_makes_no_listing_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """失败路径自愈 d)：resume=None 的全新上传失败零额外目录查询请求。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "tiny.bin"
+    local_file.write_bytes(b"ab")  # 单片文件
+    handler, requests = _recovery_handler(
+        _RESUME_LISTING,
+        upload_responses={1: httpx.Response(200, json={"code": "9999", "msg": "busy"})},
+    )
+
+    with pytest.raises(WopanBusinessError, match="busy"):
+        _upload_client(handler).upload_file("folder-1", local_file, retry_max_attempts=0)
+
+    assert requests == ["dispatcher:GetZoneInfo", "upload:1"]
+
+
+def test_upload_parts_parallel_reraises_unexpected_part_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "report.bin"
+    local_file.write_bytes(b"012345678901234")
+    handler, _requests, _bodies = _upload_capture_handler(
+        responses={2: RuntimeError("boom")},
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _upload_client(handler).upload_file(
+            "folder-1",
+            local_file,
+            upload_part_size_mb=5,
+            max_upload_threads=2,
+            retry_max_attempts=0,
+        )
+
+
+def test_upload_parts_parallel_defends_against_empty_pending(
+    tmp_path: Path,
+) -> None:
+    wopan = _upload_client(_upload_handler(httpx.Response(200, json={})))
+    local_file = tmp_path / "f.bin"
+    local_file.write_bytes(b"x")
+
+    with pytest.raises(WopanResponseError, match="no response"):
+        wopan._upload_parts_parallel(
+            "https://upload.example.test/openapi/client/upload2C",
+            {},
+            "f.bin",
+            "application/octet-stream",
+            local_file,
+            part_size=1,
+            total_parts=1,
+            max_workers=1,
+            max_attempts=1,
+            completed_indexes={1},
+        )
+
+
+def test_upload_part_reports_empty_fid_without_data_object(tmp_path: Path) -> None:
+    local_file = tmp_path / "report.txt"
+    local_file.write_bytes(b"content")
+    handler, _requests, _bodies = _upload_capture_handler(
+        responses={1: httpx.Response(200, json={"code": "0000"})},
+    )
+    part_results: list[tuple[int, str]] = []
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset(),
+        on_part_result=lambda index, fid: part_results.append((index, fid)),
+    )
+
+    with pytest.raises(WopanResponseError, match="data is not an object"):
+        _upload_client(handler).upload_file("0", local_file, resume=resume)
+
+    assert part_results == [(1, "")]
