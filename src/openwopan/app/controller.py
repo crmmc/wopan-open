@@ -126,8 +126,6 @@ class ApplicationController(QObject):
         worker.succeeded.connect(thread.quit)
         worker.web_login_error.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_restore_finished)
         self._restore_worker = worker
         self._restore_thread = thread
@@ -176,6 +174,9 @@ class ApplicationController(QObject):
         self.prompt_login("登录已过期，请重新登录")
 
     def _on_restore_finished(self) -> None:
+        thread = self.sender()
+        if isinstance(thread, QThread):
+            thread.deleteLater()
         self._restore_worker = None
         self._restore_thread = None
 
@@ -224,8 +225,6 @@ class ApplicationController(QObject):
         worker.succeeded.connect(thread.quit)
         worker.web_login_error.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_login_finished)
         self._login_worker = worker
         self._login_thread = thread
@@ -253,6 +252,9 @@ class ApplicationController(QObject):
             self._login_window.show_error("登录失败，请重试")
 
     def _on_login_finished(self) -> None:
+        thread = self.sender()
+        if isinstance(thread, QThread):
+            thread.deleteLater()
         self._login_worker = None
         self._login_thread = None
 

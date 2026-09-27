@@ -51,7 +51,11 @@ def test_download_url_reuses_valid_completed_parts(
         range_header = request.headers.get("Range")
         requested_ranges.append(range_header or "")
         start, end = _parse_range(range_header)
-        return httpx.Response(206, content=content[start : end + 1])
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+            content=content[start : end + 1],
+        )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     settings = AppSettings(
@@ -95,6 +99,237 @@ def test_download_url_reuses_valid_completed_parts(
     assert requested_ranges == ["bytes=0-15", "bytes=16-16", "bytes=16-16"]
 
 
+class _ChunkedRangeStream(httpx.SyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    def __iter__(self):
+        yield from self._chunks
+
+
+def test_range_download_pause_persists_partial_part_and_resumes_offset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    monkeypatch.setattr(download, "DOWNLOAD_CHUNK_SIZE", 4)
+    content = b"abcdefghijklmnopq"
+    store = DownloadTaskStore(tmp_path / "store")
+    local_path = tmp_path / "out.bin"
+    task_id = "t1"
+    requested_ranges: list[str] = []
+    control = DownloadTaskControl()
+    pause_after = 4
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(content))})
+        range_header = request.headers["Range"]
+        requested_ranges.append(range_header)
+        start, end = _parse_range(range_header)
+        if start == 0:
+            return httpx.Response(
+                206,
+                headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+                stream=_ChunkedRangeStream([content[:pause_after], content[pause_after : end + 1]]),
+            )
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+            content=content[start : end + 1],
+        )
+
+    def pause_after_first_chunk(done: int, _total: int | None) -> None:
+        if done == pause_after:
+            control.request_pause()
+
+    first = download_url(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        "https://download.example.test/file",
+        local_path,
+        settings=_range_settings(),
+        store=store,
+        task_id=task_id,
+        file_name="out.bin",
+        download_id="fid-1",
+        callbacks=DownloadCallbacks(progress=pause_after_first_chunk),
+        control=control,
+    )
+
+    assert first.status == "已暂停"
+    state = store.load(task_id)
+    assert state is not None
+    assert state.bytes_done == pause_after
+    assert state.parts[0].actual_size == pause_after
+    assert state.parts[0].md5 == _compute_md5(store.part_downloading_path(task_id, 0))
+    assert store.part_downloading_path(task_id, 0).read_bytes() == content[:pause_after]
+
+    second = download_url(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        "https://download.example.test/file",
+        local_path,
+        settings=_range_settings(),
+        store=store,
+        task_id=task_id,
+        file_name="out.bin",
+        download_id="fid-1",
+    )
+
+    assert second.status == "已完成"
+    assert local_path.read_bytes() == content
+    assert requested_ranges == ["bytes=0-15", "bytes=4-15", "bytes=16-16"]
+
+
+def test_range_pause_after_last_byte_keeps_completed_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    monkeypatch.setattr(download, "DOWNLOAD_CHUNK_SIZE", 16)
+    content = b"abcdefghijklmnopq"
+    control = DownloadTaskControl()
+    store = DownloadTaskStore(tmp_path / "store")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(content))})
+        start, end = _parse_range(request.headers["Range"])
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+            content=content[start : end + 1],
+        )
+
+    def pause_on_complete_part(done: int, _total: int | None) -> None:
+        if done == 16:
+            control.request_pause()
+
+    result = download_url(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        "https://download.example.test/file",
+        tmp_path / "out.bin",
+        settings=_range_settings(),
+        store=store,
+        task_id="last-byte",
+        file_name="out.bin",
+        control=control,
+        callbacks=DownloadCallbacks(progress=pause_on_complete_part),
+    )
+
+    assert result.status == "已暂停"
+    state = store.load("last-byte")
+    assert state is not None and state.bytes_done == 16
+    assert state.parts[0].actual_size == 16
+    assert store.part_path("last-byte", 0).read_bytes() == content[:16]
+
+
+def test_range_resume_rejects_wrong_content_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    content = b"abcdefghijklmnopq"
+    store = DownloadTaskStore(tmp_path / "store")
+    local_path = tmp_path / "out.bin"
+    partial_path = store.part_downloading_path("t1", 0)
+    partial_path.parent.mkdir(parents=True)
+    partial_path.write_bytes(content[:4])
+    state = _state(
+        task_id="t1",
+        save_path=local_path,
+        parts=[DownloadPartRecord(0, 0, 15, 16, 4, _compute_md5(partial_path))],
+    )
+    state.total_bytes = len(content)
+    state.part_size = 16
+    store.save(state)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(content))})
+        assert request.headers["Range"] == "bytes=4-15"
+        return httpx.Response(
+            206,
+            headers={"Content-Range": "bytes 4-15/999"},
+            content=content[:12],
+        )
+
+    with pytest.raises(DownloadError, match="分片下载失败"):
+        download_url(
+            httpx.Client(transport=httpx.MockTransport(handler)),
+            "https://download.example.test/file",
+            local_path,
+            settings=_range_settings(retries=0),
+            store=store,
+            task_id="t1",
+            file_name="out.bin",
+        )
+
+    assert not local_path.exists()
+    assert not partial_path.exists()
+    failed = store.load("t1")
+    assert failed is not None and failed.parts == []
+
+
+def test_range_download_rejects_wrong_initial_content_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    content = b"abcdefghijklmnopq"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(content))})
+        assert request.headers["Range"] == "bytes=0-15"
+        return httpx.Response(
+            206,
+            headers={"Content-Range": "bytes 1-16/17"},
+            content=content[1:17],
+        )
+
+    with pytest.raises(DownloadError, match="分片下载失败"):
+        download_url(
+            httpx.Client(transport=httpx.MockTransport(handler)),
+            "https://download.example.test/file",
+            tmp_path / "out.bin",
+            settings=_range_settings(retries=0),
+            store=DownloadTaskStore(tmp_path / "store"),
+            task_id="initial-range",
+            file_name="out.bin",
+        )
+
+    assert not (tmp_path / "out.bin").exists()
+
+
+def test_validate_existing_parts_keeps_valid_partial_part(tmp_path: Path) -> None:
+    store = DownloadTaskStore(tmp_path)
+    parts = _build_parts(8, 8)
+    partial_path = store.part_downloading_path("t1", 0)
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path.write_bytes(b"abcd")
+    state = _state(
+        task_id="t1",
+        save_path=tmp_path / "out.bin",
+        parts=[
+            DownloadPartRecord(
+                index=0,
+                start=0,
+                end=7,
+                expected_size=8,
+                actual_size=4,
+                md5=_compute_md5(partial_path),
+            )
+        ],
+    )
+    store.save(state)
+
+    downloaded, reusable = _validate_existing_parts(store, state, parts)
+
+    assert downloaded == 4
+    assert reusable == set()
+    assert partial_path.read_bytes() == b"abcd"
+    restored = store.load("t1")
+    assert restored is not None
+    assert restored.parts[0].actual_size == 4
+
+
 def test_download_url_refreshes_expired_range_url(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -114,7 +349,11 @@ def test_download_url_refreshes_expired_range_url(
         if str(request.url) == "https://download.example.test/expired":
             return httpx.Response(403)
         start, end = _parse_range(request.headers.get("Range"))
-        return httpx.Response(206, content=content[start : end + 1])
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+            content=content[start : end + 1],
+        )
 
     def refresh_url() -> str:
         nonlocal refresh_calls
@@ -162,7 +401,11 @@ def test_download_url_retries_rate_limited_part(
             first_part_attempts += 1
             return httpx.Response(429)
         start, end = _parse_range(range_header)
-        return httpx.Response(206, content=content[start : end + 1])
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+            content=content[start : end + 1],
+        )
 
     result = download_url(
         httpx.Client(transport=httpx.MockTransport(handler)),
@@ -341,6 +584,13 @@ def test_store_list_records_returns_persisted_records(tmp_path: Path) -> None:
     records = store.list_records()
     assert [record.task_id for record in records] == ["task-1", "task-2"]
     assert records[0].name == "file.bin"
+
+
+def test_store_update_rejects_missing_task(tmp_path: Path) -> None:
+    store = DownloadTaskStore(tmp_path)
+
+    with pytest.raises(KeyError, match="unknown download task"):
+        store.update("missing", lambda state: setattr(state, "bytes_done", 1))
 
 
 def test_store_record_part_without_state_is_noop(tmp_path: Path) -> None:
@@ -659,10 +909,14 @@ def test_stop_during_stream_read_is_not_reported_as_failure(
             return httpx.Response(
                 200, headers={"Content-Length": str(download.DOWNLOAD_CHUNK_SIZE + 1)}
             )
-        return httpx.Response(
-            206 if request.headers.get("Range") else 200,
-            stream=InterruptedStream(),
-        )
+        response_status = 206 if request.headers.get("Range") else 200
+        headers = {}
+        if response_status == 206:
+            start, end = _parse_range(request.headers["Range"])
+            headers["Content-Range"] = (
+                f"bytes {start}-{end}/{download.DOWNLOAD_CHUNK_SIZE + 1}"
+            )
+        return httpx.Response(response_status, headers=headers, stream=InterruptedStream())
 
     def progress(done: int, _total: int | None) -> None:
         if done > 0:
@@ -758,7 +1012,11 @@ def _range_handler(
         status = (status_for_range or {}).get(range_header, 206)
         if status == 206:
             start, end = _parse_range(range_header)
-            return httpx.Response(206, content=CONTENT[start : end + 1])
+            return httpx.Response(
+                206,
+                headers={"Content-Range": f"bytes {start}-{end}/{len(CONTENT)}"},
+                content=CONTENT[start : end + 1],
+            )
         return httpx.Response(status)
 
     return handler
@@ -834,6 +1092,47 @@ def test_range_download_paused_during_part_transfer(
     result = _run_ranges(tmp_path, _range_handler(), control=control)
 
     assert result.status == "已暂停"
+
+
+def test_range_download_failure_removes_partial_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    store = DownloadTaskStore(tmp_path / "store")
+    partial_path = store.part_downloading_path("t1", 0)
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path.write_bytes(CONTENT[:4])
+    state = _state(
+        task_id="t1",
+        save_path=tmp_path / "out.bin",
+        parts=[
+            DownloadPartRecord(
+                index=0,
+                start=0,
+                end=15,
+                expected_size=16,
+                actual_size=4,
+                md5=_compute_md5(partial_path),
+            )
+        ],
+    )
+    state.total_bytes = len(CONTENT)
+    state.part_size = 16
+    store.save(state)
+
+    with pytest.raises(DownloadError, match="分片下载失败"):
+        _run_ranges(
+            tmp_path,
+            _range_handler({"bytes=4-15": 500}),
+            store=store,
+            settings=_range_settings(retries=0),
+        )
+
+    failed = store.load("t1")
+    assert failed is not None and failed.status == "失败"
+    assert failed.parts == []
+    assert not partial_path.exists()
 
 
 def test_range_download_fails_when_rate_limits_exceed_maximum(
@@ -1075,6 +1374,42 @@ def test_validate_existing_parts_rejects_and_cleans_stale_entries(
     updated = store.load("t1")
     assert updated is not None
     assert [part.index for part in updated.parts] == [1]
+
+
+@pytest.mark.parametrize("case", ["missing", "wrong_size", "md5", "too_large"])
+def test_validate_existing_parts_rejects_invalid_partial_checkpoints(
+    tmp_path: Path, case: str
+) -> None:
+    store = DownloadTaskStore(tmp_path)
+    parts = _build_parts(8, 8)
+    partial_path = store.part_downloading_path("t1", 0)
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    if case != "missing":
+        partial_path.write_bytes(
+            b"abcdefghi" if case == "too_large" else b"abc" if case == "wrong_size" else b"abcd"
+        )
+    actual_size = 9 if case == "too_large" else 4
+    md5 = (
+        "f" * 32
+        if case == "md5"
+        else _compute_md5(partial_path)
+        if case != "missing"
+        else "0" * 32
+    )
+    state = _state(
+        task_id="t1",
+        save_path=tmp_path / "out.bin",
+        parts=[DownloadPartRecord(0, 0, 7, 8, actual_size, md5)],
+    )
+    store.save(state)
+
+    downloaded, reusable = _validate_existing_parts(store, state, parts)
+
+    assert downloaded == 0
+    assert reusable == set()
+    assert not partial_path.exists()
+    restored = store.load("t1")
+    assert restored is not None and restored.parts == []
 
 
 def test_validate_existing_parts_rejects_md5_mismatch(tmp_path: Path) -> None:
@@ -1361,7 +1696,11 @@ def test_download_never_overwrites_local_target(
             target.write_bytes(existing)
         if request.headers.get("Range"):
             start, end = _parse_range(request.headers.get("Range"))
-            return httpx.Response(206, content=content[start : end + 1])
+            return httpx.Response(
+                206,
+                headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+                content=content[start : end + 1],
+            )
         return httpx.Response(200, content=content)
 
     with pytest.raises(DownloadError, match="下载目标已存在"):

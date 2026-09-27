@@ -205,6 +205,10 @@ class DownloadTaskStore:
         """Return one completed part file path."""
         return self.task_temp_dir(task_id) / f"part{index}"
 
+    def part_downloading_path(self, task_id: str, index: int) -> Path:
+        """Return one partial part file path."""
+        return self.task_temp_dir(task_id) / f"part{index}.downloading"
+
     def merged_path(self, task_id: str) -> Path:
         """Return the temporary merged file path."""
         return self.task_temp_dir(task_id) / "merged"
@@ -254,6 +258,18 @@ class DownloadTaskStore:
                 file.write("\n")
             tmp_path.replace(path)
 
+    def update(
+        self, task_id: str, change: Callable[[DownloadTaskState], None]
+    ) -> DownloadTaskState:
+        """Apply a scheduler state change without overwriting concurrent part writes."""
+        with self._lock:
+            state = self.load(task_id)
+            if state is None:
+                raise KeyError(f"unknown download task: {task_id}")
+            change(state)
+            self.save(state)
+            return state
+
     def delete(self, task_id: str) -> None:
         """Delete task metadata and temporary files."""
         with self._lock:
@@ -278,7 +294,7 @@ class DownloadTaskStore:
         return tuple(records)
 
     def record_part(self, task_id: str, record: DownloadPartRecord) -> None:
-        """Persist one completed part record."""
+        """Persist one part record."""
         with self._lock:
             state = self.load(task_id)
             if state is None:
@@ -297,6 +313,7 @@ class DownloadTaskStore:
                 state.bytes_done = sum(part.actual_size for part in state.parts)
                 self.save(state)
             self.part_path(task_id, index).unlink(missing_ok=True)
+            self.part_downloading_path(task_id, index).unlink(missing_ok=True)
 
 
 def make_download_task_id(download_id: str, local_path: Path) -> str:
@@ -427,7 +444,16 @@ def _download_with_ranges(
     allowed_workers = 1
     rate_limit_count = 0
     url_refresh_count = 0
-    part_progress = {part.index: part.expected_size for part in parts if part.index in reusable}
+    records_by_index = {record.index: record for record in state.parts}
+    part_progress = {
+        part.index: (
+            part.expected_size
+            if part.index in reusable
+            else records_by_index[part.index].actual_size
+        )
+        for part in parts
+        if part.index in reusable or part.index in records_by_index
+    }
     progress_lock = threading.Lock()
 
     def report_part_progress(index: int, value: int) -> None:
@@ -628,6 +654,42 @@ def _download_single_stream(
         raise DownloadError(message) from exc
 
 
+def _stop_range_part(
+    stop_result: PartResult,
+    store: DownloadTaskStore,
+    task_id: str,
+    part: DownloadPart,
+    temp_path: Path,
+    progress_callback: Callable[[int, int], None],
+) -> PartResult:
+    if stop_result == "cancelled":
+        store.remove_part_record(task_id, part.index)
+        progress_callback(part.index, 0)
+        return stop_result
+
+    actual_size = temp_path.stat().st_size if temp_path.exists() else 0
+    if 0 < actual_size <= part.expected_size:
+        digest = _compute_md5(temp_path)
+        if actual_size == part.expected_size:
+            temp_path.replace(store.part_path(task_id, part.index))
+        store.record_part(
+            task_id,
+            DownloadPartRecord(
+                index=part.index,
+                start=part.start,
+                end=part.end,
+                expected_size=part.expected_size,
+                actual_size=actual_size,
+                md5=digest,
+            ),
+        )
+        progress_callback(part.index, actual_size)
+    else:
+        store.remove_part_record(task_id, part.index)
+        progress_callback(part.index, 0)
+    return stop_result
+
+
 def _download_range_part(
     http_client: httpx.Client,
     url: str,
@@ -642,64 +704,91 @@ def _download_range_part(
     part_dir = store.task_temp_dir(task_id)
     part_dir.mkdir(parents=True, exist_ok=True)
     final_path = store.part_path(task_id, part.index)
-    temp_path = final_path.with_name(f"{final_path.name}.downloading")
+    temp_path = store.part_downloading_path(task_id, part.index)
+    state = store.load(task_id)
+    partial_record = next(
+        (
+            record
+            for record in (state.parts if state is not None else [])
+            if record.index == part.index and 0 < record.actual_size < record.expected_size
+        ),
+        None,
+    )
+    resume_size = partial_record.actual_size if partial_record is not None else 0
+    total_size = state.total_bytes if state is not None else None
     attempts = retry_max_attempts + 1
     for attempt in range(attempts):
         stop_result = control.stop_result()
         if stop_result is not None:
-            _remove_partial_file(temp_path)
-            progress_callback(part.index, 0)
-            return stop_result
-        bytes_done = 0
+            return _stop_range_part(
+                stop_result, store, task_id, part, temp_path, progress_callback
+            )
+        bytes_done = resume_size if attempt == 0 else 0
         md5 = hashlib.md5()
+        if bytes_done:
+            with temp_path.open("rb") as existing:
+                while chunk := existing.read(DOWNLOAD_CHUNK_SIZE):
+                    md5.update(chunk)
         try:
             with http_client.stream(
                 "GET",
                 url,
-                headers={"Range": f"bytes={part.start}-{part.end}"},
+                headers={"Range": f"bytes={part.start + bytes_done}-{part.end}"},
             ) as response:
                 control.set_active_response(response)
                 if response.status_code == 200:
-                    _remove_partial_file(temp_path)
+                    store.remove_part_record(task_id, part.index)
                     raise RangeDownloadUnsupported("Range download unsupported")
                 if response.status_code == 403:
-                    _remove_partial_file(temp_path)
+                    store.remove_part_record(task_id, part.index)
                     progress_callback(part.index, 0)
                     return "url_expired"
                 if response.status_code in RATE_LIMIT_STATUS_CODES:
-                    _remove_partial_file(temp_path)
+                    store.remove_part_record(task_id, part.index)
                     progress_callback(part.index, 0)
                     return "rate_limited"
                 response.raise_for_status()
                 if response.status_code != 206:
-                    _remove_partial_file(temp_path)
+                    store.remove_part_record(task_id, part.index)
                     progress_callback(part.index, 0)
                     return "fatal"
-                with temp_path.open("wb") as output:
+                content_range = response.headers.get("Content-Range", "")
+                range_text, _, total_text = content_range.partition("/")
+                if range_text != f"bytes {part.start + bytes_done}-{part.end}" or (
+                    total_size is not None and total_text != str(total_size)
+                ):
+                    store.remove_part_record(task_id, part.index)
+                    progress_callback(part.index, 0)
+                    return "fatal"
+                stop_requested: PartResult | None = None
+                with temp_path.open("ab" if bytes_done else "wb") as output:
                     for chunk in response.iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                        stop_result = control.stop_result()
-                        if stop_result is not None:
-                            _remove_partial_file(temp_path)
-                            progress_callback(part.index, 0)
-                            return stop_result
+                        stop_requested = control.stop_result()
+                        if stop_requested is not None:
+                            break
                         if not chunk:  # pragma: no cover - docs/testing-exemptions.md
                             continue
                         output.write(chunk)
                         md5.update(chunk)
                         bytes_done += len(chunk)
                         progress_callback(part.index, bytes_done)
+            if stop_requested is not None:
+                return _stop_range_part(
+                    stop_requested, store, task_id, part, temp_path, progress_callback
+                )
         except RangeDownloadUnsupported:
             raise
         except httpx.HTTPStatusError:
-            _remove_partial_file(temp_path)
+            store.remove_part_record(task_id, part.index)
         except httpx.HTTPError:
-            _remove_partial_file(temp_path)
             stop_result = control.stop_result()
             if stop_result is not None:
-                progress_callback(part.index, 0)
-                return stop_result
+                return _stop_range_part(
+                    stop_result, store, task_id, part, temp_path, progress_callback
+                )
+            store.remove_part_record(task_id, part.index)
         except OSError:
-            _remove_partial_file(temp_path)
+            store.remove_part_record(task_id, part.index)
         finally:
             control.set_active_response(None)
 
@@ -717,7 +806,7 @@ def _download_range_part(
                 ),
             )
             return "ok"
-        _remove_partial_file(temp_path)
+        store.remove_part_record(task_id, part.index)
         progress_callback(part.index, 0)
         if attempt < attempts - 1:
             time.sleep(attempt + 1)
@@ -794,7 +883,12 @@ def _mark_failed(
     latest = store.load(state.task_id) or state
     latest.status = "失败"
     latest.error = message
+    latest.parts = [part for part in latest.parts if part.actual_size == part.expected_size]
     latest.bytes_done = sum(part.actual_size for part in latest.parts)
+    temp_dir = store.task_temp_dir(latest.task_id)
+    if temp_dir.exists():
+        for entry in temp_dir.glob("part*.downloading"):
+            _remove_partial_file(entry)
     store.save(latest)
     _emit_status(callbacks, "失败")
     _emit_connections(callbacks, 0, latest.max_connections)
@@ -807,24 +901,47 @@ def _validate_existing_parts(
 ) -> tuple[int, set[int]]:
     part_by_index = {part.index: part for part in parts}
     reusable: set[int] = set()
+    partial: set[int] = set()
     downloaded = 0
     for record in list(state.parts):
         planned = part_by_index.get(record.index)
-        path = store.part_path(state.task_id, record.index)
-        if planned is None or not path.exists():
+        if (
+            planned is None
+            or record.start != planned.start
+            or record.end != planned.end
+            or record.expected_size != planned.expected_size
+        ):
             store.remove_part_record(state.task_id, record.index)
             continue
-        if record.start != planned.start or record.end != planned.end:
+        if record.actual_size == planned.expected_size:
+            path = store.part_path(state.task_id, record.index)
+            if not path.exists():
+                store.remove_part_record(state.task_id, record.index)
+                continue
+            if path.stat().st_size != planned.expected_size:
+                store.remove_part_record(state.task_id, record.index)
+                continue
+            if _compute_md5(path) != record.md5:
+                store.remove_part_record(state.task_id, record.index)
+                continue
+            reusable.add(record.index)
+            downloaded += planned.expected_size
+            continue
+        if not 0 < record.actual_size < planned.expected_size:
             store.remove_part_record(state.task_id, record.index)
             continue
-        if path.stat().st_size != planned.expected_size:
+        path = store.part_downloading_path(state.task_id, record.index)
+        if not path.exists():
+            store.remove_part_record(state.task_id, record.index)
+            continue
+        if path.stat().st_size != record.actual_size:
             store.remove_part_record(state.task_id, record.index)
             continue
         if _compute_md5(path) != record.md5:
             store.remove_part_record(state.task_id, record.index)
             continue
-        reusable.add(record.index)
-        downloaded += planned.expected_size
+        partial.add(record.index)
+        downloaded += record.actual_size
 
     temp_dir = store.task_temp_dir(state.task_id)
     if temp_dir.exists():
@@ -839,7 +956,10 @@ def _validate_existing_parts(
                 index = int(index_text)
             except ValueError:
                 continue
-            if index not in reusable:
+            if entry.name.endswith(".downloading"):
+                if index not in partial:
+                    _remove_partial_file(entry)
+            elif index not in reusable:
                 _remove_partial_file(entry)
     return downloaded, reusable
 
@@ -1081,7 +1201,13 @@ def _read_part_record(raw: object) -> DownloadPartRecord | None:
     expected_size = _read_non_negative_int(raw.get("expected_size"))
     actual_size = _read_non_negative_int(raw.get("actual_size"))
     md5 = _read_text(raw.get("md5"))
-    if end < start or expected_size <= 0 or actual_size <= 0 or not md5:
+    if (
+        end < start
+        or expected_size <= 0
+        or actual_size <= 0
+        or actual_size > expected_size
+        or not md5
+    ):
         return None
     return DownloadPartRecord(
         index=index,

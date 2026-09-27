@@ -13,12 +13,13 @@ from openwopan.storage.settings import AppSettings
 from openwopan.tasks.download import (
     DownloadCallbacks,
     DownloadError,
+    DownloadPartRecord,
     DownloadResult,
     DownloadTaskControl,
     DownloadTaskState,
     DownloadTaskStore,
 )
-from openwopan.tasks.scheduler import DownloadScheduler, DownloadTaskInput
+from openwopan.tasks.scheduler import DownloadScheduler, DownloadTaskEvent, DownloadTaskInput
 
 
 def _task(tmp_path: Path, task_id: str) -> DownloadTaskInput:
@@ -41,6 +42,27 @@ def _wait_for(condition: Callable[[], bool], timeout: float = 2.0) -> None:
             return
         time.sleep(0.01)
     assert condition()
+
+
+def test_execute_download_forwards_task_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _task(tmp_path, "forward")
+    control = DownloadTaskControl()
+    callbacks = DownloadCallbacks()
+    result = DownloadResult("已完成", task.task_id, task.local_path)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_download_url(*args: object, **kwargs: object) -> DownloadResult:
+        calls.append((args, kwargs))
+        return result
+
+    monkeypatch.setattr(scheduler_module, "download_url", fake_download_url)
+
+    assert scheduler_module._execute_download(task, control, callbacks) == result
+    assert calls and calls[0][0][:3] == (task.http_client, task.url, task.local_path)
+    assert calls[0][1]["control"] is control
+    assert calls[0][1]["callbacks"] is callbacks
 
 
 def test_scheduler_is_fifo_and_refills_slots(tmp_path: Path) -> None:
@@ -75,6 +97,242 @@ def test_scheduler_is_fifo_and_refills_slots(tmp_path: Path) -> None:
         assert started == ["one", "two", "three"]
         assert maximum == 2
     finally:
+        scheduler.close()
+
+
+def test_scheduler_rejects_invalid_and_closed_submission(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        DownloadScheduler(max_concurrent_downloads=0)
+
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=lambda *_: DownloadResult(
+        "已完成", "unused", Path("unused")
+    ))
+    scheduler.close()
+    scheduler.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        scheduler.submit(_task(tmp_path, "closed"))
+
+
+def test_scheduler_controls_waiting_tasks_and_refuses_terminal_cancel(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def execute(
+        task: DownloadTaskInput, _control: DownloadTaskControl, _callbacks: DownloadCallbacks
+    ) -> DownloadResult:
+        started.set()
+        release.wait(1)
+        return DownloadResult("已完成", task.task_id, task.local_path)
+
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=execute)
+    try:
+        scheduler.submit(_task(tmp_path, "active"))
+        scheduler.submit(_task(tmp_path, "cancelled"))
+        scheduler.submit(_task(tmp_path, "paused"))
+        assert started.wait(1)
+        assert scheduler.cancel("cancelled")
+        assert scheduler.state("cancelled").status == "已取消"
+        assert scheduler.pause("paused")
+        assert scheduler.state("paused").status == "已暂停"
+        release.set()
+        _wait_for(lambda: scheduler.state("active").status == "已完成")
+        assert scheduler.cancel("active") is False
+        assert scheduler.resume("paused")
+        _wait_for(lambda: scheduler.state("paused").status == "已完成")
+    finally:
+        release.set()
+        scheduler.close()
+
+
+def test_scheduler_maps_unexpected_error_and_failed_result(tmp_path: Path) -> None:
+    def unexpected(
+        _task: DownloadTaskInput, _control: DownloadTaskControl, _callbacks: DownloadCallbacks
+    ) -> DownloadResult:
+        raise RuntimeError("unexpected")
+
+    failed_scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=unexpected)
+    try:
+        failed_scheduler.submit(_task(tmp_path, "unexpected"))
+        _wait_for(lambda: failed_scheduler.state("unexpected").status == "失败")
+        assert failed_scheduler.state("unexpected").error == "下载任务执行失败"
+    finally:
+        failed_scheduler.close()
+
+    def failed(
+        task: DownloadTaskInput, _control: DownloadTaskControl, _callbacks: DownloadCallbacks
+    ) -> DownloadResult:
+        return DownloadResult("失败", task.task_id, task.local_path)
+
+    result_scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=failed)
+    try:
+        result_scheduler.submit(_task(tmp_path, "failed"))
+        _wait_for(lambda: result_scheduler.state("failed").status == "失败")
+        assert result_scheduler.state("failed").error == "下载失败"
+    finally:
+        result_scheduler.close()
+
+
+def test_scheduler_forwards_status_and_connection_events(tmp_path: Path) -> None:
+    events: list[DownloadTaskEvent] = []
+
+    def execute(
+        task: DownloadTaskInput, _control: DownloadTaskControl, callbacks: DownloadCallbacks
+    ) -> DownloadResult:
+        assert callbacks.status is not None
+        assert callbacks.connections is not None
+        callbacks.status("校验中")
+        callbacks.connections(2, 4)
+        callbacks.status("已完成")
+        return DownloadResult("已完成", task.task_id, task.local_path)
+
+    scheduler = DownloadScheduler(
+        max_concurrent_downloads=1,
+        executor=execute,
+    )
+    scheduler.set_event_callback(lambda event: events.append(event))
+    try:
+        scheduler.submit(_task(tmp_path, "events"))
+        _wait_for(lambda: scheduler.state("events").status == "已完成")
+        assert any(event.status == "校验中" for event in events)
+        connection_event = next(event for event in events if event.active_connections == 2)
+        assert connection_event.task_id == "events"
+        assert connection_event.max_connections == 4
+    finally:
+        scheduler.close()
+
+
+def test_scheduler_progress_preserves_persisted_partial_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    callbacks: list[DownloadCallbacks] = []
+
+    def execute(
+        task: DownloadTaskInput,
+        _control: DownloadTaskControl,
+        task_callbacks: DownloadCallbacks,
+    ) -> DownloadResult:
+        callbacks.append(task_callbacks)
+        started.set()
+        release.wait(1)
+        return DownloadResult("已暂停", task.task_id, task.local_path)
+
+    task = _task(tmp_path, "partial")
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=execute)
+    record = DownloadPartRecord(
+        index=0,
+        start=0,
+        end=3,
+        expected_size=4,
+        actual_size=4,
+        md5="0" * 32,
+    )
+    try:
+        scheduler.submit(task)
+        assert started.wait(1)
+        task.store.record_part(task.task_id, record)
+
+        assert callbacks[0].progress is not None
+        clock = iter((100.0, 100.6))
+        monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: next(clock))
+        callbacks[0].progress(4, 8)
+        callbacks[0].progress(4, 8)
+
+        persisted = task.store.load(task.task_id)
+        assert persisted is not None
+        assert persisted.parts == [record]
+        assert persisted.bytes_done == 4
+        assert persisted.total_bytes == 8
+    finally:
+        release.set()
+        scheduler.close()
+
+
+def test_scheduler_throttles_progress_persistence(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    callbacks: list[DownloadCallbacks] = []
+    task = _task(tmp_path, "throttle")
+
+    def execute(
+        current: DownloadTaskInput,
+        _control: DownloadTaskControl,
+        task_callbacks: DownloadCallbacks,
+    ) -> DownloadResult:
+        callbacks.append(task_callbacks)
+        started.set()
+        release.wait(1)
+        return DownloadResult("已暂停", current.task_id, current.local_path)
+
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=execute)
+    try:
+        scheduler.submit(task)
+        assert started.wait(1)
+        assert callbacks[0].progress is not None
+        callbacks[0].progress(1, 8)
+        persisted = task.store.load(task.task_id)
+        assert persisted is not None and persisted.bytes_done == 0
+        callbacks[0].progress(1024 * 1024, 8)
+        persisted = task.store.load(task.task_id)
+        assert persisted is not None and persisted.bytes_done == 1024 * 1024
+    finally:
+        release.set()
+        scheduler.close()
+
+
+def test_scheduler_progress_and_part_record_write_do_not_interleave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    loaded = threading.Event()
+    proceed = threading.Event()
+    task = _task(tmp_path, "race")
+    callbacks: list[DownloadCallbacks] = []
+
+    def execute(
+        current: DownloadTaskInput, _control: DownloadTaskControl, cb: DownloadCallbacks
+    ) -> DownloadResult:
+        callbacks.append(cb)
+        started.set()
+        release.wait(2)
+        return DownloadResult("已暂停", current.task_id, current.local_path)
+
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=execute)
+    original_load = task.store.load
+
+    def gated_load(task_id: str) -> DownloadTaskState | None:
+        state = original_load(task_id)
+        if threading.current_thread().name == "progress":
+            loaded.set()
+            assert proceed.wait(2)
+        return state
+
+    record = DownloadPartRecord(0, 0, 3, 4, 2, "0" * 32)
+    try:
+        scheduler.submit(task)
+        assert started.wait(1)
+        monkeypatch.setattr(task.store, "load", gated_load)
+        assert callbacks[0].progress is not None
+        progress = threading.Thread(
+            target=callbacks[0].progress, args=(1024 * 1024, 8), name="progress"
+        )
+        progress.start()
+        assert loaded.wait(1)
+        writer = threading.Thread(target=task.store.record_part, args=(task.task_id, record))
+        writer.start()
+        proceed.set()
+        progress.join(2)
+        writer.join(2)
+        assert not progress.is_alive() and not writer.is_alive()
+        persisted = original_load(task.task_id)
+        assert persisted is not None and persisted.parts == [record]
+    finally:
+        proceed.set()
+        release.set()
         scheduler.close()
 
 
