@@ -490,6 +490,36 @@ def test_controller_complete_login_ignores_duplicate_in_flight(qapp: object) -> 
     harness.controller._login_thread = None
 
 
+def test_controller_finished_thread_is_deleted_by_gui_cleanup(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delete_later_calls: list[bool] = []
+    worker_delete_later_calls: list[bool] = []
+
+    class TrackingThread(RealQThread):
+        def start(self, *args: object, **kwargs: object) -> None:
+            self.started.emit()
+
+        def quit(self) -> None:
+            self.finished.emit()
+
+        def deleteLater(self) -> None:
+            delete_later_calls.append(True)
+
+    monkeypatch.setattr(controller_module, "QThread", TrackingThread)
+    monkeypatch.setattr(
+        controller_module.ControllerOperationWorker,
+        "deleteLater",
+        lambda _worker: worker_delete_later_calls.append(True),
+    )
+    harness = _build_harness()
+
+    harness.controller.start()
+
+    assert delete_later_calls == [True]
+    assert worker_delete_later_calls == []
+
+
 def test_controller_restore_updates_main_window_on_gui_thread(
     qapp: QApplication,
     monkeypatch: pytest.MonkeyPatch,
@@ -535,7 +565,11 @@ def test_controller_restore_updates_main_window_on_gui_thread(
 
     controller.start()
 
-    assert _wait_until(qapp, lambda: controller._restore_thread is None)
+    assert _wait_until(
+        qapp,
+        lambda: controller._restore_thread is None
+        and not any(isinstance(child, RealQThread) for child in controller.children()),
+    )
     assert worker_thread_ids
     assert worker_thread_ids[0] != gui_thread_id
     assert handler_thread_ids == [gui_thread_id]
@@ -583,7 +617,11 @@ def test_controller_complete_login_updates_main_window_on_gui_thread(
         "WoCloud-Web-Token=%2212345678-1234-1234-1234-123456789abc%22"
     )
 
-    assert _wait_until(qapp, lambda: controller._login_thread is None)
+    assert _wait_until(
+        qapp,
+        lambda: controller._login_thread is None
+        and not any(isinstance(child, RealQThread) for child in controller.children()),
+    )
     assert worker_thread_ids
     assert worker_thread_ids[0] != gui_thread_id
     assert handler_thread_ids == [gui_thread_id]
