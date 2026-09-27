@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -28,6 +29,8 @@ from openwopan.tasks.download import (
 LOGGER = logging.getLogger(__name__)
 _TERMINAL_STATUSES = frozenset({"已完成", "失败", "已取消"})
 REMOVE_WAIT_TIMEOUT_SECONDS = 30
+PROGRESS_PERSIST_INTERVAL_SECONDS = 0.5
+PROGRESS_PERSIST_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +69,24 @@ class DownloadEventCallback(Protocol):
 DownloadExecutor = Callable[
     [DownloadTaskInput, DownloadTaskControl, DownloadCallbacks], DownloadResult
 ]
+
+
+def _set_failed_state(state: DownloadTaskState, error: str) -> None:
+    state.status = "失败"
+    state.error = error
+
+
+def _set_result_state(state: DownloadTaskState, status: DownloadStatus) -> None:
+    state.status = status
+    if status == "失败" and not state.error:
+        state.error = "下载失败"
+
+
+def _set_progress_state(
+    state: DownloadTaskState, done: int, total: int | None
+) -> None:
+    state.bytes_done = done
+    state.total_bytes = total
 
 
 def _execute_download(
@@ -109,6 +130,7 @@ class DownloadScheduler:
         self._states: dict[str, DownloadTaskState] = {}
         self._controls: dict[str, DownloadTaskControl] = {}
         self._active_connections: dict[str, int] = {}
+        self._last_progress_persisted: dict[str, tuple[float, int]] = {}
         self._queue: deque[str] = deque()
         self._futures: dict[str, Future[DownloadResult]] = {}
         self._removing: dict[str, threading.Event] = {}
@@ -306,10 +328,11 @@ class DownloadScheduler:
                 if task_id in self._removing:
                     self._finish_removing_locked(task_id)
                     return
-                state = self._states[task_id]
-                state.status = "失败"
-                state.error = str(exc) if isinstance(exc, DownloadError) else "下载任务执行失败"
-                self._tasks[task_id].store.save(state)
+                error = str(exc) if isinstance(exc, DownloadError) else "下载任务执行失败"
+                state = self._tasks[task_id].store.update(
+                    task_id, lambda current: _set_failed_state(current, error)
+                )
+                self._states[task_id] = state
                 self._finish_locked(task_id)
                 self._emit_state(task_id)
                 self._start_queued_locked()
@@ -318,7 +341,7 @@ class DownloadScheduler:
             if task_id in self._removing:
                 self._finish_removing_locked(task_id)
                 return
-            state = self._states[task_id]
+            state = self._latest_state(task_id)
             state.status = result.status
             if result.status == "失败" and not state.error:
                 state.error = "下载失败"
@@ -329,7 +352,10 @@ class DownloadScheduler:
             if cleanup_cancel:
                 self._tasks[task_id].store.delete(task_id)
             elif result.status != "已完成":
-                self._tasks[task_id].store.save(state)
+                state = self._tasks[task_id].store.update(
+                    task_id, lambda current: _set_result_state(current, result.status)
+                )
+                self._states[task_id] = state
             self._finish_locked(task_id)
             self._emit_state(task_id, result=result)
             self._start_queued_locked()
@@ -347,21 +373,42 @@ class DownloadScheduler:
         self._futures.pop(task_id, None)
         self._controls.pop(task_id, None)
         self._active_connections.pop(task_id, None)
+        self._last_progress_persisted.pop(task_id, None)
 
     def _progress(self, task_id: str, done: int, total: int | None) -> None:
         with self._lock:
             state = self._states[task_id]
             state.bytes_done = done
             state.total_bytes = total
-            self._tasks[task_id].store.save(state)
+            now = time.monotonic()
+            marker = self._last_progress_persisted.get(task_id)
+            if marker is None:
+                self._last_progress_persisted[task_id] = (now, 0)
+                should_persist = done == total or done >= PROGRESS_PERSIST_BYTES
+            else:
+                last_time, last_bytes = marker
+                should_persist = (
+                    done == total
+                    or now - last_time >= PROGRESS_PERSIST_INTERVAL_SECONDS
+                    or done - last_bytes >= PROGRESS_PERSIST_BYTES
+                )
+            if should_persist:
+                self._states[task_id] = self._tasks[task_id].store.update(
+                    task_id,
+                    lambda current: _set_progress_state(current, done, total),
+                )
+                self._last_progress_persisted[task_id] = (now, done)
             self._emit_state(task_id)
 
     def _status(self, task_id: str, status: DownloadStatus) -> None:
         with self._lock:
-            state = self._states[task_id]
-            state.status = status
-            if status != "已完成":
-                self._tasks[task_id].store.save(state)
+            if status == "已完成":
+                state = self._latest_state(task_id)
+                state.status = status
+            else:
+                self._states[task_id] = self._tasks[task_id].store.update(
+                    task_id, lambda state: setattr(state, "status", status)
+                )
             self._emit_state(task_id)
 
     def _connections(self, task_id: str, active: int, maximum: int) -> None:
@@ -398,6 +445,14 @@ class DownloadScheduler:
                 result=result,
             )
         )
+
+    def _latest_state(self, task_id: str) -> DownloadTaskState:
+        state = self._tasks[task_id].store.load(task_id)
+        if state is None:
+            state = self._states[task_id]
+        else:
+            self._states[task_id] = state
+        return state
 
     def _state(self, task_id: str) -> DownloadTaskState:
         try:

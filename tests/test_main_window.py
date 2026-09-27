@@ -277,7 +277,11 @@ def test_main_window_matches_sibling_file_layout_invariants(qapp: QApplication) 
     assert table.selectionMode() == QAbstractItemView.SelectionMode.ExtendedSelection
 
     assert file_interface.storage_card is not None
-    assert file_interface.storage_label.text() == "云盘空间"
+    assert not hasattr(file_interface, "storage_label")
+    storage_top_layout = file_interface.storage_card.layout().itemAt(0).layout()
+    assert storage_top_layout is not None
+    assert storage_top_layout.itemAt(0).widget() is file_interface.storage_icon
+    assert storage_top_layout.itemAt(1).widget() is file_interface.storage_value_label
     assert file_interface.storage_value_label.text() == "-- / --"
     assert file_interface.storage_progress_bar.value() == 0
     assert file_interface.search_bar.width() == 200
