@@ -336,7 +336,14 @@ def download_url(
     callbacks: DownloadCallbacks | None = None,
     control: DownloadTaskControl | None = None,
 ) -> DownloadResult:
-    """Download one URL with resumable range support when the server allows it."""
+    """Download one URL through the unified resumable Range executor.
+
+    Every download plans byte-range parts from the probed file size and runs
+    them through the same Range executor; ``max_download_threads=1`` is only a
+    single-worker configuration. There is no single-stream fallback: when the
+    file size cannot be probed or the server ignores Range requests, the task
+    ends with an explicit download error (R7).
+    """
     if not url:
         raise DownloadError("下载地址为空")
     callbacks = callbacks or DownloadCallbacks()
@@ -353,51 +360,37 @@ def download_url(
     state.download_id = download_id or state.download_id
     store.save(state)
 
-    total_size = (
-        _probe_download_size(http_client, url) if settings.max_download_threads > 1 else None
-    )
+    total_size = _probe_download_size(http_client, url)
+    if total_size is None:
+        _mark_failed(store, state, callbacks, "无法获取文件大小，无法进行分片下载")
+        raise DownloadError("无法获取文件大小，无法进行分片下载")
     part_size = state.part_size or _download_part_size(total_size, settings)
-    should_try_ranges = (
-        total_size is not None
-        and total_size > part_size
-        and settings.max_download_threads > 1
-    )
 
-    if should_try_ranges and total_size is not None:
-        try:
-            return _download_with_ranges(
-                http_client,
-                url,
-                local_path,
-                total_size=total_size,
-                part_size=part_size,
-                settings=settings,
-                store=store,
-                state=state,
-                refresh_url=refresh_url,
-                callbacks=callbacks,
-                control=control,
-            )
-        except RangeDownloadUnsupported:
-            LOGGER.info("download.range_unsupported task_id=%s", task_id)
-            store.cleanup_temp(task_id)
-            state.parts = []
-            state.bytes_done = 0
-            state.supports_resume = False
-            state.part_size = None
-            store.save(state)
-
-    return _download_single_stream(
-        http_client,
-        url,
-        local_path,
-        total_size=total_size,
-        store=store,
-        state=state,
-        refresh_url=refresh_url,
-        callbacks=callbacks,
-        control=control,
-    )
+    try:
+        return _download_with_ranges(
+            http_client,
+            url,
+            local_path,
+            total_size=total_size,
+            part_size=part_size,
+            settings=settings,
+            store=store,
+            state=state,
+            refresh_url=refresh_url,
+            callbacks=callbacks,
+            control=control,
+        )
+    except RangeDownloadUnsupported as exc:
+        LOGGER.info("download.range_unsupported task_id=%s", task_id)
+        latest = store.load(task_id) or state
+        latest.parts = []
+        latest.bytes_done = 0
+        latest.supports_resume = False
+        latest.part_size = None
+        store.save(latest)
+        store.cleanup_temp(task_id)
+        _mark_failed(store, latest, callbacks, "服务器不支持断点续传下载")
+        raise DownloadError("服务器不支持断点续传下载") from exc
 
 
 def _download_with_ranges(
@@ -551,107 +544,6 @@ def _download_with_ranges(
     _emit_status(callbacks, "已完成")
     _emit_connections(callbacks, 0, max_workers)
     return DownloadResult(status="已完成", task_id=latest.task_id, local_path=local_path)
-
-
-def _download_single_stream(
-    http_client: httpx.Client,
-    url: str,
-    local_path: Path,
-    *,
-    total_size: int | None,
-    store: DownloadTaskStore,
-    state: DownloadTaskState,
-    refresh_url: RefreshUrlCallback | None,
-    callbacks: DownloadCallbacks,
-    control: DownloadTaskControl,
-) -> DownloadResult:
-    state.total_bytes = total_size
-    state.supports_resume = False
-    state.max_connections = 1
-    state.status = "下载中"
-    state.error = ""
-    state.parts = []
-    state.bytes_done = 0
-    store.save(state)
-    _emit_status(callbacks, "下载中")
-    _emit_connections(callbacks, 1, 1)
-
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    part_path = store.task_temp_dir(state.task_id) / "single.part"
-    part_path.parent.mkdir(parents=True, exist_ok=True)
-    bytes_done = 0
-    current_url = url
-    refresh_count = 0
-    try:
-        while True:
-            try:
-                with http_client.stream("GET", current_url) as response:
-                    control.set_active_response(response)
-                    if response.status_code == 403:
-                        if refresh_url is None or refresh_count >= MAX_URL_REFRESHES:
-                            raise DownloadError("下载链接已过期或刷新失败")
-                        refresh_count += 1
-                        current_url = refresh_url()
-                        continue
-                    if response.status_code in RATE_LIMIT_STATUS_CODES:
-                        raise DownloadError("下载被限流，请稍后重试")
-                    response.raise_for_status()
-                    total = total_size or _read_content_length(
-                        response.headers.get("Content-Length")
-                    )
-                    with part_path.open("wb") as output:
-                        for chunk in response.iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                            stop_result = control.stop_result()
-                            if stop_result in ("paused", "cancelled"):
-                                return _stop_single_download(
-                                    stop_result,
-                                    store,
-                                    state,
-                                    callbacks,
-                                    control,
-                                    part_path,
-                                )
-                            if not chunk:  # pragma: no cover - docs/testing-exemptions.md
-                                continue
-                            output.write(chunk)
-                            bytes_done += len(chunk)
-                            state.bytes_done = bytes_done
-                            store.save(state)
-                            _emit_progress(callbacks, bytes_done, total)
-                break
-            finally:
-                control.set_active_response(None)
-        expected = total_size
-        if expected is not None and part_path.stat().st_size != expected:
-            raise DownloadError("下载大小不一致")
-        _replace_output_file(part_path, local_path)
-        store.delete(state.task_id)
-        _emit_status(callbacks, "已完成")
-        _emit_connections(callbacks, 0, 1)
-        return DownloadResult(status="已完成", task_id=state.task_id, local_path=local_path)
-    except DownloadError as exc:
-        _remove_partial_file(part_path)
-        _mark_failed(store, state, callbacks, str(exc))
-        raise
-    except httpx.HTTPStatusError as exc:
-        _remove_partial_file(part_path)
-        message = f"HTTP {exc.response.status_code}"
-        _mark_failed(store, state, callbacks, message)
-        raise DownloadError(message) from exc
-    except httpx.HTTPError as exc:
-        stop_result = control.stop_result()
-        if stop_result in ("paused", "cancelled"):
-            return _stop_single_download(
-                stop_result, store, state, callbacks, control, part_path
-            )
-        _remove_partial_file(part_path)
-        _mark_failed(store, state, callbacks, "网络错误")
-        raise DownloadError("网络错误") from exc
-    except OSError as exc:
-        _remove_partial_file(part_path)
-        message = f"无法写入本地文件：{exc}"
-        _mark_failed(store, state, callbacks, message)
-        raise DownloadError(message) from exc
 
 
 def _stop_range_part(
@@ -845,35 +737,6 @@ def _stop_range_download(
     return DownloadResult(status="已暂停", task_id=latest.task_id, local_path=latest.save_path)
 
 
-def _stop_single_download(
-    stop_result: PartResult,
-    store: DownloadTaskStore,
-    state: DownloadTaskState,
-    callbacks: DownloadCallbacks,
-    control: DownloadTaskControl,
-    part_path: Path,
-) -> DownloadResult:
-    if stop_result == "cancelled":
-        _remove_partial_file(part_path)
-        state.status = "已取消"
-        state.error = "用户取消下载"
-        state.bytes_done = 0
-        store.save(state)
-        if control.cleanup_on_cancel:
-            store.delete(state.task_id)
-        _emit_status(callbacks, "已取消")
-        _emit_connections(callbacks, 0, 1)
-        return DownloadResult(status="已取消", task_id=state.task_id, local_path=state.save_path)
-    _remove_partial_file(part_path)
-    state.status = "已暂停"
-    state.error = "远端不支持可续传下载"
-    state.bytes_done = 0
-    store.save(state)
-    _emit_status(callbacks, "已暂停")
-    _emit_connections(callbacks, 0, 1)
-    return DownloadResult(status="已暂停", task_id=state.task_id, local_path=state.save_path)
-
-
 def _mark_failed(
     store: DownloadTaskStore,
     state: DownloadTaskState,
@@ -1006,9 +869,9 @@ def _build_parts(total_size: int, part_size: int) -> list[DownloadPart]:
     ]
 
 
-def _download_part_size(total_size: int | None, settings: AppSettings) -> int:
+def _download_part_size(total_size: int, settings: AppSettings) -> int:
     configured_size = settings.download_part_size_mb * BYTES_PER_MB
-    if total_size is None or settings.download_part_mode == "fixed":
+    if settings.download_part_mode == "fixed":
         return configured_size
     target_workers = max(1, min(settings.max_download_threads, 16))
     return max(configured_size, math.ceil(total_size / target_workers))

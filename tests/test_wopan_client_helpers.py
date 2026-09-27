@@ -191,15 +191,47 @@ def test_upload_file_maps_local_read_error(tmp_path: Path, monkeypatch: pytest.M
     local_file = tmp_path / "report.txt"
     local_file.write_bytes(b"content")
 
-    def failing_read(self: Path) -> bytes:
+    def failing_open(self: Path, *args: object, **kwargs: object) -> object:
         raise OSError("disk error")
 
-    monkeypatch.setattr(Path, "read_bytes", failing_read)
+    monkeypatch.setattr(Path, "open", failing_open)
 
     with pytest.raises(WopanResponseError, match="cannot be decoded"):
         _upload_client(_upload_handler(httpx.Response(200, json={}))).upload_file(
             "0", local_file, retry_max_attempts=0
         )
+
+
+def test_upload_file_single_part_runs_through_part_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """单分片规划同样经过分片 executor：重试与进度语义与多分片一致。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    local_file = tmp_path / "tiny.bin"
+    local_file.write_bytes(b"abc")  # 3 bytes < 5-byte part → total_parts == 1
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return _success_response({"url": "https://upload.example.test"})
+        part_index = int(_multipart_field(request.content, "partIndex"))
+        attempts.append(part_index)
+        if len(attempts) == 1:
+            return httpx.Response(200, json={"code": "9999", "msg": "busy"})
+        return httpx.Response(200, json={"code": "0000", "data": {"fid": "fid-1"}})
+
+    progress: list[tuple[int, int]] = []
+    item = _upload_client(handler).upload_file(
+        "folder-1",
+        local_file,
+        max_upload_threads=4,
+        retry_max_attempts=1,
+        progress_callback=lambda done, total: progress.append((done, total)),
+    )
+
+    assert attempts == [1, 1]  # 同一分片经 executor 重试一次后成功
+    assert item.item_id == "fid-1"
+    assert progress == [(3, 3)]
 
 
 @pytest.mark.parametrize(

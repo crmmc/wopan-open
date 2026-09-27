@@ -88,6 +88,7 @@ from openwopan.auth.session import AuthSession
 from openwopan.storage.settings import AppSettings, app_settings_path, save_app_settings
 from openwopan.tasks.download import DownloadTaskControl, DownloadTaskRecord
 from openwopan.tasks.scheduler import DownloadTaskEvent
+from openwopan.tasks.transfer_rate import TransferRateEstimator
 from openwopan.tasks.upload import (
     FolderUploadJob,
     UploadBatchSummary,
@@ -804,6 +805,11 @@ class TransferInterface(QWidget):
     """Transfer center aligned with the sibling Fluent client."""
 
     PROGRESS_RENDER_INTERVAL_MS = 150
+    SPEED_SAMPLE_INTERVAL_MS = 1000
+    # Statuses during which bytes are expected to flow; only these are sampled.
+    # Waiting/creating-dir/verifying/merging/paused/terminal tasks show no
+    # active speed (R5).
+    SAMPLING_STATUSES = frozenset({"上传中", "下载中"})
 
     remove_records_requested = Signal(str, object)
     open_download_folder_requested = Signal(object)
@@ -826,6 +832,14 @@ class TransferInterface(QWidget):
         self._active_direction = "download"
         self._pending_progress_directions: set[str] = set()
         self._progress_render_scheduled = False
+        self._speed_estimators: dict[tuple[str, str], TransferRateEstimator] = {}
+        # Injectable for tests; must return a fresh TransferRateEstimator.
+        self._new_speed_estimator: Callable[[], TransferRateEstimator] = (
+            TransferRateEstimator
+        )
+        self._speed_sampler = QTimer(self)
+        self._speed_sampler.setInterval(self.SPEED_SAMPLE_INTERVAL_MS)
+        self._speed_sampler.timeout.connect(self._sample_speeds)
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(24, 20, 24, 24)
         self._main_layout.setSpacing(12)
@@ -838,16 +852,24 @@ class TransferInterface(QWidget):
 
     def add_upload_record(self, record: TransferRecord) -> None:
         """Add or replace an upload task row."""
+        self._on_record_added("upload", record)
         self._upsert_record(self.upload_records, record)
         self.flush_progress_render()
         self._render_upload_table()
 
     def add_download_record(self, record: TransferRecord, *, render: bool = True) -> None:
         """Add or replace a download task row."""
+        self._on_record_added("download", record)
         self._upsert_record(self.download_records, record)
         if render:
             self.flush_progress_render()
             self._render_download_table()
+
+    def _on_record_added(self, direction: str, record: TransferRecord) -> None:
+        """Reset speed state for a (re-)added record; recovered tasks re-baseline."""
+        self._speed_estimators.pop((direction, record.task_id), None)
+        if record.status in self.SAMPLING_STATUSES:
+            self._ensure_speed_sampler()
 
     def update_record(
         self,
@@ -866,8 +888,7 @@ class TransferInterface(QWidget):
         record = self._find_record(direction, task_id)
         if record is None:
             return
-        previous_bytes = record.bytes_done
-        previous_time = record.updated_at
+        previous_status = record.status
         now = time.monotonic()
         progress_only = (
             status is None
@@ -888,15 +909,25 @@ class TransferInterface(QWidget):
         if can_resume is not None:
             record.can_resume = can_resume
         if bytes_done is not None:
+            # Progress callbacks only carry cumulative bytes; the speed comes
+            # from the 1-second sampler (R1/R2), never from callback intervals.
             record.bytes_done = max(0, bytes_done)
-            elapsed = max(now - previous_time, 0.001)
-            delta = record.bytes_done - previous_bytes
-            record.speed_bps = max(0.0, delta / elapsed)
         if error is not None:
             record.error = error
         if record.status in TERMINAL_TRANSFER_STATUSES:
+            # Terminal: zero the speed and release estimator state (R5).
+            self._speed_estimators.pop((direction, task_id), None)
             record.speed_bps = 0.0
             record.active_connections = 0
+        elif status is not None and status != previous_status:
+            # Status transition (pause/resume/waiting/...): re-baseline so the
+            # paused or transitional span is never counted into a new rate.
+            estimator = self._speed_estimators.get((direction, task_id))
+            if estimator is not None:
+                estimator.reset()
+            record.speed_bps = 0.0
+            if record.status in self.SAMPLING_STATUSES:
+                self._ensure_speed_sampler()
         record.updated_at = now
         if record.status in TERMINAL_TRANSFER_STATUSES:
             self._discard_pending_progress(direction)
@@ -935,6 +966,55 @@ class TransferInterface(QWidget):
         else:
             self._render_download_table()
 
+    def _ensure_speed_sampler(self) -> None:
+        """Start the 1-second speed tick; runs only while active tasks exist."""
+        if not self._speed_sampler.isActive():
+            self._speed_sampler.start()
+
+    def stop_speed_sampler(self) -> None:
+        """Stop the speed tick; called on window close so no timer outlives it."""
+        self._speed_sampler.stop()
+
+    def _sample_speeds(self) -> None:
+        """Sampler tick (GUI thread): advance each active task's estimator.
+
+        Updates only the speed cells and the direction total labels; it never
+        rebuilds the table (R6). Stops itself when no task is transferring.
+        """
+        has_active = False
+        for direction in ("upload", "download"):
+            records = (
+                self.upload_records if direction == "upload" else self.download_records
+            )
+            table = self.upload_table if direction == "upload" else self.download_table
+            visible = (
+                self._filtered_upload_records()
+                if direction == "upload"
+                else self._filtered_download_records()
+            )
+            for record in records:
+                if record.status not in self.SAMPLING_STATUSES:
+                    continue
+                has_active = True
+                key = (direction, record.task_id)
+                estimator = self._speed_estimators.get(key)
+                if estimator is None:
+                    estimator = self._new_speed_estimator()
+                    self._speed_estimators[key] = estimator
+                record.speed_bps = max(0.0, estimator.sample(record.bytes_done))
+            for row, record in enumerate(visible):
+                if record.status not in self.SAMPLING_STATUSES:
+                    continue
+                speed_item = table.item(row, TRANSFER_COL_SPEED)
+                if (
+                    speed_item is not None
+                    and speed_item.data(Qt.ItemDataRole.UserRole) == record.task_id
+                ):
+                    speed_item.setText(_format_speed(record.speed_bps))
+            self._update_total_speed(direction)
+        if not has_active:
+            self._speed_sampler.stop()
+
     def remove_records(self, direction: str, task_ids: set[str]) -> None:
         """Remove task rows by id."""
         if direction == "upload":
@@ -943,12 +1023,14 @@ class TransferInterface(QWidget):
             ]
             self.flush_progress_render()
             self._render_upload_table()
-            return
-        self.download_records = [
-            record for record in self.download_records if record.task_id not in task_ids
-        ]
-        self.flush_progress_render()
-        self._render_download_table()
+        else:
+            self.download_records = [
+                record for record in self.download_records if record.task_id not in task_ids
+            ]
+            self.flush_progress_render()
+            self._render_download_table()
+        for task_id in task_ids:
+            self._speed_estimators.pop((direction, task_id), None)
 
     def active_download_folder(self) -> Path | None:
         """Return selected download folder or the latest download folder."""
@@ -2395,6 +2477,7 @@ class MainWindow(_MainWindowBase):
         # would stack each THREAD_JOIN_TIMEOUT_MS on a pathological close.
         running: list[tuple[QThread, str, str | None]] = []
         self._closing = True
+        self.transfer_interface.stop_speed_sampler()
         if self._folder_prepare_cancel is not None:
             self._folder_prepare_cancel.set()
         close_downloads = getattr(self._file_browser, "close_downloads", None)

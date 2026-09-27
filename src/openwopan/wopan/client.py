@@ -482,10 +482,7 @@ class WopanClient:
         file_size = local_path.stat().st_size
         file_name = upload_name if upload_name is not None else local_path.name
         part_size, total_parts = resolve_upload_part_plan(file_size, upload_part_size_mb)
-        max_workers = 1 if total_parts == 1 else min(
-            _bounded_int(max_upload_threads, 16, 1, 16),
-            total_parts,
-        )
+        max_workers = min(_bounded_int(max_upload_threads, 16, 1, 16), total_parts)
         max_attempts = _bounded_int(retry_max_attempts, 3, 0, 5) + 1
         completed_indexes = _valid_completed_indexes(resume, total_parts)
         upload_file_type = guess_upload_file_type(file_name)
@@ -575,37 +572,24 @@ class WopanClient:
             len(completed_indexes),
         )
         try:
-            if total_parts == 1:
-                _check_upload_cancelled(cancel_requested)
-                raw = self._upload_part(
-                    upload_url,
-                    form_data,
-                    file_name,
-                    mime_type,
-                    local_path.read_bytes(),
-                    part_index=1,
-                    max_attempts=max_attempts,
-                    cancel_requested=cancel_requested,
-                    on_part_result=on_part_result,
-                )
-                if progress_callback is not None:
-                    progress_callback(file_size, file_size)
-            else:
-                raw = self._upload_parts_parallel(
-                    upload_url,
-                    form_data,
-                    file_name,
-                    mime_type,
-                    local_path,
-                    part_size,
-                    total_parts,
-                    max_workers,
-                    max_attempts,
-                    progress_callback=progress_callback,
-                    cancel_requested=cancel_requested,
-                    completed_indexes=completed_indexes,
-                    on_part_result=on_part_result,
-                )
+            # Single-part plans also run through the multipart executor: one
+            # part is just a one-element executor task, so request fields,
+            # retry, cancel, resume-skip and fid handling stay identical.
+            raw = self._upload_parts_parallel(
+                upload_url,
+                form_data,
+                file_name,
+                mime_type,
+                local_path,
+                part_size,
+                total_parts,
+                max_workers,
+                max_attempts,
+                progress_callback=progress_callback,
+                cancel_requested=cancel_requested,
+                completed_indexes=completed_indexes,
+                on_part_result=on_part_result,
+            )
 
             _check_upload_cancelled(cancel_requested)
             code = str(raw.get("code") or "")

@@ -640,174 +640,21 @@ def test_download_url_rejects_empty_url(tmp_path: Path) -> None:
         )
 
 
-# -- single-stream paths -----------------------------------------------------
+# -- unified Range executor paths ---------------------------------------------
 
 
-def test_single_stream_refreshes_expired_url_until_success(tmp_path: Path) -> None:
-    content = b"single-stream-content"
-    calls: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(str(request.url))
-        if str(request.url).endswith("/expired"):
-            return httpx.Response(403)
-        return httpx.Response(200, content=content, headers={"Content-Length": str(len(content))})
-
-    refresh_count = 0
-
-    def refresh_url() -> str:
-        nonlocal refresh_count
-        refresh_count += 1
-        return "https://download.example.test/fresh"
-
-    result = download_url(
-        httpx.Client(transport=httpx.MockTransport(handler)),
-        "https://download.example.test/expired",
-        tmp_path / "out.bin",
-        settings=AppSettings(),
-        store=DownloadTaskStore(tmp_path / "store"),
-        task_id="t1",
-        file_name="out.bin",
-        refresh_url=refresh_url,
-        callbacks=DownloadCallbacks(
-            progress=lambda _b, _t: None,
-            status=lambda _s: None,
-            connections=lambda _a, _m: None,
-        ),
-    )
-
-    assert result.status == "已完成"
-    assert refresh_count == 1
-    assert (tmp_path / "out.bin").read_bytes() == content
-
-
-@pytest.mark.parametrize(
-    ("refresh_url", "match"),
-    [
-        (None, "下载链接已过期或刷新失败"),
-        (lambda: "https://download.example.test/expired", "下载链接已过期或刷新失败"),
-    ],
-    ids=["no-refresh-callback", "refresh-exhausted"],
-)
-def test_single_stream_fails_when_url_refresh_exhausted(
-    tmp_path: Path,
-    refresh_url: object,
-    match: str,
-) -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403)
-
-    store = DownloadTaskStore(tmp_path / "store")
-
-    with pytest.raises(DownloadError, match=match):
-        download_url(
-            httpx.Client(transport=httpx.MockTransport(handler)),
-            "https://download.example.test/expired",
-            tmp_path / "out.bin",
-            settings=AppSettings(),
-            store=store,
-            task_id="t1",
-            file_name="out.bin",
-            refresh_url=refresh_url,  # type: ignore[arg-type]
-        )
-
-    state = store.load("t1")
-    assert state is not None and state.status == "失败"
-
-
-def test_single_stream_fails_when_rate_limited(tmp_path: Path) -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429)
-
-    with pytest.raises(DownloadError, match="下载被限流"):
-        download_url(
-            httpx.Client(transport=httpx.MockTransport(handler)),
-            "https://download.example.test/file",
-            tmp_path / "out.bin",
-            settings=AppSettings(),
-            store=DownloadTaskStore(tmp_path / "store"),
-            task_id="t1",
-            file_name="out.bin",
-        )
-
-
-def test_single_stream_fails_on_network_error(tmp_path: Path) -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("boom")
-
-    with pytest.raises(DownloadError, match="网络错误"):
-        download_url(
-            httpx.Client(transport=httpx.MockTransport(handler)),
-            "https://download.example.test/file",
-            tmp_path / "out.bin",
-            settings=AppSettings(),
-            store=DownloadTaskStore(tmp_path / "store"),
-            task_id="t1",
-            file_name="out.bin",
-        )
-
-
-def test_single_stream_fails_on_size_mismatch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+def test_download_missing_file_size_fails_without_fallback(tmp_path: Path) -> None:
+    """R7：探测不到文件大小时明确失败，不退回单流下载。"""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "HEAD":
-            return httpx.Response(200, headers={"Content-Length": "10"})
-        if request.headers.get("Range") is not None:
-            # range unsupported: force fallback to single stream with total_size=10
-            return httpx.Response(200, content=b"short")
-        response = httpx.Response(200, content=b"short")
-        response.headers["Content-Length"] = "10"
-        return response
-
-    with pytest.raises(DownloadError, match="下载大小不一致"):
-        download_url(
-            httpx.Client(transport=httpx.MockTransport(handler)),
-            "https://download.example.test/file",
-            tmp_path / "out.bin",
-            settings=_range_settings(),
-            store=DownloadTaskStore(tmp_path / "store"),
-            task_id="t1",
-            file_name="out.bin",
-        )
-
-    assert not (tmp_path / "out.bin").exists()
-    assert not (tmp_path / "out.bin.part").exists()
-
-
-def test_single_stream_fails_when_local_path_is_not_writable(tmp_path: Path) -> None:
-    read_only_dir = tmp_path / "out-dir"
-    read_only_dir.mkdir()
-    read_only_dir.chmod(0o500)
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"data")
-
-    try:
-        with pytest.raises(DownloadError, match="无法写入本地文件"):
-            download_url(
-                httpx.Client(transport=httpx.MockTransport(handler)),
-                "https://download.example.test/file",
-                read_only_dir / "out.bin",
-                settings=AppSettings(),
-                store=DownloadTaskStore(tmp_path / "store"),
-                task_id="t1",
-                file_name="out.bin",
-            )
-    finally:
-        read_only_dir.chmod(0o700)
-
-
-def test_single_stream_maps_http_status_error(tmp_path: Path) -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, content=b"not found")
+            return httpx.Response(500)
+        return httpx.Response(200, content=b"payload")
 
     store = DownloadTaskStore(tmp_path / "store")
+    statuses: list[str] = []
 
-    with pytest.raises(DownloadError, match="HTTP 404"):
+    with pytest.raises(DownloadError, match="无法获取文件大小"):
         download_url(
             httpx.Client(transport=httpx.MockTransport(handler)),
             "https://download.example.test/file",
@@ -816,10 +663,52 @@ def test_single_stream_maps_http_status_error(tmp_path: Path) -> None:
             store=store,
             task_id="t1",
             file_name="out.bin",
+            callbacks=DownloadCallbacks(status=statuses.append),
         )
 
+    assert statuses[-1] == "失败"
     state = store.load("t1")
-    assert state is not None and state.error == "HTTP 404"
+    assert state is not None and state.status == "失败"
+    assert state.error == "无法获取文件大小，无法进行分片下载"
+    assert not (tmp_path / "out.bin").exists()
+
+
+def test_download_single_worker_uses_unified_range_path(tmp_path: Path) -> None:
+    """max_download_threads=1 也只是 Range 分片 executor 的单 worker 配置。"""
+    requested_ranges: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(CONTENT))})
+        range_header = request.headers.get("Range")
+        requested_ranges.append(range_header or "")
+        start, end = _parse_range(range_header)
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(CONTENT)}"},
+            content=CONTENT[start : end + 1],
+        )
+
+    settings = AppSettings(
+        max_download_threads=1,
+        download_part_mode="fixed",
+        download_part_size_mb=4,
+        retry_max_attempts=0,
+    )
+    result = download_url(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        "https://download.example.test/file",
+        tmp_path / "out.bin",
+        settings=settings,
+        store=DownloadTaskStore(tmp_path / "store"),
+        task_id="t1",
+        file_name="out.bin",
+    )
+
+    assert result.status == "已完成"
+    # 4MB 分片规划大于 17 字节文件：单 part 一次 Range 请求覆盖整个文件
+    assert requested_ranges == ["bytes=0-16"]
+    assert (tmp_path / "out.bin").read_bytes() == CONTENT
 
 
 class _StopAfterChunks(DownloadTaskControl):
@@ -851,29 +740,28 @@ class _StopAfterChunks(DownloadTaskControl):
         ("cancelled", True, "已取消"),
     ],
 )
-def test_single_stream_stop_during_transfer(
+def test_download_stop_during_range_transfer(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     result: str,
     cleanup: bool,
     expected_status: str,
 ) -> None:
-    content = b"x" * (download.DOWNLOAD_CHUNK_SIZE + 16)
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=content)
-
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
     store = DownloadTaskStore(tmp_path / "store")
     statuses: list[str] = []
-    control = _StopAfterChunks(result, 2, cleanup=cleanup)
+    # 3 次轮询：外层批次前 1 次、分片尝试开始 1 次、首个 chunk 读取时 1 次
+    control = _StopAfterChunks(result, 3, cleanup=cleanup)
 
     download_result = download_url(
-        httpx.Client(transport=httpx.MockTransport(handler)),
+        httpx.Client(transport=httpx.MockTransport(_range_handler())),
         "https://download.example.test/file",
         tmp_path / "out.bin",
-        settings=AppSettings(),
+        settings=_range_settings(),
         store=store,
         task_id="t1",
         file_name="out.bin",
+        download_id="fid-1",
         callbacks=DownloadCallbacks(status=statuses.append),
         control=control,
     )
@@ -881,7 +769,6 @@ def test_single_stream_stop_during_transfer(
     assert download_result.status == expected_status
     assert statuses[-1] == expected_status
     assert not (tmp_path / "out.bin").exists()
-    assert not (tmp_path / "out.bin.part").exists()
     state = store.load("t1")
     if cleanup:
         assert state is None
@@ -889,10 +776,17 @@ def test_single_stream_stop_during_transfer(
         assert state is not None and state.status == expected_status
 
 
-@pytest.mark.parametrize("range_download", [False, True])
+@pytest.mark.parametrize(
+    "settings",
+    [
+        AppSettings(),
+        AppSettings(max_download_threads=1, download_part_mode="fixed"),
+    ],
+    ids=["default-workers", "single-worker"],
+)
 @pytest.mark.parametrize("stop", ["已暂停", "已取消"])
 def test_stop_during_stream_read_is_not_reported_as_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, range_download: bool, stop: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settings: AppSettings, stop: str
 ) -> None:
     monkeypatch.setattr(download, "BYTES_PER_MB", download.DOWNLOAD_CHUNK_SIZE // 4)
     control = DownloadTaskControl()
@@ -929,7 +823,7 @@ def test_stop_during_stream_read_is_not_reported_as_failure(
         httpx.Client(transport=httpx.MockTransport(handler)),
         "https://download.example.test/file",
         tmp_path / "out.bin",
-        settings=_range_settings(retries=0) if range_download else AppSettings(),
+        settings=settings,
         store=store,
         task_id="t1",
         file_name="out.bin",
@@ -943,22 +837,35 @@ def test_stop_during_stream_read_is_not_reported_as_failure(
     assert not (tmp_path / "out.bin").exists()
 
 
-def test_single_stream_handles_empty_chunks(tmp_path: Path) -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=iter([b"", b"payload"]))
+def test_download_empty_chunks_are_skipped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    payload = b"payload"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(payload))})
+        start, end = _parse_range(request.headers["Range"])
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(payload)}"},
+            stream=_ChunkedRangeStream([b"", payload]),
+        )
 
     result = download_url(
         httpx.Client(transport=httpx.MockTransport(handler)),
         "https://download.example.test/file",
         tmp_path / "out.bin",
-        settings=AppSettings(),
+        settings=_range_settings(),
         store=DownloadTaskStore(tmp_path / "store"),
         task_id="t1",
         file_name="out.bin",
     )
 
     assert result.status == "已完成"
-    assert (tmp_path / "out.bin").read_bytes() == b"payload"
+    assert (tmp_path / "out.bin").read_bytes() == payload
 
 
 # -- range download failure semantics ----------------------------------------
@@ -1001,12 +908,9 @@ CONTENT = b"abcdefghijklmnopq"  # 17 bytes: parts 0-15 and 16-16
 
 def _range_handler(
     status_for_range: dict[str, int] | None = None,
-    head_status: int = 200,
 ):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "HEAD":
-            if head_status != 200:
-                return httpx.Response(head_status)
             return httpx.Response(200, headers={"Content-Length": str(len(CONTENT))})
         range_header = request.headers.get("Range", "")
         status = (status_for_range or {}).get(range_header, 206)
@@ -1022,18 +926,17 @@ def _range_handler(
     return handler
 
 
-def test_range_download_falls_back_to_single_stream_when_unsupported(
+def test_range_unsupported_fails_without_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """R7：服务端忽略 Range 时明确失败，不退回单流执行路径。"""
     monkeypatch.setattr(download, "BYTES_PER_MB", 4)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "HEAD":
             return httpx.Response(200, headers={"Content-Length": str(len(CONTENT))})
-        if request.headers.get("Range") is not None:
-            return httpx.Response(200, content=CONTENT)
-        return httpx.Response(200, content=CONTENT, headers={"Content-Length": str(len(CONTENT))})
+        return httpx.Response(200, content=CONTENT)
 
     store = DownloadTaskStore(tmp_path / "store")
     seeded = _state(task_id="t1", save_path=tmp_path / "out.bin")
@@ -1046,11 +949,15 @@ def test_range_download_falls_back_to_single_stream_when_unsupported(
     stale_part.parent.mkdir(parents=True, exist_ok=True)
     stale_part.write_bytes(b"x" * 16)
 
-    result = _run_ranges(tmp_path, handler, store=store)
+    with pytest.raises(DownloadError, match="服务器不支持断点续传下载"):
+        _run_ranges(tmp_path, handler, store=store)
 
-    assert result.status == "已完成"
-    assert (tmp_path / "out.bin").read_bytes() == CONTENT
-    assert store.load("t1") is None  # deleted after successful completion
+    state = store.load("t1")
+    assert state is not None and state.status == "失败"
+    assert state.parts == []
+    assert state.supports_resume is False
+    assert not stale_part.exists()
+    assert not (tmp_path / "out.bin").exists()
 
 
 @pytest.mark.parametrize("cleanup", [False, True])
@@ -1469,7 +1376,6 @@ def test_clear_parts_if_plan_changed_keeps_matching_plan(tmp_path: Path) -> None
 def test_download_part_size_modes() -> None:
     fixed = AppSettings(download_part_mode="fixed", download_part_size_mb=4)
     assert _download_part_size(1024, fixed) == 4 * download.BYTES_PER_MB
-    assert _download_part_size(None, AppSettings()) == 5 * download.BYTES_PER_MB
 
     auto = AppSettings(
         download_part_mode="auto",
@@ -1477,6 +1383,15 @@ def test_download_part_size_modes() -> None:
         max_download_threads=4,
     )
     assert _download_part_size(100 * download.BYTES_PER_MB, auto) == 25 * download.BYTES_PER_MB
+
+    single_worker = AppSettings(
+        download_part_mode="auto",
+        download_part_size_mb=4,
+        max_download_threads=1,
+    )
+    # 单 worker：part 取整个文件大小，规划结果只有一个 Range 分片
+    whole_file = 10 * download.BYTES_PER_MB
+    assert _download_part_size(whole_file, single_worker) == whole_file
 
 
 def test_probe_download_size_handles_head_failures(tmp_path: Path) -> None:
