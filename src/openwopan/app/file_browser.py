@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -28,12 +29,25 @@ from openwopan.tasks.scheduler import (
     DownloadTaskInput,
 )
 from openwopan.tasks.upload import (
+    UPLOAD_SESSION_MAX_AGE_SECONDS,
     FolderUploadJob,
     PlannedUploadFile,
+    UploadTaskRecord,
+    UploadTaskState,
+    UploadTaskStore,
+    make_upload_task_id,
     next_available_name,
     scan_folder_tree,
 )
-from openwopan.wopan.client import ORIGIN, REFERER, ROOT_DIRECTORY_ID, WopanClient
+from openwopan.wopan.client import (
+    ORIGIN,
+    REFERER,
+    ROOT_DIRECTORY_ID,
+    UploadResumeContext,
+    WopanClient,
+    build_uploaded_file_item,
+    resolve_upload_part_plan,
+)
 from openwopan.wopan.errors import (
     WopanAuthenticationError,
     WopanError,
@@ -129,6 +143,8 @@ class FileBrowserBackend(Protocol):
         cancel_requested: Callable[[], bool] | None = None,
     ) -> WopanItem:
         """Upload one local file to a directory."""
+    def recover_uploads(self) -> tuple[UploadTaskRecord, ...]:
+        """Normalize persisted upload states and surface resumable rows."""
 
     def prepare_folder_upload(
         self,
@@ -155,6 +171,7 @@ class FileBrowserService:
         download_store: DownloadTaskStore | None = None,
         download_event_callback: DownloadEventCallback | None = None,
         download_scheduler: DownloadScheduler | None = None,
+        upload_store: UploadTaskStore | None = None,
     ) -> None:
         self._client = client
         self._settings = settings or AppSettings()
@@ -163,6 +180,9 @@ class FileBrowserService:
             max_concurrent_downloads=self._settings.max_concurrent_downloads,
             on_event=download_event_callback,
         )
+        # None (legacy callers / tests) disables upload persistence;
+        # the production factory injects a real store so uploads resume.
+        self._upload_store = upload_store
         self._http_client = http_client or httpx.Client(
             headers={"Origin": ORIGIN, "Referer": REFERER},
             follow_redirects=True,
@@ -410,7 +430,7 @@ class FileBrowserService:
         progress_callback: UploadProgressCallback | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> WopanItem:
-        """Upload one local file to a directory."""
+        """Upload one local file to a directory, resuming a persisted session."""
         if not parent_id:
             raise FileBrowserError("目标文件夹不能为空")
         if not local_path.exists():
@@ -424,7 +444,6 @@ class FileBrowserService:
                 raise FileBrowserError("上传文件名称不能为空")
             if upload_name in self._existing_names(parent_id):
                 raise FileBrowserError("上传目标已存在，请刷新后重试")
-
         if cancel_requested is not None and cancel_requested():
             raise FileBrowserUploadCancelledError("上传已取消")
 
@@ -433,59 +452,135 @@ class FileBrowserService:
             parent_id,
             len(local_path.name),
         )
+        store = self._upload_store
+        resume: UploadResumeContext | None = None
+        upload_task_id = ""
+        if store is not None:
+            try:
+                stat_result = local_path.stat()
+            except OSError as exc:
+                LOGGER.warning(
+                    "file_browser.upload_file.stat_failed error_type=%s",
+                    type(exc).__name__,
+                )
+                raise FileBrowserError(f"无法读取本地文件：{exc}") from exc
+            part_size, total_parts = resolve_upload_part_plan(
+                stat_result.st_size, self._settings.upload_part_size_mb
+            )
+            upload_task_id = make_upload_task_id(parent_id, local_path, upload_name)
+            state = self._prepare_upload_state(
+                store,
+                task_id=upload_task_id,
+                parent_id=parent_id,
+                local_path=local_path,
+                upload_name=upload_name,
+                file_size=stat_result.st_size,
+                file_mtime=stat_result.st_mtime,
+                part_size=part_size,
+                total_parts=total_parts,
+            )
+            completed = frozenset(state.completed_indexes)
+            resume = UploadResumeContext(
+                unique_id=state.unique_id,
+                batch_no=state.batch_no,
+                completed_indexes=completed,
+                known_fid=state.fid,
+                on_part_result=self._make_upload_part_recorder(store, upload_task_id),
+            )
+            if state.fid and completed == frozenset(range(1, total_parts + 1)):
+                item = build_uploaded_file_item(
+                    file_name=state.file_name,
+                    parent_id=parent_id,
+                    file_size=state.file_size,
+                    fid=state.fid,
+                )
+                store.delete(upload_task_id)
+                LOGGER.info(
+                    "file_browser.upload_file.resume_complete parent_id=%s item_id=%s",
+                    parent_id,
+                    item.item_id,
+                )
+                return item
+
         try:
-            if progress_callback is None:
-                if cancel_requested is None:
-                    item = self._call(
+            item = self._invoke_upload_client(
+                parent_id,
+                local_path,
+                upload_name=upload_name,
+                progress_callback=progress_callback,
+                cancel_requested=cancel_requested,
+                resume=resume,
+            )
+        except FileBrowserUploadCancelledError:
+            if store is not None:
+                store.delete(upload_task_id)
+            raise
+        except Exception as exc:
+            if store is not None:
+                message = str(exc)
+                try:
+                    store.update(
+                        upload_task_id,
+                        lambda state: _mark_upload_failed(state, message),
+                    )
+                except KeyError:
+                    LOGGER.debug("file_browser.upload_file.record_after_delete")
+            raise
+        if store is not None:
+            store.delete(upload_task_id)
+        LOGGER.info(
+            "file_browser.upload_file.success parent_id=%s item_id=%s file_name_length=%s",
+            parent_id,
+            item.item_id,
+            len(item.name),
+        )
+        return item
+
+    def _invoke_upload_client(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None,
+        progress_callback: UploadProgressCallback | None,
+        cancel_requested: Callable[[], bool] | None,
+        resume: UploadResumeContext | None,
+    ) -> WopanItem:
+        """Call the client, degrading kwargs for backends without new parameters."""
+        kwargs: dict[str, object] = {
+            "upload_part_size_mb": self._settings.upload_part_size_mb,
+            "max_upload_threads": self._settings.max_upload_threads,
+            "retry_max_attempts": self._settings.retry_max_attempts,
+            "upload_name": upload_name,
+        }
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        if cancel_requested is not None:
+            kwargs["cancel_requested"] = cancel_requested
+        if resume is not None:
+            kwargs["resume"] = resume
+        try:
+            while True:
+                try:
+                    return self._call(
                         lambda: self._client.upload_file(
                             parent_id,
                             local_path,
-                            upload_part_size_mb=self._settings.upload_part_size_mb,
-                            max_upload_threads=self._settings.max_upload_threads,
-                            retry_max_attempts=self._settings.retry_max_attempts,
-                            upload_name=upload_name,
+                            **kwargs,  # type: ignore[arg-type]
                         )
                     )
-                else:
-                    item = self._call(
-                        lambda: self._client.upload_file(
-                            parent_id,
-                            local_path,
-                            upload_part_size_mb=self._settings.upload_part_size_mb,
-                            max_upload_threads=self._settings.max_upload_threads,
-                            retry_max_attempts=self._settings.retry_max_attempts,
-                            upload_name=upload_name,
-                            cancel_requested=cancel_requested,
-                        )
-                    )
-            elif cancel_requested is None:
-                item = self._call(
-                    lambda: self._client.upload_file(
-                        parent_id,
-                        local_path,
-                        upload_part_size_mb=self._settings.upload_part_size_mb,
-                        max_upload_threads=self._settings.max_upload_threads,
-                        retry_max_attempts=self._settings.retry_max_attempts,
-                        upload_name=upload_name,
-                        progress_callback=progress_callback,
-                    )
-                )
-            else:
-                item = self._call(
-                    lambda: self._client.upload_file(
-                        parent_id,
-                        local_path,
-                        upload_part_size_mb=self._settings.upload_part_size_mb,
-                        max_upload_threads=self._settings.max_upload_threads,
-                        retry_max_attempts=self._settings.retry_max_attempts,
-                        upload_name=upload_name,
-                        progress_callback=progress_callback,
-                        cancel_requested=cancel_requested,
-                    )
-                )
+                except TypeError:
+                    for key in ("resume", "cancel_requested", "progress_callback"):
+                        if key in kwargs:
+                            del kwargs[key]
+                            break
+                    else:
+                        raise
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
-            LOGGER.warning("file_browser.upload_file.http_status_error status=%s", status_code)
+            LOGGER.warning(
+                "file_browser.upload_file.http_status_error status=%s", status_code
+            )
             raise FileBrowserError(f"HTTP {status_code}") from exc
         except httpx.HTTPError as exc:
             LOGGER.warning(
@@ -496,13 +591,81 @@ class FileBrowserService:
         except OSError as exc:
             LOGGER.warning("file_browser.upload_file.read_error error=%s", exc)
             raise FileBrowserError(f"无法读取本地文件：{exc}") from exc
-        LOGGER.info(
-            "file_browser.upload_file.success parent_id=%s item_id=%s file_name_length=%s",
-            parent_id,
-            item.item_id,
-            len(item.name),
+
+    def _prepare_upload_state(
+        self,
+        store: UploadTaskStore,
+        *,
+        task_id: str,
+        parent_id: str,
+        local_path: Path,
+        upload_name: str | None,
+        file_size: int,
+        file_mtime: float,
+        part_size: int,
+        total_parts: int,
+    ) -> UploadTaskState:
+        """Reuse a persisted upload session or start a fresh one."""
+        state = store.load(task_id)
+        if state is not None and _upload_state_reusable(
+            state,
+            parent_id=parent_id,
+            file_size=file_size,
+            file_mtime=file_mtime,
+            part_size=part_size,
+            total_parts=total_parts,
+        ):
+            return store.update(task_id, _reset_upload_session)
+        if state is not None:
+            store.delete(task_id)
+        fresh = UploadTaskState(
+            task_id=task_id,
+            file_name=upload_name if upload_name is not None else local_path.name,
+            local_path=local_path,
+            parent_id=parent_id,
+            upload_name=upload_name,
+            file_size=file_size,
+            file_mtime=file_mtime,
+            part_size=part_size,
+            total_parts=total_parts,
+            unique_id=str(int(time.time() * 1000)),
+            batch_no=time.strftime("%Y%m%d%H%M%S"),
         )
-        return item
+        store.save(fresh)
+        return fresh
+
+    def _make_upload_part_recorder(
+        self, store: UploadTaskStore, task_id: str
+    ) -> Callable[[int, str], None]:
+        """Record each confirmed part under the store lock (worker-thread safe)."""
+
+        def record_part_result(part_index: int, fid: str) -> None:
+            try:
+                store.update(
+                    task_id,
+                    lambda state: _record_upload_part(state, part_index, fid),
+                )
+            except KeyError:
+                LOGGER.debug(
+                    "file_browser.upload_file.record_after_delete part_index=%s",
+                    part_index,
+                )
+
+        return record_part_result
+
+    def recover_uploads(self) -> tuple[UploadTaskRecord, ...]:
+        """Normalize persisted upload states after an application restart."""
+        store = self._upload_store
+        if store is None:
+            return ()
+        records: list[UploadTaskRecord] = []
+        for state in store.load_all():
+            if state.status == "已完成" or not state.local_path.exists():
+                store.delete(state.task_id)
+                continue
+            updated = store.update(state.task_id, _mark_upload_interrupted)
+            records.append(_upload_state_record(updated))
+        return tuple(records)
 
     def prepare_folder_upload(
         self,
@@ -670,4 +833,74 @@ def build_file_browser_service(
     settings: AppSettings | None = None,
 ) -> FileBrowserService:
     """Build a file browser service for a validated Cookie header."""
-    return FileBrowserService(WopanClient(cookie_header), settings=settings)
+    return FileBrowserService(
+        WopanClient(cookie_header),
+        settings=settings,
+        upload_store=UploadTaskStore(),
+    )
+
+
+def _upload_state_reusable(
+    state: UploadTaskState,
+    *,
+    parent_id: str,
+    file_size: int,
+    file_mtime: float,
+    part_size: int,
+    total_parts: int,
+) -> bool:
+    """Return True when a persisted upload session still matches this upload."""
+    return (
+        state.status != "已完成"
+        and state.parent_id == parent_id
+        and state.file_size == file_size
+        and state.file_mtime == file_mtime
+        and state.part_size == part_size
+        and state.total_parts == total_parts
+        and time.time() - state.updated_at <= UPLOAD_SESSION_MAX_AGE_SECONDS
+    )
+
+
+def _reset_upload_session(state: UploadTaskState) -> None:
+    """Mark a reused upload session as active again."""
+    state.status = "进行中"
+    state.error = ""
+
+
+def _record_upload_part(state: UploadTaskState, part_index: int, fid: str) -> None:
+    """Merge one confirmed part into the persisted upload state."""
+    if part_index not in state.completed_indexes:
+        state.completed_indexes = [*state.completed_indexes, part_index]
+    if fid and not state.fid:
+        state.fid = fid
+
+
+def _mark_upload_failed(state: UploadTaskState, message: str) -> None:
+    """Persist a failed upload while keeping its completed parts."""
+    state.status = "失败"
+    state.error = message
+
+
+def _mark_upload_interrupted(state: UploadTaskState) -> None:
+    """Normalize a state left behind by an interrupted application run."""
+    state.status = "失败"
+    state.error = (
+        f"应用中断，可续传（已完成 {len(state.completed_indexes)}/{state.total_parts} 分片）"
+    )
+
+
+def _upload_state_record(state: UploadTaskState) -> UploadTaskRecord:
+    """Project a persisted upload state onto the transfer-center record."""
+    return UploadTaskRecord(
+        task_id=state.task_id,
+        name=state.file_name,
+        local_path=state.local_path,
+        target_parent_id=state.parent_id,
+        status=state.status,
+        completed_parts=len(state.completed_indexes),
+        total_parts=state.total_parts,
+        file_size=state.file_size,
+        upload_name=state.upload_name,
+        error=state.error,
+        resumable=True,
+    )

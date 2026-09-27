@@ -7,7 +7,7 @@ import json
 import logging
 import mimetypes
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +29,23 @@ from openwopan.wopan.errors import (
 from openwopan.wopan.models import DownloadInfo, WopanCloudUsage, WopanItem, WopanItemKind
 
 UploadProgressCallback = Callable[[int, int], None]
+UploadPartResultCallback = Callable[[int, str], None]
+
+
+@dataclass(frozen=True, slots=True)
+class UploadResumeContext:
+    """Reuses one upload session to skip already-confirmed parts.
+
+    ``on_part_result`` is invoked from the client's worker threads after each
+    part is confirmed with ``code == "0000"``; ``fid`` carries that response's
+    ``data.fid`` or an empty string when the response has none.
+    """
+
+    unique_id: str
+    batch_no: str
+    completed_indexes: frozenset[int] = frozenset()
+    known_fid: str = ""
+    on_part_result: UploadPartResultCallback | None = None
 
 
 def _check_upload_cancelled(cancel_requested: Callable[[], bool] | None) -> None:
@@ -444,8 +461,18 @@ class WopanClient:
         upload_name: str | None = None,
         progress_callback: UploadProgressCallback | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        resume: UploadResumeContext | None = None,
     ) -> WopanItem:
-        """Upload a local file to a parent directory."""
+        """Upload a local file to a parent directory.
+
+        With ``resume`` the previous session's ``uniqueId``/``batchNo`` are
+        reused, already-confirmed parts are skipped, and the request form
+        stays byte-identical to the original session so the server can
+        aggregate parts under the same uniqueId. When a resumable upload
+        finishes its parts without a usable fid, or fails after the server
+        may already have assembled the file, the target directory listing is
+        queried to recover the fid by name+size match.
+        """
         if not parent_id:
             raise ValueError("parent_id must not be empty")
         if not local_path.is_file():
@@ -454,14 +481,52 @@ class WopanClient:
         _check_upload_cancelled(cancel_requested)
         file_size = local_path.stat().st_size
         file_name = upload_name if upload_name is not None else local_path.name
-        part_size = _bounded_int(upload_part_size_mb, 5, 5, 16) * BYTES_PER_MB
-        total_parts = max(1, (file_size + part_size - 1) // part_size)
+        part_size, total_parts = resolve_upload_part_plan(file_size, upload_part_size_mb)
         max_workers = 1 if total_parts == 1 else min(
             _bounded_int(max_upload_threads, 16, 1, 16),
             total_parts,
         )
         max_attempts = _bounded_int(retry_max_attempts, 3, 0, 5) + 1
-        upload_file_type = _guess_upload_file_type(file_name)
+        completed_indexes = _valid_completed_indexes(resume, total_parts)
+        upload_file_type = guess_upload_file_type(file_name)
+
+        if resume is not None and resume.known_fid and completed_indexes == set(
+            range(1, total_parts + 1)
+        ):
+            # Defensive: the service layer short-circuits earlier; never resend
+            # a fully uploaded file just to re-derive a known fid.
+            if progress_callback is not None:
+                progress_callback(file_size, file_size)
+            return build_uploaded_file_item(
+                file_name=file_name,
+                parent_id=parent_id,
+                file_size=file_size,
+                fid=resume.known_fid,
+            )
+
+        if not pending_upload_indexes(total_parts, completed_indexes):
+            # Every part is already confirmed but no fid was captured. UAT
+            # (2026-09-26): resending an already-assembled part returns an
+            # empty body, so the fid cannot be recovered from the part
+            # response; the server has assembled the file, so it must exist
+            # in the target directory. Recover the fid from the listing (R7).
+            _check_upload_cancelled(cancel_requested)
+            recovered = self._recover_upload_item_from_listing(
+                parent_id=parent_id, file_name=file_name, file_size=file_size
+            )
+            if recovered is None:
+                LOGGER.warning(
+                    "wopan.upload_file.recovery_missed parent_id=%s "
+                    "file_name_length=%s file_size=%s",
+                    parent_id,
+                    len(file_name),
+                    file_size,
+                )
+                raise WopanResponseError("上传已完成但目标目录未找到对应文件，请刷新后重试")
+            if progress_callback is not None:
+                progress_callback(file_size, file_size)
+            return recovered
+
         if cancel_requested is None:
             zone_url = self.get_upload_zone_url(retry_max_attempts=retry_max_attempts)
         else:
@@ -470,12 +535,17 @@ class WopanClient:
             )
         _check_upload_cancelled(cancel_requested)
         upload_url = f"{zone_url.rstrip('/')}/openapi/client/upload2C"
-        unique_id = str(int(time.time() * 1000))
+        unique_id = (
+            resume.unique_id if resume is not None else str(int(time.time() * 1000))
+        )
+        batch_no = (
+            resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
+        )
         token_key = _wohome_crypto_key(self._access_token)
         file_info = {
             "spaceType": PERSONAL_SPACE_TYPE,
             "directoryId": parent_id,
-            "batchNo": time.strftime("%Y%m%d%H%M%S"),
+            "batchNo": batch_no,
             "fileName": file_name,
             "fileSize": file_size,
             "fileType": upload_file_type,
@@ -492,15 +562,17 @@ class WopanClient:
             "fileInfo": _encrypt_param(file_info, token_key),
         }
         mime_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        on_part_result = resume.on_part_result if resume is not None else None
 
         LOGGER.info(
             "wopan.upload_file.start parent_id=%s file_name_length=%s file_size=%s "
-            "total_parts=%s workers=%s",
+            "total_parts=%s workers=%s completed_parts=%s",
             parent_id,
             len(file_name),
             file_size,
             total_parts,
             max_workers,
+            len(completed_indexes),
         )
         try:
             if total_parts == 1:
@@ -514,6 +586,7 @@ class WopanClient:
                     part_index=1,
                     max_attempts=max_attempts,
                     cancel_requested=cancel_requested,
+                    on_part_result=on_part_result,
                 )
                 if progress_callback is not None:
                     progress_callback(file_size, file_size)
@@ -530,46 +603,129 @@ class WopanClient:
                     max_attempts,
                     progress_callback=progress_callback,
                     cancel_requested=cancel_requested,
+                    completed_indexes=completed_indexes,
+                    on_part_result=on_part_result,
                 )
+
+            _check_upload_cancelled(cancel_requested)
+            code = str(raw.get("code") or "")
+            if code != "0000":  # pragma: no cover - docs/testing-exemptions.md
+                message = str(raw.get("msg") or "WoPan upload failed")
+                LOGGER.warning(
+                    "wopan.upload_file.business_error parent_id=%s code=%s message=%s",
+                    parent_id,
+                    code,
+                    message,
+                )
+                raise WopanBusinessError(code, message)
+            data = raw.get("data")
+            if not isinstance(data, dict):
+                raise WopanResponseError("upload2C response data is not an object")
+            fid = str(data.get("fid") or "")
+            if not fid:
+                raise WopanResponseError("upload2C response missing fid")
+            LOGGER.info(
+                "wopan.upload_file.success parent_id=%s file_name_length=%s fid_present=%s",
+                parent_id,
+                len(file_name),
+                bool(fid),
+            )
+            return build_uploaded_file_item(
+                file_name=file_name,
+                parent_id=parent_id,
+                file_size=file_size,
+                fid=fid,
+            )
         except httpx.HTTPError:
             LOGGER.warning("wopan.upload_file.http_error parent_id=%s", parent_id)
             raise
         except (OSError, ValueError) as exc:
             LOGGER.warning("wopan.upload_file.response_error parent_id=%s", parent_id)
             raise WopanResponseError("upload2C response cannot be decoded") from exc
-
-        _check_upload_cancelled(cancel_requested)
-        code = str(raw.get("code") or "")
-        if code != "0000":  # pragma: no cover - docs/testing-exemptions.md
-            message = str(raw.get("msg") or "WoPan upload failed")
-            LOGGER.warning(
-                "wopan.upload_file.business_error parent_id=%s code=%s message=%s",
-                parent_id,
-                code,
-                message,
+        except WopanUploadCancelledError:
+            raise
+        except Exception as exc:
+            # Resumable uploads only: a part or response failure after the
+            # server already assembled the file can still mean success, so
+            # check the target directory listing before giving up. Fresh
+            # uploads (resume is None) never spend an extra request here.
+            if resume is None:
+                raise
+            recovered = self._recover_upload_item_on_error(
+                original_error=exc,
+                parent_id=parent_id,
+                file_name=file_name,
+                file_size=file_size,
             )
-            raise WopanBusinessError(code, message)
-        data = raw.get("data")
-        if not isinstance(data, dict):
-            raise WopanResponseError("upload2C response data is not an object")
-        fid = str(data.get("fid") or "")
-        if not fid:
-            raise WopanResponseError("upload2C response missing fid")
-        LOGGER.info(
-            "wopan.upload_file.success parent_id=%s file_name_length=%s fid_present=%s",
-            parent_id,
-            len(file_name),
-            bool(fid),
-        )
-        return WopanItem(
-            item_id=fid,
-            name=file_name,
-            kind=WopanItemKind.FILE,
-            parent_id=parent_id,
-            file_type=upload_file_type,
-            download_id=fid,
-            size=file_size,
-        )
+            if recovered is None:
+                raise
+            if progress_callback is not None:
+                progress_callback(file_size, file_size)
+            return recovered
+
+    def _recover_upload_item_from_listing(
+        self, *, parent_id: str, file_name: str, file_size: int
+    ) -> WopanItem | None:
+        """Find the finished upload in its target directory by name and size.
+
+        UAT (2026-09-26): once the server has assembled all parts the file
+        exists in the cloud even when the client never captured the fid from
+        the final part response. Only a FILE entry matching both the exact
+        name and the exact size counts, so an older same-name file is never
+        mistaken for this upload; same-name conflicts are already rejected by
+        the service layer's pre-upload check, so the first hit is taken.
+        Entries without a fid cannot yield a usable item and are ignored.
+        """
+        for item in self.list_files(parent_id):
+            if (
+                item.kind is WopanItemKind.FILE
+                and item.name == file_name
+                and item.size == file_size
+                and item.download_id
+            ):
+                return build_uploaded_file_item(
+                    file_name=file_name,
+                    parent_id=parent_id,
+                    file_size=file_size,
+                    fid=item.download_id,
+                )
+        return None
+
+    def _recover_upload_item_on_error(
+        self,
+        *,
+        original_error: Exception,
+        parent_id: str,
+        file_name: str,
+        file_size: int,
+    ) -> WopanItem | None:
+        """Best-effort listing recovery before re-raising a failed resumable upload.
+
+        A listing failure (network/decryption) must never mask the original
+        upload error: it is logged and ``None`` is returned so the caller can
+        re-raise the original exception.
+        """
+        try:
+            recovered = self._recover_upload_item_from_listing(
+                parent_id=parent_id, file_name=file_name, file_size=file_size
+            )
+        except Exception as recovery_error:
+            LOGGER.warning(
+                "wopan.upload_file.listing_recovery_failed parent_id=%s "
+                "original_error_type=%s recovery_error_type=%s",
+                parent_id,
+                type(original_error).__name__,
+                type(recovery_error).__name__,
+            )
+            return None
+        if recovered is not None:
+            LOGGER.info(
+                "wopan.upload_file.recovered_from_listing parent_id=%s "
+                "original_error_type=%s",
+                parent_id,
+                type(original_error).__name__,
+            )
+        return recovered
 
     def _upload_parts_parallel(
         self,
@@ -584,14 +740,22 @@ class WopanClient:
         max_attempts: int,
         progress_callback: UploadProgressCallback | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        completed_indexes: set[int] | frozenset[int] = frozenset(),
+        on_part_result: UploadPartResultCallback | None = None,
     ) -> dict[str, Any]:
         if total_parts <= 0:
             raise WopanResponseError("upload2C multipart upload produced no response")
         last_raw: dict[str, Any] | None = None
+        first_fid_raw: dict[str, Any] | None = None
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures: dict[Any, int] = {}
             file_size = local_path.stat().st_size
-            for part_index in range(1, total_parts + 1):
+            pending = pending_upload_indexes(total_parts, completed_indexes)
+            completed_bytes = sum(
+                min(part_size, max(0, file_size - (index - 1) * part_size))
+                for index in completed_indexes
+            )
+            for part_index in pending:
                 _check_upload_cancelled(cancel_requested)
                 offset = (part_index - 1) * part_size
                 part_length = min(part_size, max(0, file_size - offset))
@@ -607,9 +771,9 @@ class WopanClient:
                     part_index,
                     max_attempts,
                     cancel_requested,
+                    on_part_result,
                 )
                 futures[future] = part_length
-            completed_bytes = 0
             for future in as_completed(futures):
                 _check_upload_cancelled(cancel_requested)
                 try:
@@ -622,9 +786,11 @@ class WopanClient:
                 if progress_callback is not None:
                     progress_callback(completed_bytes, file_size)
                 last_raw = raw
+                if first_fid_raw is None and _extract_part_fid(raw):
+                    first_fid_raw = raw
         if last_raw is None:
             raise WopanResponseError("upload2C multipart upload produced no response")
-        return last_raw
+        return first_fid_raw if first_fid_raw is not None else last_raw
 
     def _upload_file_part(
         self,
@@ -638,6 +804,7 @@ class WopanClient:
         part_index: int,
         max_attempts: int,
         cancel_requested: Callable[[], bool] | None = None,
+        on_part_result: UploadPartResultCallback | None = None,
     ) -> dict[str, Any]:
         _check_upload_cancelled(cancel_requested)
         with local_path.open("rb") as file_obj:
@@ -652,6 +819,7 @@ class WopanClient:
             part_index,
             max_attempts,
             cancel_requested,
+            on_part_result,
         )
 
     def _upload_part(
@@ -664,6 +832,7 @@ class WopanClient:
         part_index: int,
         max_attempts: int,
         cancel_requested: Callable[[], bool] | None = None,
+        on_part_result: UploadPartResultCallback | None = None,
     ) -> dict[str, Any]:
         form_data = {
             **base_form_data,
@@ -693,6 +862,8 @@ class WopanClient:
                 if code != "0000":
                     message = str(raw.get("msg") or "WoPan upload failed")
                     raise WopanBusinessError(code, message)
+                if on_part_result is not None:
+                    on_part_result(part_index, _extract_part_fid(raw))
                 return raw
             except (httpx.HTTPError, WopanBusinessError) as exc:
                 _check_upload_cancelled(cancel_requested)
@@ -781,6 +952,58 @@ class WopanClient:
             raise WopanResponseError("GetDownloadUrl response missing downloadUrl")
         LOGGER.info("wopan.get_download_info.success download_id_present=%s", bool(download_id))
         return DownloadInfo(url=download_url)
+
+
+def resolve_upload_part_plan(file_size: int, upload_part_size_mb: int) -> tuple[int, int]:
+    """Return the single source of truth for ``(part_size, total_parts)``."""
+    part_size = _bounded_int(upload_part_size_mb, 5, 5, 16) * BYTES_PER_MB
+    total_parts = max(1, (file_size + part_size - 1) // part_size)
+    return part_size, total_parts
+
+
+def pending_upload_indexes(
+    total_parts: int, completed_indexes: Iterable[int] | None
+) -> list[int]:
+    """Return 1-based part indexes that still need an upload request."""
+    completed = set(completed_indexes or ())
+    return [index for index in range(1, total_parts + 1) if index not in completed]
+
+
+def _valid_completed_indexes(
+    resume: UploadResumeContext | None, total_parts: int
+) -> set[int]:
+    """Filter resume part indexes down to the valid 1..total_parts range."""
+    if resume is None:
+        return set()
+    return {
+        index for index in resume.completed_indexes if 1 <= index <= total_parts
+    }
+
+
+def _extract_part_fid(raw: dict[str, Any]) -> str:
+    data = raw.get("data")
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("fid") or "")
+
+
+def build_uploaded_file_item(
+    *,
+    file_name: str,
+    parent_id: str,
+    file_size: int,
+    fid: str,
+) -> WopanItem:
+    """Build the result item for one completed upload (shared with the app layer)."""
+    return WopanItem(
+        item_id=fid,
+        name=file_name,
+        kind=WopanItemKind.FILE,
+        parent_id=parent_id,
+        file_type=guess_upload_file_type(file_name),
+        download_id=fid,
+        size=file_size,
+    )
 
 
 def _sign(key: str, res_time: int, req_seq: int, channel: str) -> str:
@@ -959,7 +1182,7 @@ def _wopan_kind_value(kind: WopanItemKind) -> int:
     return 1
 
 
-def _guess_upload_file_type(name: str) -> str:
+def guess_upload_file_type(name: str) -> str:
     suffix = Path(name).suffix.lower().lstrip(".")
     if suffix in {"jpg", "jpeg", "png", "gif", "bmp", "webp"}:
         return "1"
@@ -970,6 +1193,10 @@ def _guess_upload_file_type(name: str) -> str:
     if suffix in {"doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf", "txt", "md"}:
         return "4"
     return "0"
+
+
+# Backwards-compatible private alias (existing tests reference the private name).
+_guess_upload_file_type = guess_upload_file_type
 
 
 def _read_wopan_timestamp(raw: dict[str, Any]) -> datetime | None:
