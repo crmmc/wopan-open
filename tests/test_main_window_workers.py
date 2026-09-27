@@ -2746,10 +2746,11 @@ def test_settings_change_propagates_to_browser(qapp: QApplication, tmp_path: Pat
     browser = WorkerFileBrowser()
     window = MainWindow(browser, settings_path=tmp_path / "settings.json")
 
-    window.setting_interface.download_threads_spin_box.setValue(8)
+    # Pick a value away from the default so the spin box actually emits.
+    window.setting_interface.download_threads_spin_box.setValue(10)
 
-    assert window.setting_interface.settings().max_download_threads == 8
-    assert browser.update_settings_calls[-1].max_download_threads == 8
+    assert window.setting_interface.settings().max_download_threads == 10
+    assert browser.update_settings_calls[-1].max_download_threads == 10
 
 
 def test_settings_change_ignores_non_settings_payload(qapp: QApplication) -> None:

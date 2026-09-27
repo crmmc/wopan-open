@@ -21,6 +21,7 @@ from openwopan.tasks.download import (
     DownloadTaskControl,
     DownloadTaskState,
     DownloadTaskStore,
+    make_download_task_id,
 )
 from openwopan.tasks.scheduler import DownloadCallbacks, DownloadScheduler, DownloadTaskInput
 from openwopan.tasks.upload import (
@@ -154,10 +155,20 @@ def test_file_browser_service_delegates_basic_operations() -> None:
 
 def test_file_browser_service_downloads_file_to_local_path(tmp_path: Path) -> None:
     requests: list[str] = []
+    content = b"download-content"
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(str(request.url))
-        return httpx.Response(200, content=b"download-content", headers={"Content-Length": "16"})
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(content))})
+        _, range_value = request.headers["Range"].split("=", 1)
+        start_text, end_text = range_value.split("-", 1)
+        start, end = int(start_text), int(end_text)
+        return httpx.Response(
+            206,
+            content=content[start : end + 1],
+            headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+        )
 
     client = FakeClient()
     service = FileBrowserService(  # type: ignore[arg-type]
@@ -180,9 +191,11 @@ def test_file_browser_service_downloads_file_to_local_path(tmp_path: Path) -> No
     )
 
     assert client.downloaded_item_ids == ["fid-1"]
-    assert requests == ["https://download.example.test/file"]
-    assert local_path.read_bytes() == b"download-content"
-    assert progress == [(16, 16)]
+    # 统一 Range 路径：HEAD 探测一次 + 单 Range GET 一次
+    assert requests.count("https://download.example.test/file") == 2
+    assert local_path.read_bytes() == content
+    # 统一 Range 路径进度：校验后初始 0 进度 + 分片 chunk 完成 + 合并完成
+    assert progress == [(0, 16), (16, 16), (16, 16)]
     assert not local_path.with_name("report.txt.part").exists()
 
 
@@ -237,11 +250,10 @@ def test_file_browser_service_downloads_file_with_ranges(
     assert requested_ranges == ["bytes=0-15", "bytes=16-16"]
 
 
-def test_file_browser_service_falls_back_when_range_is_unsupported(
+def test_file_browser_service_fails_when_range_is_unsupported(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("openwopan.tasks.download.BYTES_PER_MB", 4)
+    """R7：服务端忽略 Range 时明确失败，不再退回单流下载。"""
     content = b"abcdefghijklmnopq"
     requests: list[tuple[str, str | None]] = []
 
@@ -249,9 +261,7 @@ def test_file_browser_service_falls_back_when_range_is_unsupported(
         requests.append((request.method, request.headers.get("Range")))
         if request.method == "HEAD":
             return httpx.Response(200, headers={"Content-Length": str(len(content))})
-        if request.headers.get("Range") is not None:
-            return httpx.Response(200, content=content)
-        return httpx.Response(200, content=content, headers={"Content-Length": str(len(content))})
+        return httpx.Response(200, content=content)
 
     service = FileBrowserService(  # type: ignore[arg-type]
         FakeClient(),
@@ -261,6 +271,7 @@ def test_file_browser_service_falls_back_when_range_is_unsupported(
             download_part_mode="fixed",
             download_part_size_mb=4,
         ),
+        download_store=DownloadTaskStore(tmp_path / "store"),
     )
     item = WopanItem(
         item_id="file-1",
@@ -270,12 +281,13 @@ def test_file_browser_service_falls_back_when_range_is_unsupported(
     )
     local_path = tmp_path / "report.bin"
 
-    service.download_file(item, local_path)
+    with pytest.raises(FileBrowserError, match="服务器不支持断点续传下载"):
+        service.download_file(item, local_path)
 
-    assert local_path.read_bytes() == content
+    assert not local_path.exists()
     assert requests[0] == ("HEAD", None)
     assert any(method == "GET" and range_header is not None for method, range_header in requests)
-    assert requests[-1] == ("GET", None)
+    assert not any(method == "GET" and range_header is None for method, range_header in requests)
 
 
 def test_file_browser_service_uploads_file_to_parent(tmp_path: Path) -> None:
@@ -466,12 +478,19 @@ def test_file_browser_service_rejects_invalid_uploads(
 
 
 def test_file_browser_service_removes_partial_file_on_download_failure(tmp_path: Path) -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
+    content = b"0123456789abcdef"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(content))})
         return httpx.Response(404, content=b"not found")
 
+    store = DownloadTaskStore(tmp_path / "store")
     service = FileBrowserService(  # type: ignore[arg-type]
         FakeClient(),
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        settings=AppSettings(retry_max_attempts=0),
+        download_store=store,
     )
     item = WopanItem(
         item_id="file-1",
@@ -481,11 +500,13 @@ def test_file_browser_service_removes_partial_file_on_download_failure(tmp_path:
     )
     local_path = tmp_path / "report.txt"
 
-    with pytest.raises(FileBrowserError, match="HTTP 404"):
+    with pytest.raises(FileBrowserError, match="分片下载失败"):
         service.download_file(item, local_path)
 
     assert not local_path.exists()
     assert not local_path.with_name("report.txt.part").exists()
+    state = store.load(make_download_task_id("fid-1", local_path))
+    assert state is not None and state.status == "失败"
 
 
 def test_file_browser_service_maps_login_expiry() -> None:
@@ -519,9 +540,18 @@ def test_file_browser_service_refreshes_expired_download_url(
 
     def handler(request: httpx.Request) -> httpx.Response:
         get_calls.append(str(request.url))
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(content))})
         if str(request.url).endswith("/expired"):
             return httpx.Response(403)
-        return httpx.Response(200, content=content, headers={"Content-Length": str(len(content))})
+        _, range_value = request.headers["Range"].split("=", 1)
+        start_text, end_text = range_value.split("-", 1)
+        start, end = int(start_text), int(end_text)
+        return httpx.Response(
+            206,
+            content=content[start : end + 1],
+            headers={"Content-Range": f"bytes {start}-{end}/{len(content)}"},
+        )
 
     service = FileBrowserService(  # type: ignore[arg-type]
         RefreshingClient(),
