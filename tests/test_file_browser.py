@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import types
 from pathlib import Path
 
 import httpx
@@ -1144,6 +1145,20 @@ def test_service_upload_discards_state_on_mtime_change(
 ) -> None:
     """AC3 mtime 变化：旧进度清除，全新 uniqueId。"""
     monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    # unique_id 取 int(time.time() * 1000)，两次 upload_file 可能落入同一毫秒；
+    # 注入可控时钟保证两次调用之间至少前进 1ms。
+    clock_value = 1000.0
+
+    def fake_time() -> float:
+        nonlocal clock_value
+        clock_value += 0.002
+        return clock_value
+
+    fake_time_module = types.SimpleNamespace(
+        time=fake_time,
+        strftime=time.strftime,
+    )
+    monkeypatch.setattr("openwopan.app.file_browser.time", fake_time_module)
     service, client, _store = _resume_service(tmp_path)
     client.part_results = [(1, "fid-1")]
     client.upload_failure = WopanBusinessError("9999", "busy")

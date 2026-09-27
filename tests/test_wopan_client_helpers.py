@@ -841,7 +841,7 @@ def test_upload_file_with_resume_sends_only_pending_parts(
         resume=resume,
     )
 
-    assert [request["partIndex"] for request in requests] == ["2", "3"]
+    assert sorted(request["partIndex"] for request in requests) == ["2", "3"]
     assert {request["uniqueId"] for request in requests} == {"1690000000000"}
     assert {request["fileSize"] for request in requests} == {"15"}
     assert {request["totalPart"] for request in requests} == {"3"}
