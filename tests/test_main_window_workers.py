@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from PySide6.QtCore import QItemSelectionModel, QMimeData, QPoint, Qt, QThread, QUrl
@@ -29,7 +30,9 @@ from PySide6.QtWidgets import (
 
 import openwopan.ui.main_window as main_window_module
 from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError
+from openwopan.app.transfer_history import TransferHistoryAdapter
 from openwopan.storage.settings import AppSettings
+from openwopan.storage.transfer_records import TransferRecordStore
 from openwopan.tasks.download import DownloadTaskControl
 from openwopan.tasks.upload import (
     FolderUploadJob,
@@ -6539,3 +6542,478 @@ def test_recovered_upload_row_retry_uses_original_target(
 
     assert browser.uploaded_files == [("0", local_path)]
     assert browser.upload_names == ["persisted.bin"]
+
+
+# ---------------------------------------------------------------------------
+# Persistent transfer history (SQLite-backed restore across restarts)
+# ---------------------------------------------------------------------------
+
+
+class FakeTransferPersistence:
+    """Protocol double recording every persistence call."""
+
+    def __init__(self) -> None:
+        self.saved: list[TransferRecord] = []
+        self.progress_updates: list[tuple[str, str, int, int, float]] = []
+        self.deleted: list[tuple[str, set[str]]] = []
+        self.history: tuple[TransferRecord, ...] = ()
+        self.load_calls = 0
+
+    def save_record(self, record: TransferRecord) -> None:
+        self.saved.append(record)
+
+    def update_record_progress(
+        self,
+        direction: str,
+        task_id: str,
+        *,
+        bytes_done: int,
+        active_connections: int,
+        updated_at: float,
+    ) -> None:
+        self.progress_updates.append(
+            (direction, task_id, bytes_done, active_connections, updated_at)
+        )
+
+    def delete_records(self, direction: str, task_ids: Any) -> None:
+        self.deleted.append((direction, set(task_ids)))
+
+    def load_history(self) -> tuple[TransferRecord, ...]:
+        self.load_calls += 1
+        return self.history
+
+
+def _opened_store(tmp_path: Path) -> TransferRecordStore:
+    store = TransferRecordStore(tmp_path / "records.sqlite3")
+    store.open()
+    return store
+
+
+def _history_record(task_id: str, direction: str, **overrides: object) -> TransferRecord:
+    values: dict[str, object] = {
+        "task_id": task_id,
+        "direction": direction,
+        "name": f"{task_id}.bin",
+        "size": 10,
+        "target_path": Path(f"/tmp/{task_id}.bin"),
+        "status": "已完成",
+        "created_at_epoch": 1.0,
+        "updated_at_epoch": 2.0,
+    }
+    values.update(overrides)
+    return TransferRecord(**values)
+
+
+def test_update_record_persists_terminal_and_batches_progress(qapp: QApplication) -> None:
+    fake = FakeTransferPersistence()
+    interface = TransferInterface(persistence=fake)
+    record = TransferRecord(
+        task_id="upload-1", direction="upload", name="x.bin", size=100
+    )
+
+    interface.add_upload_record(record)
+    assert len(fake.saved) == 1
+
+    interface.update_record("upload", "upload-1", status="上传中")
+    assert len(fake.saved) == 2
+
+    interface.update_record("upload", "upload-1", bytes_done=50)
+    assert len(fake.saved) == 2
+    assert ("upload", "upload-1") in interface._persist_dirty
+
+    interface._flush_pending_record_persist()
+    assert fake.progress_updates == [
+        ("upload", "upload-1", 50, 0, record.updated_at_epoch)
+    ]
+    assert not interface._persist_timer.isActive()
+
+    interface.update_record("upload", "upload-1", status="已完成")
+    assert len(fake.saved) == 3
+    assert ("upload", "upload-1") not in interface._persist_dirty
+
+
+def test_restore_delivery_does_not_write_back(qapp: QApplication) -> None:
+    fake = FakeTransferPersistence()
+    interface = TransferInterface(persistence=fake)
+
+    interface.add_upload_record(
+        _history_record("upload-9", "upload"), render=False, persist=False
+    )
+
+    assert fake.saved == []
+    assert [row.task_id for row in interface.upload_records] == ["upload-9"]
+
+
+def test_remove_records_deletes_persisted_rows(qapp: QApplication) -> None:
+    fake = FakeTransferPersistence()
+    interface = TransferInterface(persistence=fake)
+    interface.add_download_record(
+        _history_record("download-1", "download", status="下载中")
+    )
+    interface.update_record("download", "download-1", bytes_done=5)
+
+    interface.remove_records("download", {"download-1"})
+
+    assert fake.deleted == [("download", {"download-1"})]
+    assert ("download", "download-1") not in interface._persist_dirty
+
+
+def test_flush_skips_records_removed_after_dirty_mark(qapp: QApplication) -> None:
+    fake = FakeTransferPersistence()
+    interface = TransferInterface(persistence=fake)
+    interface.add_download_record(_history_record("download-1", "download"))
+    interface.update_record("download", "download-1", bytes_done=5)
+    interface._persist_dirty.add(("download", "download-gone"))
+
+    interface.remove_records("download", {"download-1"})
+    interface._flush_pending_record_persist()
+
+    assert fake.progress_updates == []
+    assert not interface._persist_timer.isActive()
+
+
+def test_stop_record_persistence_flushes_pending_progress(qapp: QApplication) -> None:
+    fake = FakeTransferPersistence()
+    interface = TransferInterface(persistence=fake)
+    record = _history_record("download-1", "download", status="下载中")
+    interface.add_download_record(record)
+    interface.update_record("download", "download-1", bytes_done=7)
+    assert interface._persist_timer.isActive()
+
+    interface.stop_record_persistence()
+
+    assert fake.progress_updates == [
+        ("download", "download-1", 7, 0, record.updated_at_epoch)
+    ]
+    assert not interface._persist_timer.isActive()
+
+
+class HistoryRestoreBrowser(WorkerFileBrowser):
+    """Worker browser double without persisted download rows."""
+
+    def download_records(self) -> tuple[SimpleNamespace, ...]:
+        return ()
+
+
+def test_set_file_browser_restores_history_once_on_gui_thread(
+    qapp: QApplication,
+    sync_threads: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _opened_store(tmp_path)
+    seeder = TransferHistoryAdapter(store)
+    seeder.save_record(
+        _history_record(
+            "upload-3",
+            "upload",
+            status="失败",
+            upload_parent_id="0",
+            upload_retryable=True,
+        )
+    )
+    seeder.save_record(_history_record("download-5", "download"))
+    window = MainWindow(HistoryRestoreBrowser(), transfer_record_store=store)
+    renders: list[str] = []
+    monkeypatch.setattr(
+        window.transfer_interface, "_render_upload_table", lambda: renders.append("upload")
+    )
+    monkeypatch.setattr(
+        window.transfer_interface,
+        "_render_download_table",
+        lambda: renders.append("download"),
+    )
+
+    window.set_file_browser(HistoryRestoreBrowser())
+
+    assert renders == ["upload", "download"]
+    assert [row.task_id for row in window.transfer_interface.upload_records] == ["upload-3"]
+    assert [row.task_id for row in window.transfer_interface.download_records] == [
+        "download-5"
+    ]
+    upload_row = window.transfer_interface.upload_records[0]
+    assert upload_row.created_at_epoch == 1.0
+    assert upload_row.upload_retryable is True
+    assert window._transfer_sequence == 5
+    assert window._next_transfer_task_id("upload") == "upload-6"
+    store.close()
+
+
+def test_transfer_history_conflict_drops_restored_row(
+    qapp: QApplication,
+    sync_threads: None,
+    tmp_path: Path,
+) -> None:
+    store = _opened_store(tmp_path)
+    window = MainWindow(WorkerFileBrowser(), transfer_record_store=store)
+    live = TransferRecord(
+        task_id="upload-1", direction="upload", name="live.bin", size=1, status="上传中"
+    )
+    window.transfer_interface.add_upload_record(live)
+
+    window._on_transfer_history_loaded(
+        (_history_record("upload-1", "upload", name="stale.bin", status="失败"),)
+    )
+
+    rows = window.transfer_interface.upload_records
+    assert len(rows) == 1
+    assert rows[0] is live
+    db_rows = store.load_all()
+    assert len(db_rows) == 1
+    assert db_rows[0].name == "live.bin"
+    store.close()
+
+
+def test_recovered_download_row_upserts_restored_row(
+    qapp: QApplication,
+    sync_threads: None,
+    tmp_path: Path,
+) -> None:
+    store = _opened_store(tmp_path)
+    window = MainWindow(WorkerFileBrowser(), transfer_record_store=store)
+    window._on_transfer_history_loaded(
+        (
+            _history_record(
+                "download-1",
+                "download",
+                status="已暂停",
+                bytes_done=1,
+            ),
+        )
+    )
+    assert len(window.transfer_interface.download_records) == 1
+    # 恢复行是纯展示行：不自动续传、不注册控制对象（PRD Out of Scope）。
+    assert window.transfer_interface.download_records[0].can_resume is False
+    assert window._download_controls == {}
+    assert not window.transfer_interface._speed_sampler.isActive()
+
+    persisted = SimpleNamespace(
+        task_id="download-1",
+        name="download-1.bin",
+        target_path=Path("/tmp/download-1.bin"),
+        status="等待中",
+        total_bytes=9,
+        bytes_done=2,
+        active_connections=0,
+        max_connections=1,
+        supports_resume=False,
+    )
+    window._add_persisted_download_record(persisted, render=False)
+
+    rows = window.transfer_interface.download_records
+    assert len(rows) == 1
+    assert rows[0].status == "等待中"
+    db_rows = store.load_all()
+    assert len(db_rows) == 1
+    assert db_rows[0].status == "等待中"
+    store.close()
+
+
+def test_upload_recovery_upserts_restored_row(
+    qapp: QApplication,
+    sync_threads: None,
+    tmp_path: Path,
+) -> None:
+    store = _opened_store(tmp_path)
+    window = MainWindow(WorkerFileBrowser(), transfer_record_store=store)
+    window._on_transfer_history_loaded((_history_record("upload-1", "upload"),))
+
+    window._add_persisted_upload_record(_upload_recovery_record("upload-1"))
+
+    rows = window.transfer_interface.upload_records
+    assert len(rows) == 1
+    assert rows[0].status == "失败"
+    assert rows[0].upload_retryable is True
+    db_rows = store.load_all()
+    assert len(db_rows) == 1
+    assert db_rows[0].status == "失败"
+    store.close()
+
+
+def test_transfer_history_delivery_ignores_malformed_and_late_events(
+    qapp: QApplication,
+    sync_threads: None,
+    tmp_path: Path,
+) -> None:
+    store = _opened_store(tmp_path)
+    window = MainWindow(WorkerFileBrowser(), transfer_record_store=store)
+
+    window._on_transfer_history_loaded("not-a-tuple")
+    window._on_transfer_history_loaded((object(),))
+
+    assert window.transfer_interface.upload_records == []
+    assert window.transfer_interface.download_records == []
+
+    window._closing = True
+    window._on_transfer_history_loaded((_history_record("upload-1", "upload"),))
+
+    assert window.transfer_interface.upload_records == []
+    store.close()
+
+
+def test_transfer_history_load_failure_is_logged_only(
+    qapp: QApplication,
+    sync_threads: None,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _opened_store(tmp_path)
+    window = MainWindow(WorkerFileBrowser(), transfer_record_store=store)
+
+    with caplog.at_level(logging.WARNING, logger="openwopan.ui.main_window"):
+        window._on_transfer_history_failed("boom")
+
+    assert any(
+        "main_window.transfer_history.load_failed" in message for message in caplog.messages
+    )
+    store.close()
+
+
+def test_load_transfer_history_guards(
+    qapp: QApplication,
+    sync_threads: None,
+    tmp_path: Path,
+) -> None:
+    store = _opened_store(tmp_path)
+    window = MainWindow(WorkerFileBrowser(), transfer_record_store=store)
+    calls: list[int] = []
+    original_load = window._transfer_history.load_history
+
+    def counting_load() -> tuple[TransferRecord, ...]:
+        calls.append(1)
+        return original_load()
+
+    window._transfer_history.load_history = counting_load  # type: ignore[method-assign]
+
+    window.set_file_browser(WorkerFileBrowser())
+    assert calls == [1]
+    assert window._transfer_history_loaded is True
+
+    window._transfer_history_loaded = False
+    window._transfer_history_thread = cast(QThread, object())
+    window._load_transfer_history()
+    assert calls == [1]
+
+    window._transfer_history_thread = None
+    window._transfer_history_loaded = True
+    window._load_transfer_history()
+    assert calls == [1]
+    store.close()
+
+
+def test_load_transfer_history_without_store_is_noop(qapp: QApplication) -> None:
+    window = MainWindow()
+
+    window._load_transfer_history()
+
+    assert window._transfer_history_loaded is False
+    assert window._transfer_history_thread is None
+
+
+def test_broken_history_store_degrades_without_crashing(
+    qapp: QApplication,
+    sync_threads: None,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "records.sqlite3"
+    db_path.write_bytes(b"this is not a database" * 100)
+    window = MainWindow(
+        WorkerFileBrowser(), transfer_record_store=TransferRecordStore(db_path)
+    )
+
+    window.transfer_interface.add_upload_record(
+        TransferRecord(task_id="upload-1", direction="upload", name="x.bin", size=1)
+    )
+    window.transfer_interface.update_record("upload", "upload-1", status="已完成")
+    window.transfer_interface.remove_records("upload", {"upload-1"})
+
+    assert window.transfer_interface.upload_records == []
+
+
+def test_transfer_sequence_skips_non_numeric_ids(qapp: QApplication) -> None:
+    window = MainWindow()
+
+    window._raise_transfer_sequence("download", "abc123def456")
+    window._raise_transfer_sequence("upload", "upload-2")
+    window._raise_transfer_sequence("upload", "upload-0")
+
+    assert window._transfer_sequence == 2
+    assert window._next_transfer_task_id("upload") == "upload-3"
+
+
+def test_upload_file_flow_persists_record(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """上传单文件流程经汇聚点写入 SQLite（PRD AC：上传文件记录）。"""
+    store = _opened_store(tmp_path)
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser, transfer_record_store=store)
+    window.refresh_current_directory()
+    local_path = tmp_path / "movie.bin"
+    local_path.write_bytes(b"data")
+
+    window.upload_file_to_current_directory(
+        local_path, upload_name="movie.bin", _conflict_checked=True
+    )
+
+    assert browser.uploaded_files == [(ROOT_DIRECTORY_ID, local_path)]
+    rows = {row.task_id: row for row in store.load_all()}
+    assert len(rows) == 1
+    (row,) = rows.values()
+    assert row.direction == "upload"
+    assert row.name == "movie.bin"
+    assert row.status == "已完成"
+    assert row.local_path == str(local_path)
+    store.close()
+
+
+def test_folder_upload_flow_persists_root_and_child_records(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """上传文件夹流程：root 与逐文件记录分别落库（PRD AC：文件夹批量）。"""
+    store = _opened_store(tmp_path)
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser, transfer_record_store=store)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+
+    window.upload_folder_to_current_directory(local_root)
+
+    rows = {
+        row.name: row
+        for row in store.load_all()
+        if row.direction == "upload"
+    }
+    assert set(rows) == {"相册", "春节.md", "说明.txt"}
+    assert all(row.status == "已完成" for row in rows.values())
+    assert rows["春节.md"].local_path == str(local_root / "2024" / "春节.md")
+    assert rows["说明.txt"].local_path == str(local_root / "说明.txt")
+    store.close()
+
+
+def test_download_batch_flow_persists_records(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    """下载批量流程逐项写入 SQLite（PRD AC：下载批量记录）。"""
+    store = _opened_store(tmp_path)
+    window = MainWindow(WorkerFileBrowser(), transfer_record_store=store)
+    window.refresh_current_directory()
+    targets = [
+        (_file_item("file-a", "a.bin"), tmp_path / "a.bin"),
+        (_file_item("file-b", "b.bin"), tmp_path / "b.bin"),
+    ]
+
+    window._submit_resolved_download_items(targets, run_in_background=False)
+
+    rows = {row.task_id: row for row in store.load_all()}
+    live_ids = [
+        record.task_id for record in window.transfer_interface.download_records
+    ]
+    assert sorted(rows) == sorted(live_ids)
+    assert all(row.direction == "download" for row in rows.values())
+    assert [row.status for row in rows.values()] == ["已完成", "已完成"]
+    assert {row.local_path for row in rows.values()} == {str(path) for _, path in targets}
+    store.close()

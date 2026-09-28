@@ -103,6 +103,7 @@ def test_main_handles_session_marker_and_crash_dialogs(
         credential_store=object(),
         web_login_coordinator=object(),
         file_browser_factory=object(),
+        transfer_record_store=None,
     )
     monkeypatch.setattr(main_module, "load_app_settings", lambda: AppSettings())
     monkeypatch.setattr(main_module, "ensure_app_settings_file", lambda _settings: tmp_path)
