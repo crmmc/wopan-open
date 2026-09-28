@@ -816,6 +816,9 @@ class FileBrowserService:
 
     def update_settings(self, settings: AppSettings) -> None:
         """Apply updated transfer settings to future operations."""
+        self._download_scheduler.set_max_concurrent_downloads(
+            settings.max_concurrent_downloads
+        )
         self._settings = settings
 
     def download_records(self) -> tuple[DownloadTaskRecord, ...]:

@@ -432,6 +432,83 @@ def test_file_browser_service_updates_transfer_settings_for_future_uploads(
     ]
 
 
+def test_file_browser_service_syncs_runtime_download_settings(tmp_path: Path) -> None:
+    first_started = threading.Event()
+    second_started = threading.Event()
+    third_started = threading.Event()
+    release = threading.Event()
+    started_tasks: dict[str, DownloadTaskInput] = {}
+
+    def execute(
+        task: DownloadTaskInput,
+        _control: DownloadTaskControl,
+        _callbacks: DownloadCallbacks,
+    ) -> DownloadResult:
+        started_tasks[task.local_path.name] = task
+        if task.local_path.name == "first.txt":
+            first_started.set()
+        elif task.local_path.name == "second.txt":
+            second_started.set()
+        else:
+            third_started.set()
+        release.wait(5)
+        return DownloadResult("已完成", task.task_id, task.local_path)
+
+    old_settings = AppSettings(max_concurrent_downloads=1, max_download_threads=1)
+    new_settings = AppSettings(max_concurrent_downloads=2, max_download_threads=3)
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=execute)
+    service = FileBrowserService(
+        FakeClient(),
+        settings=old_settings,
+        download_store=DownloadTaskStore(tmp_path / "store"),
+        download_scheduler=scheduler,
+    )
+    item = WopanItem(
+        item_id="file-1",
+        name="report.txt",
+        kind=WopanItemKind.FILE,
+        download_id="fid-1",
+    )
+
+    try:
+        service.submit_download(item, tmp_path / "first.txt")
+        assert first_started.wait(1)
+        service.submit_download(item, tmp_path / "second.txt")
+
+        service.update_settings(new_settings)
+        service.submit_download(item, tmp_path / "third.txt")
+
+        assert second_started.wait(1)
+        assert started_tasks["first.txt"].settings is old_settings
+        assert started_tasks["second.txt"].settings is old_settings
+        release.set()
+        assert third_started.wait(1)
+        assert started_tasks["third.txt"].settings is new_settings
+    finally:
+        release.set()
+        service.close_downloads()
+
+
+def test_file_browser_service_keeps_settings_when_scheduler_update_fails(
+    tmp_path: Path,
+) -> None:
+    old_settings = AppSettings(max_concurrent_downloads=1)
+    new_settings = AppSettings(max_concurrent_downloads=2)
+    scheduler = DownloadScheduler(max_concurrent_downloads=1)
+    service = FileBrowserService(
+        FakeClient(),
+        settings=old_settings,
+        download_store=DownloadTaskStore(tmp_path / "store"),
+        download_scheduler=scheduler,
+    )
+
+    scheduler.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        service.update_settings(new_settings)
+
+    assert service._settings is old_settings
+
+
 def test_file_browser_service_returns_cloud_usage() -> None:
     client = FakeClient()
     service = FileBrowserService(client)  # type: ignore[arg-type]
