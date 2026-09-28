@@ -364,6 +364,8 @@ def download_url(
     if total_size is None:
         _mark_failed(store, state, callbacks, "无法获取文件大小，无法进行分片下载")
         raise DownloadError("无法获取文件大小，无法进行分片下载")
+    if total_size == 0:
+        return _complete_zero_byte_download(store, state, local_path, callbacks, control)
     part_size = state.part_size or _download_part_size(total_size, settings)
 
     try:
@@ -391,6 +393,57 @@ def download_url(
         store.cleanup_temp(task_id)
         _mark_failed(store, latest, callbacks, "服务器不支持断点续传下载")
         raise DownloadError("服务器不支持断点续传下载") from exc
+
+
+def _complete_zero_byte_download(
+    store: DownloadTaskStore,
+    state: DownloadTaskState,
+    local_path: Path,
+    callbacks: DownloadCallbacks,
+    control: DownloadTaskControl,
+) -> DownloadResult:
+    latest = store.load(state.task_id) or state
+    latest.total_bytes = 0
+    latest.bytes_done = 0
+    latest.part_size = None
+    latest.max_connections = 1
+    latest.supports_resume = False
+    latest.error = ""
+    latest.parts = []
+    latest.status = "下载中"
+    store.cleanup_temp(latest.task_id)
+    store.save(latest)
+    _emit_progress(callbacks, 0, 0)
+    _emit_status(callbacks, "下载中")
+
+    stop_result = control.stop_result()
+    if stop_result in ("paused", "cancelled"):
+        return _stop_range_download(stop_result, store, latest, callbacks, control)
+
+    empty_path = store.merged_path(latest.task_id)
+    try:
+        empty_path.parent.mkdir(parents=True, exist_ok=True)
+        empty_path.touch()
+        stop_result = control.stop_result()
+        if stop_result in ("paused", "cancelled"):
+            return _stop_range_download(stop_result, store, latest, callbacks, control)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        _replace_output_file(empty_path, local_path)
+    except DownloadError as exc:
+        store.cleanup_temp(latest.task_id)
+        _mark_failed(store, latest, callbacks, str(exc))
+        raise
+    except OSError as exc:
+        store.cleanup_temp(latest.task_id)
+        _mark_failed(store, latest, callbacks, "创建空下载文件失败")
+        raise DownloadError("创建空下载文件失败") from exc
+
+    latest.status = "已完成"
+    store.save(latest)
+    store.cleanup_temp(latest.task_id)
+    _emit_status(callbacks, "已完成")
+    _emit_connections(callbacks, 0, latest.max_connections)
+    return DownloadResult(status="已完成", task_id=latest.task_id, local_path=local_path)
 
 
 def _download_with_ranges(
@@ -612,9 +665,7 @@ def _download_range_part(
     for attempt in range(attempts):
         stop_result = control.stop_result()
         if stop_result is not None:
-            return _stop_range_part(
-                stop_result, store, task_id, part, temp_path, progress_callback
-            )
+            return _stop_range_part(stop_result, store, task_id, part, temp_path, progress_callback)
         bytes_done = resume_size if attempt == 0 else 0
         md5 = hashlib.md5()
         if bytes_done:
@@ -885,7 +936,7 @@ def _probe_download_size(http_client: httpx.Client, url: str) -> int | None:
         LOGGER.info("download.head_unavailable")
         return None
     content_length = _read_content_length(response.headers.get("Content-Length"))
-    if content_length is None or content_length <= 0:
+    if content_length is None:
         return None
     return content_length
 
@@ -1042,7 +1093,7 @@ def _read_task_state(raw: dict[str, Any]) -> DownloadTaskState | None:
         save_path=Path(save_path_text),
         status=_read_status(raw.get("status")),
         download_id=_read_text(raw.get("download_id")) or None,
-        total_bytes=_read_optional_positive_int(raw.get("total_bytes")),
+        total_bytes=_read_optional_non_negative_int(raw.get("total_bytes")),
         bytes_done=_read_non_negative_int(raw.get("bytes_done")),
         part_size=_read_optional_positive_int(raw.get("part_size")),
         max_connections=max(1, _read_non_negative_int(raw.get("max_connections"))),
@@ -1103,6 +1154,19 @@ def _read_non_negative_int(value: object) -> int:
         except ValueError:
             return 0
     return 0
+
+
+def _read_optional_non_negative_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return None
+    return None
 
 
 def _read_optional_positive_int(value: object) -> int | None:

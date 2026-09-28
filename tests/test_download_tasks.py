@@ -23,6 +23,7 @@ from openwopan.tasks.download import (
     _merge_parts,
     _read_content_length,
     _read_non_negative_int,
+    _read_optional_non_negative_int,
     _read_optional_positive_int,
     _read_status,
     _read_task_state,
@@ -673,6 +674,166 @@ def test_download_missing_file_size_fails_without_fallback(tmp_path: Path) -> No
     assert not (tmp_path / "out.bin").exists()
 
 
+def test_download_zero_byte_file_completes_without_range_request(tmp_path: Path) -> None:
+    requests: list[tuple[str, str | None]] = []
+    statuses: list[str] = []
+    progress: list[tuple[int, int | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.headers.get("Range")))
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": "0"})
+        return httpx.Response(500)
+
+    store = DownloadTaskStore(tmp_path / "store")
+    target = tmp_path / "empty.bin"
+    result = download_url(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        "https://download.example.test/empty",
+        target,
+        settings=AppSettings(),
+        store=store,
+        task_id="empty-task",
+        file_name="empty.bin",
+        callbacks=DownloadCallbacks(
+            progress=lambda done, total: progress.append((done, total)),
+            status=statuses.append,
+        ),
+    )
+
+    assert result.status == "已完成"
+    assert target.exists()
+    assert target.stat().st_size == 0
+    assert requests == [("HEAD", None)]
+    assert (0, 0) in progress
+    assert statuses[-1] == "已完成"
+    assert not store.task_temp_dir("empty-task").exists()
+    state = store.load("empty-task")
+    assert state is not None
+    assert state.status == "已完成"
+    assert state.bytes_done == 0
+    assert state.total_bytes == 0
+    assert state.error == ""
+    assert state.parts == []
+
+
+def test_download_zero_byte_file_preserves_existing_target(tmp_path: Path) -> None:
+    target = tmp_path / "empty.bin"
+    target.write_bytes(b"keep this file")
+    store = DownloadTaskStore(tmp_path / "store")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": "0"})
+        pytest.fail("zero-byte download must not send a GET request")
+
+    with pytest.raises(DownloadError, match="下载目标已存在"):
+        download_url(
+            httpx.Client(transport=httpx.MockTransport(handler)),
+            "https://download.example.test/empty",
+            target,
+            settings=AppSettings(),
+            store=store,
+            task_id="empty-conflict",
+            file_name="empty.bin",
+        )
+
+    assert target.read_bytes() == b"keep this file"
+    state = store.load("empty-conflict")
+    assert state is not None
+    assert state.status == "失败"
+    assert state.error == "下载目标已存在，请重新选择保存路径"
+    assert not store.task_temp_dir("empty-conflict").exists()
+
+
+def test_download_zero_byte_temp_creation_failure_marks_task_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = DownloadTaskStore(tmp_path / "store")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": "0"})
+        pytest.fail("zero-byte download must not send a GET request")
+
+    def fail_touch(_path: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "touch", fail_touch)
+    with pytest.raises(DownloadError, match="创建空下载文件失败"):
+        download_url(
+            httpx.Client(transport=httpx.MockTransport(handler)),
+            "https://download.example.test/empty",
+            tmp_path / "empty.bin",
+            settings=AppSettings(),
+            store=store,
+            task_id="empty-failure",
+            file_name="empty.bin",
+        )
+
+    state = store.load("empty-failure")
+    assert state is not None
+    assert state.status == "失败"
+    assert state.error == "创建空下载文件失败"
+    assert not store.task_temp_dir("empty-failure").exists()
+
+
+@pytest.mark.parametrize("stop", ["pause", "cancel"])
+@pytest.mark.parametrize("after_temp_creation", [False, True])
+def test_download_zero_byte_file_stops_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: str,
+    after_temp_creation: bool,
+) -> None:
+    store = DownloadTaskStore(tmp_path / "store")
+    control = DownloadTaskControl()
+    target = tmp_path / "empty.bin"
+
+    def request_stop() -> None:
+        if stop == "pause":
+            control.request_pause()
+        else:
+            control.request_cancel()
+
+    if after_temp_creation:
+        original_touch = Path.touch
+
+        def touch_and_stop(path: Path) -> None:
+            original_touch(path)
+            request_stop()
+
+        monkeypatch.setattr(Path, "touch", touch_and_stop)
+    else:
+        request_stop()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": "0"})
+        pytest.fail("zero-byte download must not send a GET request")
+
+    result = download_url(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        "https://download.example.test/empty",
+        target,
+        settings=AppSettings(),
+        store=store,
+        task_id="empty-stop",
+        file_name="empty.bin",
+        control=control,
+    )
+
+    assert result.status == ("已暂停" if stop == "pause" else "已取消")
+    assert not target.exists()
+    assert not store.merged_path("empty-stop").exists()
+    state = store.load("empty-stop")
+    assert state is not None
+    assert state.status == result.status
+    assert state.total_bytes == 0
+    assert state.bytes_done == 0
+    assert state.parts == []
+
+
 def test_download_single_worker_uses_unified_range_path(tmp_path: Path) -> None:
     """max_download_threads=1 也只是 Range 分片 executor 的单 worker 配置。"""
     requested_ranges: list[str] = []
@@ -807,9 +968,7 @@ def test_stop_during_stream_read_is_not_reported_as_failure(
         headers = {}
         if response_status == 206:
             start, end = _parse_range(request.headers["Range"])
-            headers["Content-Range"] = (
-                f"bytes {start}-{end}/{download.DOWNLOAD_CHUNK_SIZE + 1}"
-            )
+            headers["Content-Range"] = f"bytes {start}-{end}/{download.DOWNLOAD_CHUNK_SIZE + 1}"
         return httpx.Response(response_status, headers=headers, stream=InterruptedStream())
 
     def progress(done: int, _total: int | None) -> None:
@@ -1297,11 +1456,7 @@ def test_validate_existing_parts_rejects_invalid_partial_checkpoints(
         )
     actual_size = 9 if case == "too_large" else 4
     md5 = (
-        "f" * 32
-        if case == "md5"
-        else _compute_md5(partial_path)
-        if case != "missing"
-        else "0" * 32
+        "f" * 32 if case == "md5" else _compute_md5(partial_path) if case != "missing" else "0" * 32
     )
     state = _state(
         task_id="t1",
@@ -1401,18 +1556,28 @@ def test_probe_download_size_handles_head_failures(tmp_path: Path) -> None:
         return httpx.Client(transport=httpx.MockTransport(handler))
 
     assert _probe_download_size(make(lambda _r: httpx.Response(500)), "https://x.test/f") is None
-    assert _probe_download_size(
-        make(lambda _r: httpx.Response(200, headers={})), "https://x.test/f"
-    ) is None
-    assert _probe_download_size(
-        make(lambda _r: httpx.Response(200, headers={"Content-Length": "abc"})), "https://x.test/f"
-    ) is None
-    assert _probe_download_size(
-        make(lambda _r: httpx.Response(200, headers={"Content-Length": "-3"})), "https://x.test/f"
-    ) is None
+    assert (
+        _probe_download_size(make(lambda _r: httpx.Response(200, headers={})), "https://x.test/f")
+        is None
+    )
     assert (
         _probe_download_size(
-            make(lambda _r: httpx.Response(200, headers={"Content-Length": "7"})), "https://x.test/f"
+            make(lambda _r: httpx.Response(200, headers={"Content-Length": "abc"})),
+            "https://x.test/f",
+        )
+        is None
+    )
+    assert (
+        _probe_download_size(
+            make(lambda _r: httpx.Response(200, headers={"Content-Length": "-3"})),
+            "https://x.test/f",
+        )
+        is None
+    )
+    assert (
+        _probe_download_size(
+            make(lambda _r: httpx.Response(200, headers={"Content-Length": "7"})),
+            "https://x.test/f",
         )
         == 7
     )
@@ -1457,6 +1622,23 @@ def test_read_non_negative_int(value: object, expected: int) -> None:
 )
 def test_read_optional_positive_int(value: object, expected: int | None) -> None:
     assert _read_optional_positive_int(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        (0, 0),
+        (5, 5),
+        (-3, 0),
+        ("7", 7),
+        ("bad", None),
+        (1.5, None),
+    ],
+)
+def test_read_optional_non_negative_int(value: object, expected: int | None) -> None:
+    assert _read_optional_non_negative_int(value) == expected
 
 
 def test_read_task_state_rejects_incomplete_payload() -> None:
