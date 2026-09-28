@@ -6,11 +6,11 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from PySide6.QtCore import (
     QItemSelectionModel,
@@ -86,6 +86,7 @@ from openwopan.app.file_browser import (
 from openwopan.app.logging_config import app_log_path, set_logging_level
 from openwopan.auth.session import AuthSession
 from openwopan.storage.settings import AppSettings, app_settings_path, save_app_settings
+from openwopan.storage.transfer_records import TransferRecordStore
 from openwopan.tasks.download import DownloadTaskControl, DownloadTaskRecord
 from openwopan.tasks.scheduler import DownloadTaskEvent
 from openwopan.tasks.transfer_rate import TransferRateEstimator
@@ -763,6 +764,10 @@ class TransferRecord:
     upload_retryable: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
+    # Wall-clock epochs persisted by the history store; the monotonic fields
+    # above stay process-local and keep serving the speed sampler.
+    created_at_epoch: float = 0.0
+    updated_at_epoch: float = 0.0
 
     def __post_init__(self) -> None:
         now = time.monotonic()
@@ -770,6 +775,11 @@ class TransferRecord:
             self.created_at = now
         if self.updated_at <= 0:
             self.updated_at = self.created_at
+        wall_now = time.time()
+        if self.created_at_epoch <= 0:
+            self.created_at_epoch = wall_now
+        if self.updated_at_epoch <= 0:
+            self.updated_at_epoch = self.created_at_epoch
 
     @property
     def progress_percent(self) -> int:
@@ -779,6 +789,34 @@ class TransferRecord:
         if not total or total <= 0:
             return 0
         return max(0, min(100, int(self.bytes_done * 100 / total)))
+
+
+class TransferRecordPersistence(Protocol):
+    """Persistence contract for transfer records (UI-side, Qt-free boundary).
+
+    Implementations live in the app layer and must never raise: persistence is
+    best-effort, and a failed write degrades to the in-memory row.
+    """
+
+    def save_record(self, record: TransferRecord) -> None:
+        """Upsert one full record row."""
+
+    def update_record_progress(
+        self,
+        direction: str,
+        task_id: str,
+        *,
+        bytes_done: int,
+        active_connections: int,
+        updated_at: float,
+    ) -> None:
+        """Persist progress-only fields of one row (no-op when the row is gone)."""
+
+    def delete_records(self, direction: str, task_ids: Iterable[str]) -> None:
+        """Delete rows by (direction, task id)."""
+
+    def load_history(self) -> tuple[TransferRecord, ...]:
+        """Load all persisted rows ordered by update time ascending."""
 
 
 @dataclass(slots=True)
@@ -806,6 +844,7 @@ class TransferInterface(QWidget):
 
     PROGRESS_RENDER_INTERVAL_MS = 150
     SPEED_SAMPLE_INTERVAL_MS = 1000
+    PROGRESS_PERSIST_INTERVAL_MS = 2000
     # Statuses during which bytes are expected to flow; only these are sampled.
     # Waiting/creating-dir/verifying/merging/paused/terminal tasks show no
     # active speed (R5).
@@ -822,7 +861,12 @@ class TransferInterface(QWidget):
     resume_downloads_requested = Signal(object)
     retry_upload_requested = Signal(object)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        persistence: TransferRecordPersistence | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("TransferInterface")
         self.upload_records: list[TransferRecord] = []
@@ -840,6 +884,13 @@ class TransferInterface(QWidget):
         self._speed_sampler = QTimer(self)
         self._speed_sampler.setInterval(self.SPEED_SAMPLE_INTERVAL_MS)
         self._speed_sampler.timeout.connect(self._sample_speeds)
+        # History persistence: progress-only writes coalesce behind a 2 s tick;
+        # status/error/terminal/add/remove writes stay immediate (design.md 3).
+        self._persistence = persistence
+        self._persist_dirty: set[tuple[str, str]] = set()
+        self._persist_timer = QTimer(self)
+        self._persist_timer.setInterval(self.PROGRESS_PERSIST_INTERVAL_MS)
+        self._persist_timer.timeout.connect(self._flush_pending_record_persist)
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(24, 20, 24, 24)
         self._main_layout.setSpacing(12)
@@ -850,17 +901,26 @@ class TransferInterface(QWidget):
         self._render_all()
         self._on_segment_changed("download")
 
-    def add_upload_record(self, record: TransferRecord) -> None:
+    def add_upload_record(
+        self, record: TransferRecord, *, render: bool = True, persist: bool = True
+    ) -> None:
         """Add or replace an upload task row."""
         self._on_record_added("upload", record)
         self._upsert_record(self.upload_records, record)
-        self.flush_progress_render()
-        self._render_upload_table()
+        if persist:
+            self._save_record(record)
+        if render:
+            self.flush_progress_render()
+            self._render_upload_table()
 
-    def add_download_record(self, record: TransferRecord, *, render: bool = True) -> None:
+    def add_download_record(
+        self, record: TransferRecord, *, render: bool = True, persist: bool = True
+    ) -> None:
         """Add or replace a download task row."""
         self._on_record_added("download", record)
         self._upsert_record(self.download_records, record)
+        if persist:
+            self._save_record(record)
         if render:
             self.flush_progress_render()
             self._render_download_table()
@@ -929,14 +989,60 @@ class TransferInterface(QWidget):
             if record.status in self.SAMPLING_STATUSES:
                 self._ensure_speed_sampler()
         record.updated_at = now
+        record.updated_at_epoch = time.time()
         if record.status in TERMINAL_TRANSFER_STATUSES:
             self._discard_pending_progress(direction)
+            self._save_record(record)
             self._render_direction(direction)
         elif progress_only:
+            self._mark_record_progress_dirty(direction, task_id)
             self._schedule_progress_render(direction)
         else:
             self._discard_pending_progress(direction)
+            self._save_record(record)
             self._render_direction(direction)
+
+    def _save_record(self, record: TransferRecord) -> None:
+        """Write one full record row through the persistence boundary (best-effort)."""
+        self._persist_dirty.discard((record.direction, record.task_id))
+        if self._persistence is not None:
+            self._persistence.save_record(record)
+
+    def _mark_record_progress_dirty(self, direction: str, task_id: str) -> None:
+        """Queue one progress-only write behind the 2-second persistence tick."""
+        if self._persistence is None:
+            return
+        self._persist_dirty.add((direction, task_id))
+        if not self._persist_timer.isActive():
+            self._persist_timer.start()
+
+    def _flush_pending_record_persist(self) -> None:
+        """Write every pending progress-only row through the persistence boundary."""
+        if not self._persist_dirty:
+            self._persist_timer.stop()
+            return
+        pending = tuple(self._persist_dirty)
+        self._persist_dirty.clear()
+        for direction, task_id in pending:
+            record = self._find_record(direction, task_id)
+            # A removed record's row is already deleted from the database by
+            # remove_records; a late flush must not resurrect it.
+            if record is None or self._persistence is None:
+                continue
+            self._persistence.update_record_progress(
+                direction,
+                task_id,
+                bytes_done=record.bytes_done,
+                active_connections=record.active_connections,
+                updated_at=record.updated_at_epoch,
+            )
+        if not self._persist_dirty:
+            self._persist_timer.stop()
+
+    def stop_record_persistence(self) -> None:
+        """Flush pending progress writes and stop the tick; called on window close."""
+        self._persist_timer.stop()
+        self._flush_pending_record_persist()
 
     def _discard_pending_progress(self, direction: str) -> None:
         """Drop one direction's pending coalesced render; the caller renders it now."""
@@ -1031,6 +1137,9 @@ class TransferInterface(QWidget):
             self._render_download_table()
         for task_id in task_ids:
             self._speed_estimators.pop((direction, task_id), None)
+            self._persist_dirty.discard((direction, task_id))
+        if self._persistence is not None:
+            self._persistence.delete_records(direction, task_ids)
 
     def active_download_folder(self) -> Path | None:
         """Return selected download folder or the latest download folder."""
@@ -2341,6 +2450,7 @@ class MainWindow(_MainWindowBase):
         settings: AppSettings | None = None,
         settings_path: Path | None = None,
         log_path: Path | None = None,
+        transfer_record_store: TransferRecordStore | None = None,
     ) -> None:
         super().__init__()
         self._file_browser = file_browser
@@ -2420,6 +2530,10 @@ class MainWindow(_MainWindowBase):
         self._folder_prepare_pending: list[PendingFolderUpload] = []
         self._closing = False
         self._transfer_sequence = 0
+        self._transfer_history: TransferRecordPersistence | None = None
+        self._transfer_history_thread: QThread | None = None
+        self._transfer_history_worker: BrowserOperationWorker | None = None
+        self._transfer_history_loaded = False
         self._scan_thread: QThread | None = None
         self._scan_worker: UploadScanWorker | None = None
         self._upload_scan_pending: list[tuple[tuple[Path, ...], str]] = []
@@ -2439,7 +2553,13 @@ class MainWindow(_MainWindowBase):
         self.setMinimumSize(*MAIN_WINDOW_MINIMUM_SIZE)
 
         self.file_interface = FileInterface(self)
-        self.transfer_interface = TransferInterface(self)
+        if transfer_record_store is not None:
+            # Local import: app.transfer_history imports TransferRecord from this
+            # module, so a module-level import would be circular.
+            from openwopan.app.transfer_history import TransferHistoryAdapter
+
+            self._transfer_history = TransferHistoryAdapter(transfer_record_store)
+        self.transfer_interface = TransferInterface(self, persistence=self._transfer_history)
         self.account_interface = AccountInterface(self)
         self.setting_interface = SettingsInterface(
             self._settings,
@@ -2478,6 +2598,7 @@ class MainWindow(_MainWindowBase):
         running: list[tuple[QThread, str, str | None]] = []
         self._closing = True
         self.transfer_interface.stop_speed_sampler()
+        self.transfer_interface.stop_record_persistence()
         if self._folder_prepare_cancel is not None:
             self._folder_prepare_cancel.set()
         close_downloads = getattr(self._file_browser, "close_downloads", None)
@@ -2529,6 +2650,7 @@ class MainWindow(_MainWindowBase):
             (self._download_target_thread, "download_target", None),
             (self._download_recovery_thread, "download_recovery", None),
             (self._upload_recovery_thread, "upload_recovery", None),
+            (self._transfer_history_thread, "transfer_history", None),
             (self._download_close_thread, "download_close", None),
             (self._download_operation_thread, "download_operation", None),
             (self._scan_thread, "upload_scan", None),
@@ -2704,12 +2826,99 @@ class MainWindow(_MainWindowBase):
         set_callback = getattr(file_browser, "set_download_event_callback", None)
         if callable(set_callback):
             set_callback(self._receive_download_event)
+            self._load_transfer_history()
             self._recover_downloads()
         else:
+            self._load_transfer_history()
             self._load_persisted_download_records()
         self._recover_uploads()
         self.refresh_root()
         self.refresh_cloud_usage()
+
+    def _load_transfer_history(self) -> None:
+        """Load persisted transfer history once per session on a worker thread."""
+        if (
+            self._transfer_history is None
+            or self._transfer_history_loaded
+            or self._transfer_history_thread is not None
+        ):
+            return
+        self._transfer_history_loaded = True
+        thread = QThread(self)
+        worker = BrowserOperationWorker(self._transfer_history.load_history)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_transfer_history_loaded)
+        worker.failed.connect(self._on_transfer_history_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_transfer_history)
+        self._transfer_history_thread = thread
+        self._transfer_history_worker = worker
+        thread.start()
+
+    def _on_transfer_history_loaded(self, result: object) -> None:
+        if not isinstance(result, tuple) or self._closing:
+            return
+        uploads: list[TransferRecord] = []
+        downloads: list[TransferRecord] = []
+        for record in result:
+            if not isinstance(record, TransferRecord):
+                continue
+            if (
+                self.transfer_interface._find_record(record.direction, record.task_id)
+                is not None
+            ):
+                # Same id is already alive this session (user-created race): the
+                # restored row is dropped and its database row deleted; the live
+                # record re-upserts its own row right away so its history is not
+                # lost (design.md 4).
+                if self._transfer_history is not None:
+                    self._transfer_history.delete_records(
+                        record.direction, [record.task_id]
+                    )
+                    live_record = self.transfer_interface._find_record(
+                        record.direction, record.task_id
+                    )
+                    if live_record is not None:
+                        self.transfer_interface._save_record(live_record)
+                LOGGER.warning(
+                    "main_window.transfer_history.conflict_dropped "
+                    "direction=%s task_id=%s",
+                    record.direction,
+                    record.task_id,
+                )
+                continue
+            self._raise_transfer_sequence(record.direction, record.task_id)
+            if record.direction == "upload":
+                uploads.append(record)
+            else:
+                downloads.append(record)
+        for record in uploads:
+            self.transfer_interface.add_upload_record(record, render=False, persist=False)
+        for record in downloads:
+            self.transfer_interface.add_download_record(record, render=False, persist=False)
+        if uploads:
+            self.transfer_interface._render_upload_table()
+        if downloads:
+            self.transfer_interface._render_download_table()
+
+    def _raise_transfer_sequence(self, direction: str, task_id: str) -> None:
+        """Lift the id sequence above restored numeric ids to avoid collisions."""
+        match = re.fullmatch(rf"{direction}-(\d+)", task_id)
+        if match is None:
+            return
+        number = int(match.group(1))
+        if number > self._transfer_sequence:
+            self._transfer_sequence = number
+
+    def _on_transfer_history_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.transfer_history.load_failed error=%s", message)
+
+    def _clear_transfer_history(self) -> None:
+        self._delete_finished_thread()
+        self._transfer_history_thread = None
+        self._transfer_history_worker = None
 
     def set_auth_session(self, session: AuthSession) -> None:
         """Attach a safe authenticated-session summary to the UI."""

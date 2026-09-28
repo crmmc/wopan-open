@@ -104,8 +104,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         web_login_coordinator=dependencies.web_login_coordinator,
         file_browser_factory=dependencies.file_browser_factory,
         settings=settings,
+        transfer_record_store=dependencies.transfer_record_store,
     )
-    window = MainWindow(settings=settings, settings_path=settings_path, log_path=log_path)
+    window = MainWindow(
+        settings=settings,
+        settings_path=settings_path,
+        log_path=log_path,
+        transfer_record_store=dependencies.transfer_record_store,
+    )
     controller = ApplicationController(dependencies, window, _build_login_window, app.quit)
 
     if is_smoke_test:
