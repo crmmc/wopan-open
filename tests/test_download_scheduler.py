@@ -100,6 +100,132 @@ def test_scheduler_is_fifo_and_refills_slots(tmp_path: Path) -> None:
         scheduler.close()
 
 
+def test_scheduler_increases_limit_and_refills_fifo_queue(tmp_path: Path) -> None:
+    task_ids = ("one", "two", "three", "four", "five")
+    started: set[str] = set()
+    scheduled: list[str] = []
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    releases = {task_id: threading.Event() for task_id in task_ids}
+
+    def execute(
+        task: DownloadTaskInput, _control: DownloadTaskControl, _callbacks: DownloadCallbacks
+    ) -> DownloadResult:
+        nonlocal active, maximum
+        with lock:
+            started.add(task.task_id)
+            active += 1
+            maximum = max(maximum, active)
+        releases[task.task_id].wait(5)
+        with lock:
+            active -= 1
+        return DownloadResult("已完成", task.task_id, task.local_path)
+
+    scheduler = DownloadScheduler(
+        max_concurrent_downloads=1,
+        executor=execute,
+        on_event=lambda event: scheduled.append(event.task_id)
+        if event.status == "下载中" else None,
+    )
+    try:
+        for task_id in task_ids:
+            scheduler.submit(_task(tmp_path, task_id))
+        _wait_for(lambda: started == {"one"})
+
+        scheduler.set_max_concurrent_downloads(5)
+
+        _wait_for(lambda: started == set(task_ids))
+        assert scheduled == list(task_ids)
+        assert maximum == 5
+        for release in releases.values():
+            release.set()
+        _wait_for(lambda: all(scheduler.state(task_id).status == "已完成" for task_id in task_ids))
+    finally:
+        for release in releases.values():
+            release.set()
+        scheduler.close()
+
+
+def test_scheduler_decreasing_limit_waits_for_active_tasks(tmp_path: Path) -> None:
+    task_ids = ("one", "two", "three")
+    started: set[str] = set()
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    releases = {task_id: threading.Event() for task_id in task_ids}
+
+    def execute(
+        task: DownloadTaskInput, _control: DownloadTaskControl, _callbacks: DownloadCallbacks
+    ) -> DownloadResult:
+        nonlocal active, maximum
+        with lock:
+            started.add(task.task_id)
+            active += 1
+            maximum = max(maximum, active)
+        releases[task.task_id].wait(5)
+        with lock:
+            active -= 1
+        return DownloadResult("已完成", task.task_id, task.local_path)
+
+    scheduler = DownloadScheduler(max_concurrent_downloads=2, executor=execute)
+    try:
+        for task_id in task_ids:
+            scheduler.submit(_task(tmp_path, task_id))
+        _wait_for(lambda: started == {"one", "two"})
+
+        scheduler.set_max_concurrent_downloads(1)
+        releases["one"].set()
+        _wait_for(lambda: scheduler.state("one").status == "已完成")
+        assert started == {"one", "two"}
+        assert scheduler.state("two").status == "下载中"
+        assert scheduler.state("three").status == "等待中"
+
+        releases["two"].set()
+        _wait_for(lambda: started == set(task_ids))
+        releases["three"].set()
+        _wait_for(lambda: scheduler.state("three").status == "已完成")
+        assert maximum == 2
+    finally:
+        for release in releases.values():
+            release.set()
+        scheduler.close()
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1, 6])
+def test_scheduler_rejects_invalid_update_without_refilling_queue(
+    tmp_path: Path, invalid_limit: int
+) -> None:
+    started: list[str] = []
+    release = threading.Event()
+
+    def execute(
+        task: DownloadTaskInput, _control: DownloadTaskControl, _callbacks: DownloadCallbacks
+    ) -> DownloadResult:
+        started.append(task.task_id)
+        release.wait(5)
+        return DownloadResult("已完成", task.task_id, task.local_path)
+
+    scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=execute)
+    try:
+        scheduler.submit(_task(tmp_path, "one"))
+        scheduler.submit(_task(tmp_path, "two"))
+        _wait_for(lambda: started == ["one"])
+
+        with pytest.raises(ValueError, match="positive|capacity"):
+            scheduler.set_max_concurrent_downloads(invalid_limit)
+        assert scheduler.state("two").status == "等待中"
+
+        scheduler.submit(_task(tmp_path, "three"))
+        assert scheduler.state("three").status == "等待中"
+        scheduler.set_max_concurrent_downloads(2)
+        _wait_for(lambda: "two" in started)
+        assert scheduler.state("three").status == "等待中"
+    finally:
+        release.set()
+        scheduler.close()
+
+
 def test_scheduler_rejects_invalid_and_closed_submission(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="positive"):
         DownloadScheduler(max_concurrent_downloads=0)
@@ -107,8 +233,13 @@ def test_scheduler_rejects_invalid_and_closed_submission(tmp_path: Path) -> None
     scheduler = DownloadScheduler(max_concurrent_downloads=1, executor=lambda *_: DownloadResult(
         "已完成", "unused", Path("unused")
     ))
+    with pytest.raises(ValueError, match="positive"):
+        scheduler.set_max_concurrent_downloads(0)
+    scheduler.set_max_concurrent_downloads(2)
     scheduler.close()
     scheduler.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        scheduler.set_max_concurrent_downloads(1)
     with pytest.raises(RuntimeError, match="closed"):
         scheduler.submit(_task(tmp_path, "closed"))
 

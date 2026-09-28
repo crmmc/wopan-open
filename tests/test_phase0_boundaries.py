@@ -85,7 +85,10 @@ def test_app_settings_loads_user_config_and_creates_default_file(tmp_path: objec
     assert created["log_level"] == "WARNING"
     assert created["stay_logged_in"] is False
     assert created["ask_download_location"] is True
-    assert created["max_upload_threads"] == 16
+    assert created["max_download_threads"] == 8
+    assert created["max_upload_threads"] == 4
+    assert created["max_concurrent_downloads"] == 4
+    assert created["max_concurrent_uploads"] == 3
 
 
 def test_app_settings_save_round_trips_user_config(tmp_path: object) -> None:
@@ -144,7 +147,7 @@ def test_app_settings_clamps_transfer_numeric_values(tmp_path: object) -> None:
 
     settings = load_app_settings(settings_path)
 
-    assert settings.max_download_threads == 1
+    assert settings.max_download_threads == 8
     assert settings.max_upload_threads == 16
     assert settings.max_concurrent_downloads == 1
     assert settings.max_concurrent_uploads == 3

@@ -35,9 +35,9 @@ class AppSettings:
     stay_logged_in: bool = True
     default_download_path: Path = DEFAULT_DOWNLOAD_PATH
     ask_download_location: bool = True
-    max_download_threads: int = 1
-    max_upload_threads: int = 16
-    max_concurrent_downloads: int = 5
+    max_download_threads: int = 8
+    max_upload_threads: int = 4
+    max_concurrent_downloads: int = 4
     max_concurrent_uploads: int = 3
     retry_max_attempts: int = 3
     upload_part_size_mb: int = 5
@@ -60,17 +60,17 @@ class AppSettings:
         object.__setattr__(
             self,
             "max_download_threads",
-            _bounded_int(self.max_download_threads, 1, 1, 16),
+            _bounded_int(self.max_download_threads, 8, 1, 16),
         )
         object.__setattr__(
             self,
             "max_upload_threads",
-            _bounded_int(self.max_upload_threads, 16, 1, 16),
+            _bounded_int(self.max_upload_threads, 4, 1, 16),
         )
         object.__setattr__(
             self,
             "max_concurrent_downloads",
-            _bounded_int(self.max_concurrent_downloads, 5, 1, 5),
+            _bounded_int(self.max_concurrent_downloads, 4, 1, 5),
         )
         object.__setattr__(
             self,
@@ -172,9 +172,9 @@ def _read_app_settings(raw: dict[str, Any]) -> AppSettings:
         stay_logged_in=stay_logged_in,
         default_download_path=Path(default_download_path),
         ask_download_location=ask_download_location,
-        max_download_threads=raw.get("max_download_threads", 1),
-        max_upload_threads=raw.get("max_upload_threads", 16),
-        max_concurrent_downloads=raw.get("max_concurrent_downloads", 5),
+        max_download_threads=raw.get("max_download_threads", 8),
+        max_upload_threads=raw.get("max_upload_threads", 4),
+        max_concurrent_downloads=raw.get("max_concurrent_downloads", 4),
         max_concurrent_uploads=raw.get("max_concurrent_uploads", 3),
         retry_max_attempts=raw.get("retry_max_attempts", 3),
         upload_part_size_mb=raw.get("upload_part_size_mb", 5),

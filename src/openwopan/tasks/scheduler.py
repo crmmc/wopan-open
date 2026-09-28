@@ -31,6 +31,7 @@ _TERMINAL_STATUSES = frozenset({"已完成", "失败", "已取消"})
 REMOVE_WAIT_TIMEOUT_SECONDS = 30
 PROGRESS_PERSIST_INTERVAL_SECONDS = 0.5
 PROGRESS_PERSIST_BYTES = 1024 * 1024
+_MAX_PHYSICAL_CONCURRENT_DOWNLOADS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,9 +123,12 @@ class DownloadScheduler:
         if max_concurrent_downloads < 1:
             raise ValueError("max_concurrent_downloads must be positive")
         self._max_concurrent_downloads = max_concurrent_downloads
+        self._pool_max_workers = max(
+            max_concurrent_downloads, _MAX_PHYSICAL_CONCURRENT_DOWNLOADS
+        )
         self._on_event = on_event
         self._executor = executor
-        self._pool = ThreadPoolExecutor(max_workers=max_concurrent_downloads)
+        self._pool = ThreadPoolExecutor(max_workers=self._pool_max_workers)
         self._lock = threading.RLock()
         self._tasks: dict[str, DownloadTaskInput] = {}
         self._states: dict[str, DownloadTaskState] = {}
@@ -142,6 +146,17 @@ class DownloadScheduler:
         """Replace the observer for future and in-flight task events."""
         with self._lock:
             self._on_event = callback
+
+    def set_max_concurrent_downloads(self, max_concurrent_downloads: int) -> None:
+        """Update the logical file-task limit and refill the FIFO queue."""
+        with self._lock:
+            self._ensure_open()
+            if max_concurrent_downloads < 1:
+                raise ValueError("max_concurrent_downloads must be positive")
+            if max_concurrent_downloads > self._pool_max_workers:
+                raise ValueError("max_concurrent_downloads exceeds scheduler capacity")
+            self._max_concurrent_downloads = max_concurrent_downloads
+            self._start_queued_locked()
 
     def submit(self, task: DownloadTaskInput) -> str:
         """Persist and enqueue a task, returning its stable task id."""
