@@ -324,10 +324,11 @@ def test_search_files_sends_request_and_maps_items() -> None:
                         {
                             "id": "file-1",
                             "fileName": "report.txt",
-                            "fileSize": 2048,
-                            "type": "1",
+                            "fileSize": "2048",
+                            "type": "",
                             "fid": "fid-1",
-                            "fileType": "4",
+                            "fileType": "5",
+                            "directoryId": "0",
                         },
                         {
                             "id": "folder-1",
@@ -363,7 +364,9 @@ def test_search_files_sends_request_and_maps_items() -> None:
     ]
     assert items[0].size == 2048
     assert items[0].download_id == "fid-1"
-    assert items[0].parent_id == ""
+    assert items[0].parent_id == "0"
+    assert items[0].file_type == "5"
+    assert items[0].updated_at is None
 
 
 def test_search_files_returns_empty_list_without_personal_result() -> None:
@@ -387,7 +390,6 @@ def test_search_files_rejects_non_list_personal_result() -> None:
     [
         ({"fileName": "a.txt", "type": "1"}, "missing id"),
         ({"id": "file-1", "type": "1"}, "missing fileName"),
-        ({"id": "file-1", "fileName": "a.txt", "type": "9"}, "unknown type"),
     ],
 )
 def test_search_files_rejects_malformed_items(raw_item: dict[str, object], match: str) -> None:

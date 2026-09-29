@@ -1214,21 +1214,23 @@ def _read_search_item(raw: dict[str, Any]) -> WopanItem:
         raise WopanResponseError("SearchFile item missing id")
     if not name:
         raise WopanResponseError("SearchFile item missing fileName")
+    # Live-verified (2026-09-29): SearchFile results carry an EMPTY `type` and
+    # only ever match files, so empty/absent type maps to FILE; "0" stays a
+    # folder for forward compatibility.
     raw_type = _read_wopan_item_type(raw)
     if raw_type == "0":
         kind = WopanItemKind.FOLDER
-    elif raw_type == "1":
-        kind = WopanItemKind.FILE
     else:
-        raise WopanResponseError(f"SearchFile item has unknown type: {raw_type}")
+        kind = WopanItemKind.FILE
     size = _read_optional_int(raw.get("fileSize"))
     if size is None:
         size = _read_optional_int(raw.get("size"))
+    parent_id_value = raw.get("directoryId")
     return WopanItem(
         item_id=item_id,
         name=name,
         kind=kind,
-        parent_id="",
+        parent_id=str(parent_id_value) if parent_id_value not in (None, "") else "",
         file_type=_read_optional_text(raw.get("fileType")),
         download_id=_read_optional_text(raw.get("fid")),
         size=size,
