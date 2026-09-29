@@ -4,6 +4,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -80,6 +81,44 @@ class FileBrowserLoginRequiredError(FileBrowserError):
     """Raised when the file browser needs the user to log in again."""
 
 
+@dataclass(frozen=True)
+class TransferBatchPlan:
+    """Outcome of comparing a transfer batch against the target directory."""
+
+    transfer_items: tuple[WopanItem, ...]
+    conflict_names: tuple[str, ...]
+    noop_ids: frozenset[str]
+
+
+def plan_transfer_batch(
+    items: Sequence[WopanItem], target_items: Sequence[WopanItem]
+) -> TransferBatchPlan:
+    """Split a move/copy batch into transferable items and name conflicts.
+
+    A target item sharing a name but a different id is a conflict that the
+    user must skip or cancel on; sharing both name and id means the batch
+    references the target item itself, which is a no-op and drops out
+    silently.
+    """
+    target_by_name = {item.name: item for item in target_items}
+    transfer_items: list[WopanItem] = []
+    conflicts: list[str] = []
+    noop_ids: set[str] = set()
+    for item in items:
+        target = target_by_name.get(item.name)
+        if target is None:
+            transfer_items.append(item)
+        elif target.item_id == item.item_id:
+            noop_ids.add(item.item_id)
+        else:
+            conflicts.append(item.name)
+    return TransferBatchPlan(
+        transfer_items=tuple(transfer_items),
+        conflict_names=tuple(conflicts),
+        noop_ids=frozenset(noop_ids),
+    )
+
+
 class FileBrowserBackend(Protocol):
     """UI-facing file browser boundary."""
 
@@ -103,6 +142,9 @@ class FileBrowserBackend(Protocol):
 
     def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
         """Move one or more files or folders in a single request."""
+
+    def copy_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        """Copy one or more files or folders in a single request."""
 
     def download_file(
         self,
@@ -372,6 +414,28 @@ class FileBrowserService:
         )
         LOGGER.info(
             "file_browser.move_items.success count=%s target_parent_id=%s",
+            len(items),
+            target_parent_id,
+        )
+
+    def copy_item(self, item: WopanItem, target_parent_id: str) -> None:
+        """Copy a file or folder to another directory."""
+        self.copy_items([item], target_parent_id)
+
+    def copy_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        """Copy one or more files or folders in a single request."""
+        LOGGER.info(
+            "file_browser.copy_items.start count=%s target_parent_id=%s",
+            len(items),
+            target_parent_id,
+        )
+        self._call(
+            lambda: self._client.copy_many(
+                [(item.item_id, item.kind) for item in items], target_parent_id
+            )
+        )
+        LOGGER.info(
+            "file_browser.copy_items.success count=%s target_parent_id=%s",
             len(items),
             target_parent_id,
         )

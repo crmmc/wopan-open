@@ -5,8 +5,9 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QFrame
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QFrame
 
+import openwopan.ui.main_window as main_window_module
 from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError
 from openwopan.auth.session import AuthSession
 from openwopan.storage.settings import AppSettings
@@ -34,6 +35,7 @@ class FakeFileBrowser:
         self.renamed_items: list[tuple[str, str]] = []
         self.deleted_items: list[str] = []
         self.moved_items: list[tuple[str, str]] = []
+        self.copied_items: list[tuple[str, str]] = []
         self.downloaded_items: list[tuple[str, Path]] = []
         self.uploaded_files: list[tuple[str, Path]] = []
         self.usage_account_ids: list[str] = []
@@ -120,6 +122,13 @@ class FakeFileBrowser:
         for item in items:
             self.move_item(item, target_parent_id)
 
+    def copy_item(self, item: WopanItem, target_parent_id: str) -> None:
+        self.copied_items.append((item.item_id, target_parent_id))
+
+    def copy_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        for item in items:
+            self.copy_item(item, target_parent_id)
+
     def download_file(
         self,
         item: WopanItem,
@@ -173,6 +182,12 @@ class LoginExpiredFileBrowser:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
     def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def copy_item(self, item: WopanItem, target_parent_id: str) -> None:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def copy_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
     def download_file(
@@ -524,6 +539,19 @@ def test_main_window_batch_operations_delete_and_move_multiple_rows(
     assert browser.deleted_items == ["file-1", "folder-1"]
 
 
+def test_main_window_batch_copies_multiple_rows(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.copy_displayed_items([0, 1], "folder-2")
+
+    assert browser.copied_items == [
+        ("folder-1", "folder-2"),
+        ("file-1", "folder-2"),
+    ]
+
+
 def test_main_window_enables_download_for_single_file_selection(qapp: QApplication) -> None:
     browser = FakeFileBrowser()
     window = MainWindow(browser)
@@ -830,7 +858,9 @@ def test_main_window_upload_reports_when_refresh_does_not_show_item(
     assert "刷新后未在当前目录看到" in window.status_message()
 
 
-def test_main_window_move_prompt_reports_when_no_target_folder(qapp: QApplication) -> None:
+def test_main_window_move_prompt_opens_dialog_without_subfolders(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
     browser = FakeFileBrowser()
     browser.items_by_parent[ROOT_DIRECTORY_ID] = [
         WopanItem(
@@ -840,12 +870,37 @@ def test_main_window_move_prompt_reports_when_no_target_folder(qapp: QApplicatio
             parent_id=ROOT_DIRECTORY_ID,
         )
     ]
+    instances: list[object] = []
+
+    class _StubDialog:
+        def __init__(self, mode, initial_entry, initial_folders, **_kwargs) -> None:
+            self.mode = mode
+            self.initial_entry = initial_entry
+            self.initial_folders = initial_folders
+            self.directory_requested = _DisconnectedSignal()
+            instances.append(self)
+
+        exec = staticmethod(lambda: QDialog.DialogCode.Rejected)
+
+        def current_target(self) -> None:
+            return None
+
+        def deleteLater(self) -> None:
+            return None
+
+    class _DisconnectedSignal:
+        def connect(self, _callback: object) -> None:
+            return None
+
+    monkeypatch.setattr(main_window_module, "TargetFolderDialog", _StubDialog)
     window = MainWindow(browser)
 
     window.refresh_current_directory()
     window.prompt_move_item(0)
 
-    assert window.status_message() == "没有可用的目标文件夹"
+    assert len(instances) == 1
+    assert instances[0].mode == "move"
+    assert instances[0].initial_folders == []
 
 
 class QueuedFileBrowser(FakeFileBrowser):

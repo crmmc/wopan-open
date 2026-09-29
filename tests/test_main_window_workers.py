@@ -153,6 +153,7 @@ class WorkerFileBrowser:
         self.prepared_upload_names: list[str | None] = []
         self.download_calls: list[dict[str, Any]] = []
         self.download_error = download_error
+        self.copied_items: list[tuple[str, str]] = []
         self.removed_download_records: list[str] = []
         self.update_settings_calls: list[AppSettings] = []
         self.items_by_parent = {
@@ -210,6 +211,13 @@ class WorkerFileBrowser:
     def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
         for item in items:
             self.move_item(item, target_parent_id)
+
+    def copy_item(self, item: WopanItem, target_parent_id: str) -> None:
+        self.copied_items.append((item.item_id, target_parent_id))
+
+    def copy_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        for item in items:
+            self.copy_item(item, target_parent_id)
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         return WopanCloudUsage(used_bytes=1, total_bytes=2)
@@ -2034,20 +2042,32 @@ class _StubMessageBox:
         self.deleted = True
 
 
-class _StubMoveDialog:
-    instances: list[_StubMoveDialog] = []
+class _StubTargetDialogSignal:
+    def __init__(self) -> None:
+        self.connected: list[object] = []
+
+    def connect(self, callback: object) -> None:
+        self.connected.append(callback)
+
+
+class _StubTargetDialog:
+    instances: list[_StubTargetDialog] = []
     accept_result = QDialog.DialogCode.Accepted
     entry = None
 
-    def __init__(self, entries, *, parent=None) -> None:
-        self.entries = entries
-        self.parent = parent
+    def __init__(self, mode, initial_entry, initial_folders, **kwargs) -> None:
+        self.mode = mode
+        self.initial_entry = initial_entry
+        self.initial_folders = initial_folders
+        self.excluded_ids = kwargs.get("excluded_ids", frozenset())
+        self.parent = kwargs.get("parent")
         self.deleted = False
+        self.directory_requested = _StubTargetDialogSignal()
         type(self).instances.append(self)
 
     exec = _accept_result_exec()
 
-    def selected_entry(self) -> object | None:
+    def current_target(self) -> object | None:
         return type(self).entry
 
     def deleteLater(self) -> None:
@@ -2072,10 +2092,11 @@ def stub_message_box(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def stub_move_dialog(monkeypatch: pytest.MonkeyPatch):
-    _StubMoveDialog.instances = []
-    _StubMoveDialog.accept_result = QDialog.DialogCode.Accepted
-    monkeypatch.setattr(main_window_module, "MoveTargetDialog", _StubMoveDialog)
-    return _StubMoveDialog
+    _StubTargetDialog.instances = []
+    _StubTargetDialog.accept_result = QDialog.DialogCode.Accepted
+    _StubTargetDialog.entry = None
+    monkeypatch.setattr(main_window_module, "TargetFolderDialog", _StubTargetDialog)
+    return _StubTargetDialog
 
 
 def test_prompt_create_folder_uses_dialog_result(
@@ -2229,6 +2250,7 @@ def test_prompt_move_item_batches_all_selected_rows(
             size=3,
         )
     )
+    browser.items_by_parent["target-folder"] = []
     window = MainWindow(browser)
     window.refresh_current_directory()
     table = window.file_interface.file_table
@@ -2237,14 +2259,17 @@ def test_prompt_move_item_batches_all_selected_rows(
         table.model().index(2, 0),
         QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
     )
-    stub_move_dialog.entry = main_window_module.BreadcrumbEntry(
-        item_id="target-folder", name="Target"
-    )
+    stub_move_dialog.entry = main_window_module.TargetEntry(item_id="target-folder", name="Target")
 
     window.prompt_move_item(1)
 
-    entries = stub_move_dialog.instances[0].entries
-    assert all(entry.item_id not in {"file-1", "file-2"} for entry in entries)
+    dialog = stub_move_dialog.instances[0]
+    assert [entry.name for entry in dialog.initial_folders] == ["Folder"]
+    assert dialog.excluded_ids == frozenset({"file-1", "file-2"})
+    assert [item.name for item in browser.items_by_parent["target-folder"]] == [
+        "report.txt",
+        "notes.txt",
+    ]
     assert [item.name for item in window.displayed_items()] == ["Folder"]
 
 
@@ -2355,16 +2380,15 @@ def test_prompt_move_item_moves_to_selected_entry(
     qapp: QApplication, stub_move_dialog
 ) -> None:
     browser = WorkerFileBrowser()
+    browser.items_by_parent["target-folder"] = []
     window = MainWindow(browser)
     window.refresh_current_directory()
-    stub_move_dialog.entry = main_window_module.BreadcrumbEntry(
-        item_id="target-folder", name="Target"
-    )
+    stub_move_dialog.entry = main_window_module.TargetEntry(item_id="target-folder", name="Target")
 
     window.prompt_move_item(1)
 
     assert stub_move_dialog.instances[0].deleted
-    assert window.status_message().startswith("1 项")
+    assert [item.name for item in browser.items_by_parent["target-folder"]] == ["report.txt"]
 
 
 def test_prompt_move_item_without_selection_does_nothing(
@@ -2377,7 +2401,7 @@ def test_prompt_move_item_without_selection_does_nothing(
 
     window.prompt_move_item(1)
 
-    assert window.status_message().startswith("2 项")
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
 def test_prompt_move_item_cancelled_does_nothing(
@@ -2387,14 +2411,12 @@ def test_prompt_move_item_cancelled_does_nothing(
     window = MainWindow(browser)
     window.refresh_current_directory()
     stub_move_dialog.accept_result = QDialog.DialogCode.Rejected
-    stub_move_dialog.entry = main_window_module.BreadcrumbEntry(
-        item_id="target-folder", name="Target"
-    )
+    stub_move_dialog.entry = main_window_module.TargetEntry(item_id="target-folder", name="Target")
 
     window.prompt_move_item(1)
 
     assert stub_move_dialog.instances[0].deleted
-    assert window.status_message().startswith("2 项")
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
 def test_prompt_move_item_ignores_missing_row(
@@ -2405,6 +2427,268 @@ def test_prompt_move_item_ignores_missing_row(
     window.prompt_move_item(3)
 
     assert stub_move_dialog.instances == []
+
+
+class _StubConflictDialog:
+    instances: list[_StubConflictDialog] = []
+    accept_result = QDialog.DialogCode.Accepted
+    resolution_value: str | None = None
+
+    def __init__(self, conflict_names, mode, parent=None) -> None:
+        self.conflict_names = list(conflict_names)
+        self.mode = mode
+        self.parent = parent
+        self.deleted = False
+        type(self).instances.append(self)
+
+    exec = _accept_result_exec()
+
+    def resolution(self) -> str | None:
+        return type(self).resolution_value
+
+    def deleteLater(self) -> None:
+        self.deleted = True
+
+
+@pytest.fixture
+def stub_conflict_dialog(monkeypatch: pytest.MonkeyPatch):
+    _StubConflictDialog.instances = []
+    _StubConflictDialog.resolution_value = "skip"
+    monkeypatch.setattr(main_window_module, "TransferConflictDialog", _StubConflictDialog)
+    return _StubConflictDialog
+
+
+def test_prompt_copy_item_copies_selected_row(
+    qapp: QApplication, stub_move_dialog
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent["target-folder"] = []
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    stub_move_dialog.entry = main_window_module.TargetEntry(item_id="target-folder", name="Target")
+
+    window.prompt_copy_item(1)
+
+    dialog = stub_move_dialog.instances[0]
+    assert dialog.mode == "copy"
+    assert browser.copied_items == [("file-1", "target-folder")]
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+
+
+def test_copy_displayed_items_reports_batch_failure(qapp: QApplication) -> None:
+    class _CopyErrorBrowser(WorkerFileBrowser):
+        def copy_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+            raise FileBrowserError("网络错误")
+
+    window = MainWindow(_CopyErrorBrowser())
+    window.refresh_current_directory()
+
+    window.copy_displayed_items([0, 1], "target-folder")
+
+    assert window.status_message() == "复制失败：网络错误"
+
+
+def test_copy_displayed_items_maps_login_required(qapp: QApplication) -> None:
+    class _CopyLoginBrowser(WorkerFileBrowser):
+        def copy_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+            raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    messages: list[str] = []
+    window = MainWindow(_CopyLoginBrowser())
+    window.refresh_current_directory()
+    window.login_required.connect(messages.append)
+
+    window.copy_displayed_items([0, 1], "target-folder")
+
+    assert messages == ["登录已过期，请重新登录"]
+
+
+def test_copy_displayed_items_skips_while_busy(qapp: QApplication) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    window.refresh_current_directory()
+    sentinel = object()
+    window._copy_thread = sentinel
+
+    window.copy_displayed_items([0, 1], "target-folder")
+
+    assert window._copy_thread is sentinel
+    window._copy_thread = None
+
+
+def test_transfer_check_skips_conflicts_and_moves_rest(
+    qapp: QApplication, stub_move_dialog, stub_conflict_dialog
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent["target-folder"] = [
+        WopanItem(
+            item_id="target-file",
+            name="report.txt",
+            kind=WopanItemKind.FILE,
+            parent_id="target-folder",
+        )
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    table = window.file_interface.file_table
+    table.selectAll()
+    stub_move_dialog.entry = main_window_module.TargetEntry(item_id="target-folder", name="Target")
+
+    window.prompt_move_item(1)
+
+    dialog = stub_conflict_dialog.instances[0]
+    assert dialog.conflict_names == ["report.txt"]
+    assert dialog.mode == "move"
+    assert [item.name for item in browser.items_by_parent["target-folder"]] == [
+        "report.txt",
+        "Folder",
+    ]
+    assert [item.name for item in window.displayed_items()] == ["report.txt"]
+
+
+def test_transfer_check_cancel_moves_nothing(
+    qapp: QApplication, stub_move_dialog, stub_conflict_dialog
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent["target-folder"] = [
+        WopanItem(
+            item_id="target-file",
+            name="report.txt",
+            kind=WopanItemKind.FILE,
+            parent_id="target-folder",
+        )
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    stub_move_dialog.entry = main_window_module.TargetEntry(item_id="target-folder", name="Target")
+    stub_conflict_dialog.resolution_value = None
+
+    window.prompt_move_item(1)
+
+    assert [item.name for item in browser.items_by_parent["target-folder"]] == ["report.txt"]
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+
+
+def test_transfer_check_all_conflicts_skipped_shows_hint(
+    qapp: QApplication, stub_move_dialog, stub_conflict_dialog
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent["target-folder"] = [
+        WopanItem(
+            item_id="target-file",
+            name="report.txt",
+            kind=WopanItemKind.FILE,
+            parent_id="target-folder",
+        )
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    stub_move_dialog.entry = main_window_module.TargetEntry(item_id="target-folder", name="Target")
+
+    window.prompt_move_item(1)
+
+    assert window.status_message() == "没有可移动的项目"
+    assert [item.name for item in browser.items_by_parent["target-folder"]] == ["report.txt"]
+
+
+def test_transfer_check_reports_listing_failure(
+    qapp: QApplication, stub_move_dialog
+) -> None:
+    class _CheckErrorBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            if parent_id == "target-folder":
+                raise FileBrowserError("目录拉取失败")
+            return super().list_directory(parent_id)
+
+    browser = _CheckErrorBrowser()
+    browser.items_by_parent["target-folder"] = []
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    stub_move_dialog.entry = main_window_module.TargetEntry(item_id="target-folder", name="Target")
+
+    window.prompt_move_item(1)
+
+    assert window.status_message() == "检查目标文件夹失败：目录拉取失败"
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+
+
+def test_target_dialog_receives_folder_only_listings(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    dialog = main_window_module.TargetFolderDialog(
+        "move",
+        main_window_module.TargetEntry(item_id=ROOT_DIRECTORY_ID, name="全部文件"),
+        [],
+    )
+    dialog.directory_requested.connect(window._on_target_directory_requested)
+    window._target_dialog = dialog
+    dialog._enter(
+        main_window_module.TargetEntry(item_id="folder-1", name="Folder")
+    )
+
+    assert dialog._folder_list.count() == 0
+    assert [entry.item_id for entry in dialog._path] == [ROOT_DIRECTORY_ID, "folder-1"]
+    assert window._target_load_thread is None
+    window._target_dialog = None
+    dialog.deleteLater()
+
+
+def test_target_dialog_load_failure_shows_error(qapp: QApplication) -> None:
+    class _LoadErrorBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            if parent_id == "folder-9":
+                raise FileBrowserError("目录拉取失败")
+            return super().list_directory(parent_id)
+
+    window = MainWindow(_LoadErrorBrowser())
+    window.refresh_current_directory()
+    dialog = main_window_module.TargetFolderDialog(
+        "move",
+        main_window_module.TargetEntry(item_id=ROOT_DIRECTORY_ID, name="全部文件"),
+        [],
+    )
+    window._target_dialog = dialog
+
+    window._on_target_directory_requested("folder-9")
+
+    assert dialog._status_label.text() == "加载失败：目录拉取失败"
+    assert dialog._load_in_flight is False
+    window._target_dialog = None
+    dialog.deleteLater()
+
+
+def test_target_dialog_login_required_rejects_and_emits(qapp: QApplication) -> None:
+    class _LoadLoginBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            if parent_id == "folder-9":
+                raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+            return super().list_directory(parent_id)
+
+    messages: list[str] = []
+    window = MainWindow(_LoadLoginBrowser())
+    window.refresh_current_directory()
+    window.login_required.connect(messages.append)
+    dialog = main_window_module.TargetFolderDialog(
+        "move",
+        main_window_module.TargetEntry(item_id=ROOT_DIRECTORY_ID, name="全部文件"),
+        [],
+    )
+    window._target_dialog = dialog
+
+    window._on_target_directory_requested("folder-9")
+
+    assert messages == ["登录已过期，请重新登录"]
+    window._target_dialog = None
+    dialog.deleteLater()
+
+
+def test_target_dialog_ignores_requests_while_dialog_closed(qapp: QApplication) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    window.refresh_current_directory()
+
+    window._on_target_directory_requested("folder-1")
+
+    assert window._target_load_thread is None
 
 
 def test_prompt_logout_confirmed_emits_logout(
@@ -2814,7 +3098,7 @@ def test_open_file_context_menu_builds_menu_per_row_type(
     window.open_file_context_menu(QPoint(1, 1))
     folder_menu = FakeMenu.instances[-1]
     folder_actions = [action.text() for action in folder_menu.actions()]
-    assert folder_actions == ["打开", "重命名", "移动", "删除"]
+    assert folder_actions == ["打开", "重命名", "移动", "复制", "删除"]
 
     monkeypatch.setattr(table, "rowAt", lambda y: 1)
     window.open_file_context_menu(QPoint(1, 1))
@@ -2823,6 +3107,7 @@ def test_open_file_context_menu_builds_menu_per_row_type(
         "下载",
         "重命名",
         "移动",
+        "复制",
         "删除",
     ]
 
@@ -2854,23 +3139,6 @@ def test_name_input_dialog_accepts_non_empty_text_only(qapp: QApplication) -> No
     rejected_dialog._name_input.clear()
     rejected_dialog._accept_if_valid()
     assert rejected_dialog.result() != QDialog.DialogCode.Accepted
-
-
-def test_move_target_dialog_selection_flow(qapp: QApplication) -> None:
-    entries = [
-        main_window_module.BreadcrumbEntry(item_id="root", name="/"),
-        main_window_module.BreadcrumbEntry(item_id="folder-1", name="Folder"),
-    ]
-    dialog = main_window_module.MoveTargetDialog(entries)
-
-    assert dialog.selected_entry() is None
-    assert not dialog._ok_button.isEnabled()
-
-    dialog._on_item_clicked(dialog._target_tree.topLevelItem(1))
-
-    assert dialog.selected_entry() == entries[1]
-    assert dialog._ok_button.isEnabled()
-    assert dialog._ok_button.text() == "移动到「Folder」"
 
 
 def test_placeholder_interface_renders_title_and_message(qapp: QApplication) -> None:
@@ -4122,21 +4390,6 @@ def test_transfer_active_download_folder_skips_row_without_target(
     transfer.download_table.selectRow(0)
 
     assert transfer.active_download_folder() == Path("/downloads")
-
-
-def test_move_target_dialog_ignores_items_without_index_data(qapp: QApplication) -> None:
-    from PySide6.QtWidgets import QTreeWidgetItem
-
-    dialog = main_window_module.MoveTargetDialog(
-        [main_window_module.BreadcrumbEntry(item_id="root", name="/")]
-    )
-    stray = QTreeWidgetItem(["stray"])
-    dialog._target_tree.addTopLevelItem(stray)
-
-    dialog._on_item_clicked(stray)
-
-    assert dialog.selected_entry() is None
-    assert not dialog._ok_button.isEnabled()
 
 
 def test_file_interface_row_helpers_invoke_prompts_for_current_row(

@@ -15,6 +15,7 @@ from openwopan.app.file_browser import (
     FileBrowserLoginRequiredError,
     FileBrowserService,
     FileBrowserUploadCancelledError,
+    plan_transfer_batch,
 )
 from openwopan.storage.settings import AppSettings
 from openwopan.tasks.download import (
@@ -47,6 +48,7 @@ class FakeClient:
         self.renamed_items: list[tuple[str, str, WopanItemKind, str | None]] = []
         self.deleted_items: list[tuple[str, WopanItemKind]] = []
         self.moved_items: list[tuple[str, WopanItemKind, str]] = []
+        self.copied_items: list[tuple[str, WopanItemKind, str]] = []
         self.downloaded_item_ids: list[str] = []
         self.uploaded_files: list[tuple[str, Path]] = []
         self.upload_kwargs: list[dict[str, object]] = []
@@ -99,6 +101,15 @@ class FakeClient:
     ) -> None:
         for item_id, kind in items:
             self.move(item_id, kind, target_parent_id)
+
+    def copy(self, item_id: str, kind: WopanItemKind, target_parent_id: str) -> None:
+        self.copied_items.append((item_id, kind, target_parent_id))
+        if self.error is not None:
+            raise self.error
+
+    def copy_many(self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str) -> None:
+        for item_id, kind in items:
+            self.copy(item_id, kind, target_parent_id)
 
     def get_download_info(self, item_id: str) -> DownloadInfo:
         self.downloaded_item_ids.append(item_id)
@@ -194,6 +205,53 @@ def test_file_browser_service_moves_many_items_in_one_request() -> None:
         ("file-1", WopanItemKind.FILE, "folder-2"),
         ("folder-1", WopanItemKind.FOLDER, "folder-2"),
     ]
+
+
+def test_file_browser_service_copies_many_items_in_one_request() -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    file_item = WopanItem(
+        item_id="file-1", name="report.txt", kind=WopanItemKind.FILE, file_type="4"
+    )
+    folder = WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)
+
+    service.copy_items([file_item, folder], "folder-2")
+
+    assert client.copied_items == [
+        ("file-1", WopanItemKind.FILE, "folder-2"),
+        ("folder-1", WopanItemKind.FOLDER, "folder-2"),
+    ]
+
+
+def test_plan_transfer_batch_splits_conflicts_noops_and_transfers() -> None:
+    items = (
+        WopanItem(item_id="file-1", name="a.txt", kind=WopanItemKind.FILE),
+        WopanItem(item_id="folder-1", name="docs", kind=WopanItemKind.FOLDER),
+        WopanItem(item_id="file-2", name="b.txt", kind=WopanItemKind.FILE),
+    )
+    target_items = (
+        WopanItem(item_id="target-file", name="a.txt", kind=WopanItemKind.FILE),
+        WopanItem(item_id="file-2", name="b.txt", kind=WopanItemKind.FILE),
+    )
+
+    plan = plan_transfer_batch(items, target_items)
+
+    assert plan.transfer_items == (items[1],)
+    assert plan.conflict_names == ("a.txt",)
+    assert plan.noop_ids == frozenset({"file-2"})
+
+
+def test_plan_transfer_batch_without_conflicts_transfers_everything() -> None:
+    items = (
+        WopanItem(item_id="file-1", name="a.txt", kind=WopanItemKind.FILE),
+        WopanItem(item_id="folder-1", name="docs", kind=WopanItemKind.FOLDER),
+    )
+
+    plan = plan_transfer_batch(items, ())
+
+    assert plan.transfer_items == items
+    assert plan.conflict_names == ()
+    assert plan.noop_ids == frozenset()
 
 
 def test_file_browser_service_downloads_file_to_local_path(tmp_path: Path) -> None:
