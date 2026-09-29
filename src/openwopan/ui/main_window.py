@@ -101,6 +101,7 @@ from openwopan.tasks.upload import (
     resolve_upload_targets,
     scan_upload_inputs,
 )
+from openwopan.ui.search_window import SearchResultsWindow
 from openwopan.ui.target_folder_dialog import (
     TargetEntry,
     TargetFolderDialog,
@@ -108,7 +109,7 @@ from openwopan.ui.target_folder_dialog import (
     TransferMode,
     mode_label,
 )
-from openwopan.wopan.client import ROOT_DIRECTORY_ID, SEARCH_DEFAULT_PAGE_SIZE
+from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
 
 MAIN_WINDOW_DEFAULT_SIZE = (900, 600)
@@ -2310,9 +2311,6 @@ class FileInterface(QWidget):
         self.file_table.paths_dropped.connect(self._window.handle_upload_drop)
         self.file_table.customContextMenuRequested.connect(self._window.open_file_context_menu)
         self.search_bar.returnPressed.connect(self._window.request_search)
-        self.file_table.verticalScrollBar().valueChanged.connect(
-            self._window.on_file_table_scrolled
-        )
 
     def _render_breadcrumb(self, breadcrumb: tuple[BreadcrumbEntry, ...]) -> None:
         self._rendering_breadcrumb = True
@@ -2464,11 +2462,7 @@ class MainWindow(_MainWindowBase):
         self._delete_worker: BrowserOperationWorker | None = None
         self._move_thread: QThread | None = None
         self._move_worker: BrowserOperationWorker | None = None
-        self._search_keyword: str | None = None
-        self._search_page_no = 1
-        self._search_has_more = False
-        self._search_thread: QThread | None = None
-        self._search_worker: BrowserOperationWorker | None = None
+        self._search_window: SearchResultsWindow | None = None
         self._tree_sync_thread: QThread | None = None
         self._tree_sync_worker: BrowserOperationWorker | None = None
         self._copy_thread: QThread | None = None
@@ -2645,7 +2639,6 @@ class MainWindow(_MainWindowBase):
             (self._rename_thread, "rename", None),
             (self._delete_thread, "delete", None),
             (self._move_thread, "move", None),
-            (self._search_thread, "search", None),
             (self._tree_sync_thread, "tree_sync", None),
             (self._copy_thread, "copy", None),
             (self._target_load_thread, "target_load", None),
@@ -2818,9 +2811,6 @@ class MainWindow(_MainWindowBase):
 
     def go_up_one_level(self) -> None:
         """Navigate to the parent breadcrumb entry."""
-        if self._search_keyword is not None:
-            self._exit_search()
-            return
         if len(self._breadcrumb) <= 1:
             return
         self.open_breadcrumb_index(len(self._breadcrumb) - 2)
@@ -3158,9 +3148,6 @@ class MainWindow(_MainWindowBase):
             return
         if [entry.item_id for entry in self._breadcrumb] == list(path_ids):
             return
-        if self._search_keyword is not None:
-            self._search_keyword = None
-            self._search_has_more = False
         self._breadcrumb = [
             BreadcrumbEntry(item_id=item_id, name=name)
             for item_id, name in zip(path_ids, path_names, strict=True)
@@ -3207,120 +3194,58 @@ class MainWindow(_MainWindowBase):
         if self._file_browser is None:
             self._set_status("请先登录")
             return
-        self._start_search(keyword)
+        self._show_search_window(keyword)
 
-    def _start_search(self, keyword: str) -> None:
-        """Enter search mode and load the first result page."""
-        if self._search_thread is not None:
-            LOGGER.debug("main_window.search.skipped_busy")
-            return
-        self._search_keyword = keyword
-        self._search_page_no = 1
-        self._search_has_more = False
-        self._items = []
-        self._render_items()
-        self._set_status(f"正在搜索「{keyword}」...")
-        LOGGER.info("main_window.search.start keyword_length=%s", len(keyword))
-
+    def _show_search_window(self, keyword: str) -> None:
+        """Open (or raise) the standalone search window and run the search."""
         file_browser = self._file_browser
         if file_browser is None:
             self._set_status("请先登录")
             return
-        thread = QThread(self)
-        worker = BrowserOperationWorker(
-            lambda: file_browser.search_files(keyword, 1, SEARCH_DEFAULT_PAGE_SIZE)
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.succeeded.connect(self._on_search_succeeded)
-        worker.failed.connect(self._on_search_failed)
-        worker.login_required.connect(self._on_search_login_required)
-        worker.succeeded.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.login_required.connect(thread.quit)
-        thread.finished.connect(self._clear_search)
-        self._search_thread = thread
-        self._search_worker = worker
-        thread.start()
+        if self._search_window is None:
+            self._search_window = SearchResultsWindow(
+                self._search_callable,
+                self._resolve_directory_path_callable,
+                parent=self,
+            )
+            self._search_window.jump_requested.connect(self.open_tree_path)
+            self._search_window.download_requested.connect(self.download_search_item)
+        self._search_window.show()
+        self._search_window.raise_()
+        self._search_window.activateWindow()
+        self._search_window.start_search(keyword)
 
-    def _load_next_search_page(self) -> None:
-        """Load the next page of the active search result set."""
-        if self._search_keyword is None or not self._search_has_more:
-            return
-        if self._search_thread is not None:
-            LOGGER.debug("main_window.search.page_skipped_busy")
-            return
+    def _search_callable(self, keyword: str, page_no: int, page_size: int) -> list[WopanItem]:
         file_browser = self._file_browser
         if file_browser is None:
+            raise FileBrowserError("请先登录")
+        return file_browser.search_files(keyword, page_no, page_size)
+
+    def _resolve_directory_path_callable(self, directory_id: str) -> list[tuple[str, str]]:
+        file_browser = self._file_browser
+        if file_browser is None:
+            raise FileBrowserError("请先登录")
+        return file_browser.resolve_directory_path(directory_id)
+
+    def download_search_item(self, item: WopanItem) -> None:
+        """Download one file handed over from the search results window."""
+        if self._file_browser is None:
+            self._set_status("请先登录")
             return
-        keyword = self._search_keyword
-        next_page = self._search_page_no + 1
-        self._search_page_no = next_page
-        LOGGER.info("main_window.search.next_page page_no=%s", next_page)
-
-        thread = QThread(self)
-        worker = BrowserOperationWorker(
-            lambda: file_browser.search_files(keyword, next_page, SEARCH_DEFAULT_PAGE_SIZE)
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.succeeded.connect(self._on_search_succeeded)
-        worker.failed.connect(self._on_search_failed)
-        worker.login_required.connect(self._on_search_login_required)
-        worker.succeeded.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.login_required.connect(thread.quit)
-        thread.finished.connect(self._clear_search)
-        self._search_thread = thread
-        self._search_worker = worker
-        thread.start()
-
-    def _on_search_succeeded(self, result: object) -> None:
-        if self._closing or self._search_keyword is None:
-            # The user left search mode while the request was in flight.
+        if item.kind is not WopanItemKind.FILE or not item.download_id:
+            self._set_status("只能下载文件")
+            InfoBar.warning(title="下载", content="只能下载文件", parent=self)
             return
-        items = cast(list[WopanItem], result)
-        self._items = [*self._items, *items]
-        self._search_has_more = len(items) >= SEARCH_DEFAULT_PAGE_SIZE
-        self._render_items()
-        LOGGER.info(
-            "main_window.search.success page_no=%s item_count=%s",
-            self._search_page_no,
-            len(items),
-        )
-
-    def _on_search_failed(self, message: str) -> None:
-        if self._closing:
+        if self._settings.ask_download_location:
+            path_text, _selected_filter = QFileDialog.getSaveFileName(self, "保存文件", item.name)
+            if not path_text:
+                return
+            paths = [(item, Path(path_text))]
+            self._submit_download_items(paths, automatic=False)
             return
-        self._search_has_more = False
-        self._set_status(f"搜索失败：{message}")
-        InfoBar.error(title="搜索失败", content=message, parent=self)
-
-    def _on_search_login_required(self, message: str) -> None:
-        if self._closing:
-            return
-        self._show_login_required_error(message)
-
-    def _clear_search(self) -> None:
-        self._delete_finished_thread()
-        self._search_thread = None
-        self._search_worker = None
-
-    def _exit_search(self) -> None:
-        """Leave search mode and restore the current directory listing."""
-        if self._search_keyword is None:
-            return
-        self._search_keyword = None
-        self._search_has_more = False
-        self.refresh_current_directory()
-
-    def on_file_table_scrolled(self, value: int) -> None:
-        """Load the next search page when the table is scrolled to the bottom."""
-        if self._search_keyword is None or not self._search_has_more:
-            return
-        bar = self.file_interface.file_table.verticalScrollBar()
-        if value >= bar.maximum() - 4:
-            self._load_next_search_page()
+        folder = self._settings.default_download_path
+        paths = [(item, folder / _safe_local_file_name(item.name))]
+        self._submit_download_items(paths, automatic=True)
 
     def create_folder_with_name(self, name: str) -> None:
         """Create a folder in the current directory."""
@@ -4837,14 +4762,6 @@ class MainWindow(_MainWindowBase):
 
     def enter_displayed_folder(self, row: int) -> None:
         """Enter a displayed folder row."""
-        if self._search_keyword is not None:
-            self._set_status("搜索结果不支持打开所在文件夹")
-            InfoBar.info(
-                title="搜索",
-                content="搜索结果不支持打开所在文件夹",
-                parent=self,
-            )
-            return
         if row < 0 or row >= len(self._items):
             return
         item = self._items[row]
@@ -4855,8 +4772,6 @@ class MainWindow(_MainWindowBase):
 
     def open_breadcrumb_index(self, index: int) -> None:
         """Open a breadcrumb entry by index."""
-        if self._search_keyword is not None:
-            self._exit_search()
         if index < 0 or index >= len(self._breadcrumb):
             return
         self._breadcrumb = self._breadcrumb[: index + 1]
@@ -4874,20 +4789,16 @@ class MainWindow(_MainWindowBase):
             menu.addAction("上传文件", self.prompt_upload_file)
             menu.addAction("上传文件夹", self.prompt_upload_folder)
         else:
-            searching = self._search_keyword is not None
-            if searching and item.kind is WopanItemKind.FOLDER:
-                return
             if item.kind is WopanItemKind.FOLDER:
                 menu.addAction("打开", lambda: self.enter_displayed_folder(row))
             else:
                 download_action = QAction("下载", self)
                 download_action.triggered.connect(lambda: self.prompt_download_item(row))
                 menu.addAction(download_action)
-            if not searching:
-                menu.addAction("重命名", lambda: self.prompt_rename_item(row))
-                menu.addAction("移动", lambda: self.prompt_move_item(row))
-                menu.addAction("复制", lambda: self.prompt_copy_item(row))
-                menu.addAction("删除", lambda: self.prompt_delete_item(row))
+            menu.addAction("重命名", lambda: self.prompt_rename_item(row))
+            menu.addAction("移动", lambda: self.prompt_move_item(row))
+            menu.addAction("复制", lambda: self.prompt_copy_item(row))
+            menu.addAction("删除", lambda: self.prompt_delete_item(row))
         viewport = table.viewport()
         if viewport is None:  # pragma: no cover - docs/testing-exemptions.md
             return
@@ -4930,11 +4841,7 @@ class MainWindow(_MainWindowBase):
         """Update selection-sensitive operation controls."""
         can_download = self._file_browser is not None and bool(self.selected_download_rows())
         self.file_interface.download_button.setEnabled(can_download)
-        can_delete = (
-            self._file_browser is not None
-            and self._search_keyword is None
-            and bool(self.selected_rows())
-        )
+        can_delete = self._file_browser is not None and bool(self.selected_rows())
         self.file_interface.delete_button.setEnabled(can_delete)
         can_upload = self._file_browser is not None
         self.file_interface.upload_button_group.setEnabled(can_upload)
@@ -6012,17 +5919,9 @@ class MainWindow(_MainWindowBase):
 
     def _render_items(self) -> None:
         self.file_interface.set_operations_enabled(self._file_browser is not None)
-        breadcrumb = tuple(self._breadcrumb)
-        if self._search_keyword is not None:
-            breadcrumb = (
-                *breadcrumb,
-                BreadcrumbEntry(item_id="", name=f"搜索：「{self._search_keyword}」"),
-            )
-        self.file_interface.render_state(tuple(self._items), breadcrumb)
+        self.file_interface.render_state(tuple(self._items), tuple(self._breadcrumb))
         self.update_operation_controls()
-        if self._search_keyword is not None:
-            self._set_status(f"搜索「{self._search_keyword}」：{len(self._items)} 项")
-        elif self._items:
+        if self._items:
             path = " > ".join(self.breadcrumb_names())
             self._set_status(f"{len(self._items)} 项 | 当前路径：{path}")
         elif self._file_browser is None:

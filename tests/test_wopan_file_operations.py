@@ -428,6 +428,58 @@ def test_search_files_falls_back_to_size_field() -> None:
     assert items[0].size == 4096
 
 
+def test_get_directory_path_sends_request_and_orders_root_first() -> None:
+    client, captured = _client_and_captured_params(
+        [
+            _success_response(
+                [
+                    {"id": "folder-2", "directoryName": "2"},
+                    {"id": "folder-1", "directoryName": "test"},
+                    {"id": "0", "directoryName": "个人云"},
+                ]
+            )
+        ]
+    )
+
+    chain = client.get_directory_path("folder-2")
+
+    assert captured == [
+        (
+            "GetDirectoryPath",
+            {"directoryId": "folder-2", "clientId": "1001000021"},
+        )
+    ]
+    assert chain == [
+        ("0", "个人云"),
+        ("folder-1", "test"),
+        ("folder-2", "2"),
+    ]
+
+
+def test_get_directory_path_rejects_malformed_responses() -> None:
+    client, _captured = _client_and_captured_params([_success_response({"id": "x"})])
+
+    with pytest.raises(WopanResponseError, match="DATA is not a list"):
+        client.get_directory_path("folder-2")
+
+
+@pytest.mark.parametrize(
+    ("data", "match"),
+    [
+        (["str-item"], "item is not an object"),
+        ([{"id": "folder-1"}], "missing id or name"),
+        ([{"directoryName": "test"}], "missing id or name"),
+    ],
+)
+def test_get_directory_path_rejects_malformed_items(
+    data: list[object], match: str
+) -> None:
+    client, _captured = _client_and_captured_params([_success_response(data)])
+
+    with pytest.raises(WopanResponseError, match=match):
+        client.get_directory_path("folder-2")
+
+
 def test_upload_file_gets_zone_and_posts_single_part(tmp_path: Path) -> None:
     local_file = tmp_path / "report.txt"
     local_file.write_bytes(b"upload-content")
@@ -869,6 +921,7 @@ def test_get_download_info_rejects_malformed_response(data: object, match: str) 
         (lambda client: client.search_files("   "), "keyword"),
         (lambda client: client.search_files("kw", 0), "page_no"),
         (lambda client: client.search_files("kw", 1, 0), "page_size"),
+        (lambda client: client.get_directory_path(""), "directory_id"),
         (lambda client: client.upload_file("", Path("report.txt")), "parent_id"),
         (lambda client: client.get_download_info(""), "download_id"),
     ],

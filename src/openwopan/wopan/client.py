@@ -382,6 +382,34 @@ class WopanClient:
         )
         return items
 
+    def get_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
+        """Resolve a directory id to its root-relative id/name path in one call."""
+        if not directory_id:
+            raise ValueError("directory_id must not be empty")
+
+        LOGGER.info("wopan.get_directory_path.start directory_id=%s", directory_id)
+        data = self._dispatch_wohome_payload(
+            "GetDirectoryPath",
+            {"directoryId": directory_id, "clientId": CLIENT_ID},
+        )
+        if not isinstance(data, list):
+            raise WopanResponseError("GetDirectoryPath DATA is not a list")
+        chain: list[tuple[str, str]] = []
+        for raw_item in reversed(data):
+            if not isinstance(raw_item, dict):
+                raise WopanResponseError("GetDirectoryPath item is not an object")
+            item_id = str(raw_item.get("id") or "")
+            name = str(raw_item.get("directoryName") or "")
+            if not item_id or not name:
+                raise WopanResponseError("GetDirectoryPath item missing id or name")
+            chain.append((item_id, name))
+        LOGGER.info(
+            "wopan.get_directory_path.success directory_id=%s depth=%s",
+            directory_id,
+            len(chain),
+        )
+        return chain
+
     def create_folder(self, parent_id: str, name: str) -> WopanItem:
         """Create a folder under a parent directory."""
         if not parent_id:
@@ -459,9 +487,7 @@ class WopanClient:
         dir_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FOLDER]
         file_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FILE]
 
-        LOGGER.info(
-            "wopan.delete_many.start folders=%s files=%s", len(dir_ids), len(file_ids)
-        )
+        LOGGER.info("wopan.delete_many.start folders=%s files=%s", len(dir_ids), len(file_ids))
         self._dispatch_wohome(
             "DeleteFile",
             {
@@ -472,17 +498,13 @@ class WopanClient:
                 "clientId": CLIENT_ID,
             },
         )
-        LOGGER.info(
-            "wopan.delete_many.success folders=%s files=%s", len(dir_ids), len(file_ids)
-        )
+        LOGGER.info("wopan.delete_many.success folders=%s files=%s", len(dir_ids), len(file_ids))
 
     def move(self, item_id: str, kind: WopanItemKind, target_parent_id: str) -> None:
         """Move a file or folder to another parent directory."""
         self.move_many([(item_id, kind)], target_parent_id)
 
-    def move_many(
-        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
-    ) -> None:
+    def move_many(self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str) -> None:
         """Move one or more files and folders in a single request."""
         if not target_parent_id:
             raise ValueError("target_parent_id must not be empty")
@@ -524,9 +546,7 @@ class WopanClient:
         """Copy a file or folder to another parent directory."""
         self.copy_many([(item_id, kind)], target_parent_id)
 
-    def copy_many(
-        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
-    ) -> None:
+    def copy_many(self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str) -> None:
         """Copy one or more files and folders in a single request."""
         if not target_parent_id:
             raise ValueError("target_parent_id must not be empty")
@@ -601,8 +621,10 @@ class WopanClient:
         completed_indexes = _valid_completed_indexes(resume, total_parts)
         upload_file_type = guess_upload_file_type(file_name)
 
-        if resume is not None and resume.known_fid and completed_indexes == set(
-            range(1, total_parts + 1)
+        if (
+            resume is not None
+            and resume.known_fid
+            and completed_indexes == set(range(1, total_parts + 1))
         ):
             # Defensive: the service layer short-circuits earlier; never resend
             # a fully uploaded file just to re-derive a known fid.
@@ -646,12 +668,8 @@ class WopanClient:
             )
         _check_upload_cancelled(cancel_requested)
         upload_url = f"{zone_url.rstrip('/')}/openapi/client/upload2C"
-        unique_id = (
-            resume.unique_id if resume is not None else str(int(time.time() * 1000))
-        )
-        batch_no = (
-            resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
-        )
+        unique_id = resume.unique_id if resume is not None else str(int(time.time() * 1000))
+        batch_no = resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
         token_key = _wohome_crypto_key(self._access_token)
         file_info = {
             "spaceType": PERSONAL_SPACE_TYPE,
@@ -818,8 +836,7 @@ class WopanClient:
             return None
         if recovered is not None:
             LOGGER.info(
-                "wopan.upload_file.recovered_from_listing parent_id=%s "
-                "original_error_type=%s",
+                "wopan.upload_file.recovered_from_listing parent_id=%s original_error_type=%s",
                 parent_id,
                 type(original_error).__name__,
             )
@@ -1059,23 +1076,17 @@ def resolve_upload_part_plan(file_size: int, upload_part_size_mb: int) -> tuple[
     return part_size, total_parts
 
 
-def pending_upload_indexes(
-    total_parts: int, completed_indexes: Iterable[int] | None
-) -> list[int]:
+def pending_upload_indexes(total_parts: int, completed_indexes: Iterable[int] | None) -> list[int]:
     """Return 1-based part indexes that still need an upload request."""
     completed = set(completed_indexes or ())
     return [index for index in range(1, total_parts + 1) if index not in completed]
 
 
-def _valid_completed_indexes(
-    resume: UploadResumeContext | None, total_parts: int
-) -> set[int]:
+def _valid_completed_indexes(resume: UploadResumeContext | None, total_parts: int) -> set[int]:
     """Filter resume part indexes down to the valid 1..total_parts range."""
     if resume is None:
         return set()
-    return {
-        index for index in resume.completed_indexes if 1 <= index <= total_parts
-    }
+    return {index for index in resume.completed_indexes if 1 <= index <= total_parts}
 
 
 def _extract_part_fid(raw: dict[str, Any]) -> str:
