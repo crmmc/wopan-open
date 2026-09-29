@@ -882,6 +882,9 @@ def test_main_window_move_prompt_opens_dialog_without_subfolders(
 
         exec = staticmethod(lambda: QDialog.DialogCode.Rejected)
 
+        def start_browse(self) -> None:
+            return None
+
         def current_target(self) -> None:
             return None
 

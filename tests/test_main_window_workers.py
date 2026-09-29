@@ -2062,10 +2062,14 @@ class _StubTargetDialog:
         self.excluded_ids = kwargs.get("excluded_ids", frozenset())
         self.parent = kwargs.get("parent")
         self.deleted = False
+        self.browse_started = False
         self.directory_requested = _StubTargetDialogSignal()
         type(self).instances.append(self)
 
     exec = _accept_result_exec()
+
+    def start_browse(self) -> None:
+        self.browse_started = True
 
     def current_target(self) -> object | None:
         return type(self).entry
@@ -2264,7 +2268,9 @@ def test_prompt_move_item_batches_all_selected_rows(
     window.prompt_move_item(1)
 
     dialog = stub_move_dialog.instances[0]
-    assert [entry.name for entry in dialog.initial_folders] == ["Folder"]
+    assert dialog.initial_entry.item_id == ROOT_DIRECTORY_ID
+    assert dialog.initial_folders == []
+    assert dialog.browse_started
     assert dialog.excluded_ids == frozenset({"file-1", "file-2"})
     assert [item.name for item in browser.items_by_parent["target-folder"]] == [
         "report.txt",

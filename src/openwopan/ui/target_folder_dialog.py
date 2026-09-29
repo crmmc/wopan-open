@@ -106,6 +106,10 @@ class TargetFolderDialog(QDialog):
         """Return the folder new items would land in."""
         return self._selected_target
 
+    def start_browse(self) -> None:
+        """Load the listing for the current location (used right after open)."""
+        self._reload_current()
+
     def show_entries(self, entries: Sequence[TargetEntry]) -> None:
         """Display one browsed level, dropping excluded folders."""
         usable = [entry for entry in entries if entry.item_id not in self._excluded_ids]

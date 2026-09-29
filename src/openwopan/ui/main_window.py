@@ -4372,21 +4372,17 @@ class MainWindow(_MainWindowBase):
             return
 
         selected_ids = frozenset(item.item_id for item in items)
-        initial_folders = [
-            TargetEntry(item_id=folder.item_id, name=folder.name)
-            for folder in self._items
-            if folder.kind is WopanItemKind.FOLDER and folder.item_id not in selected_ids
-        ]
-        current_entry = self._breadcrumb[-1]
+        root_entry = self._breadcrumb[0]
         dialog = TargetFolderDialog(
             mode,
-            TargetEntry(item_id=current_entry.item_id, name=current_entry.name),
-            initial_folders,
+            TargetEntry(item_id=root_entry.item_id, name=root_entry.name),
+            [],
             excluded_ids=selected_ids,
             parent=self,
         )
         dialog.directory_requested.connect(self._on_target_directory_requested)
         self._target_dialog = dialog
+        dialog.start_browse()
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         target = dialog.current_target() if accepted else None
         dialog.deleteLater()
