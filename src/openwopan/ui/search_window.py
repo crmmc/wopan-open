@@ -5,6 +5,7 @@ from collections.abc import Callable
 from PySide6.QtCore import QObject, QPoint, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
     QHeaderView,
     QLabel,
     QMenu,
@@ -76,12 +77,15 @@ class _ResolveWorker(QObject):
             self.succeeded.emit(resolved)
 
 
-class SearchResultsWindow(QWidget):
+class SearchResultsWindow(QDialog):
     """独立搜索结果窗口。
 
     结果表（名称/大小/位置）+ 滚动分页；双击结果跳转到所在文件夹（主窗口
     文件视图），窗口保持打开以便连续跳转。跳转路径由注入的
     ``resolve_callable`` 按目录 id 解析（服务层带会话缓存）。
+
+    继承 QDialog：以独立浮层显示在父窗口之上（QWidget 子对象会被嵌入
+    父窗口内部绘制，无法作为弹出窗口使用）。
     """
 
     jump_requested = Signal(object, object)  # path_ids, path_names
@@ -106,6 +110,9 @@ class SearchResultsWindow(QWidget):
         self._resolve_thread: QThread | None = None
         self._resolve_worker: _ResolveWorker | None = None
         self.setWindowTitle("搜索结果")
+        # 非模态浮层：双击结果跳转主窗口时本窗口保持可用、不被遮挡锁定
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setModal(False)
         self.resize(760, 480)
 
         layout = QVBoxLayout(self)
