@@ -70,6 +70,8 @@ DEFAULT_UPLOAD_ZONE_URL = "https://tjupload.pan.wo.cn"
 BYTES_PER_MB = 1024 * 1024
 TOKEN_COOKIE_NAME = "WoCloud-Web-Token"
 PERSONAL_SPACE_TYPE = "0"
+PERSONAL_SEARCH_TYPE = "2"
+SEARCH_DEFAULT_PAGE_SIZE = 50
 PERSONAL_FAMILY_ID = "0"
 DEFAULT_VIP_LEVEL = "0"
 STANDARD_BROWSER_USER_AGENT = (
@@ -335,6 +337,48 @@ class WopanClient:
             parent_id,
             len(items),
             skipped_count,
+        )
+        return items
+
+    def search_files(
+        self, keyword: str, page_no: int = 1, page_size: int = SEARCH_DEFAULT_PAGE_SIZE
+    ) -> list[WopanItem]:
+        """Search personal-space files by keyword across all directories."""
+        if not keyword.strip():
+            raise ValueError("keyword must not be empty")
+        if page_no < 1:
+            raise ValueError("page_no must be at least 1")
+        if page_size < 1:
+            raise ValueError("page_size must be at least 1")
+
+        LOGGER.info(
+            "wopan.search_files.start keyword_length=%s page_no=%s page_size=%s",
+            len(keyword),
+            page_no,
+            page_size,
+        )
+        data = self._dispatch_wohome(
+            "SearchFile",
+            {
+                "searchType": PERSONAL_SEARCH_TYPE,
+                "keyWord": keyword,
+                "pageNo": page_no,
+                "pageSize": page_size,
+                "clientId": CLIENT_ID,
+            },
+        )
+        raw_items = data.get("personalResult") or []
+        if not isinstance(raw_items, list):
+            raise WopanResponseError("SearchFile personalResult is not a list")
+        items: list[WopanItem] = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                raise WopanResponseError("SearchFile item is not an object")
+            items.append(_read_search_item(raw_item))
+        LOGGER.info(
+            "wopan.search_files.success keyword_length=%s item_count=%s",
+            len(keyword),
+            len(items),
         )
         return items
 
@@ -1159,6 +1203,35 @@ def _read_wopan_item(raw: dict[str, Any], fallback_parent_id: str) -> WopanItem:
         file_type=_read_optional_text(raw.get("fileType")),
         download_id=_read_optional_text(raw.get("fid")),
         size=_read_optional_int(raw.get("size")),
+        updated_at=_read_wopan_timestamp(raw),
+    )
+
+
+def _read_search_item(raw: dict[str, Any]) -> WopanItem:
+    item_id = str(raw.get("id") or "")
+    name = str(raw.get("fileName") or raw.get("name") or "")
+    if not item_id:
+        raise WopanResponseError("SearchFile item missing id")
+    if not name:
+        raise WopanResponseError("SearchFile item missing fileName")
+    raw_type = _read_wopan_item_type(raw)
+    if raw_type == "0":
+        kind = WopanItemKind.FOLDER
+    elif raw_type == "1":
+        kind = WopanItemKind.FILE
+    else:
+        raise WopanResponseError(f"SearchFile item has unknown type: {raw_type}")
+    size = _read_optional_int(raw.get("fileSize"))
+    if size is None:
+        size = _read_optional_int(raw.get("size"))
+    return WopanItem(
+        item_id=item_id,
+        name=name,
+        kind=kind,
+        parent_id="",
+        file_type=_read_optional_text(raw.get("fileType")),
+        download_id=_read_optional_text(raw.get("fid")),
+        size=size,
         updated_at=_read_wopan_timestamp(raw),
     )
 

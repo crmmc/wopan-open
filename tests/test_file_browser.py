@@ -44,6 +44,7 @@ class FakeClient:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.requested_parent_ids: list[str] = []
+        self.searched_keywords: list[tuple[str, int, int]] = []
         self.created_folders: list[tuple[str, str]] = []
         self.renamed_items: list[tuple[str, str, WopanItemKind, str | None]] = []
         self.deleted_items: list[tuple[str, WopanItemKind]] = []
@@ -59,6 +60,16 @@ class FakeClient:
         if self.error is not None:
             raise self.error
         return [WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)]
+
+    def search_files(
+        self, keyword: str, page_no: int = 1, page_size: int = 50
+    ) -> list[WopanItem]:
+        self.searched_keywords.append((keyword, page_no, page_size))
+        if self.error is not None:
+            raise self.error
+        return [
+            WopanItem(item_id="file-9", name=f"{keyword}.txt", kind=WopanItemKind.FILE)
+        ]
 
     def create_folder(self, parent_id: str, name: str) -> WopanItem:
         self.created_folders.append((parent_id, name))
@@ -252,6 +263,16 @@ def test_plan_transfer_batch_without_conflicts_transfers_everything() -> None:
     assert plan.transfer_items == items
     assert plan.conflict_names == ()
     assert plan.noop_ids == frozenset()
+
+
+def test_file_browser_service_searches_files() -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    items = service.search_files("report", page_no=2, page_size=25)
+
+    assert client.searched_keywords == [("report", 2, 25)]
+    assert [item.name for item in items] == ["report.txt"]
 
 
 def test_file_browser_service_downloads_file_to_local_path(tmp_path: Path) -> None:

@@ -315,6 +315,117 @@ def test_copy_many_sends_one_request_with_dir_and_file_lists() -> None:
     ]
 
 
+def test_search_files_sends_request_and_maps_items() -> None:
+    client, captured = _client_and_captured_params(
+        [
+            _success_response(
+                {
+                    "personalResult": [
+                        {
+                            "id": "file-1",
+                            "fileName": "report.txt",
+                            "fileSize": 2048,
+                            "type": "1",
+                            "fid": "fid-1",
+                            "fileType": "4",
+                        },
+                        {
+                            "id": "folder-1",
+                            "fileName": "docs",
+                            "fileSize": 0,
+                            "type": "0",
+                        },
+                    ],
+                    "familyResult": [],
+                }
+            )
+        ]
+    )
+
+    items = client.search_files("report", page_no=2, page_size=10)
+
+    assert captured == [
+        (
+            "SearchFile",
+            {
+                "searchType": "2",
+                "keyWord": "report",
+                "pageNo": 2,
+                "pageSize": 10,
+                "clientId": "1001000021",
+            },
+        )
+    ]
+    assert [item.name for item in items] == ["report.txt", "docs"]
+    assert [item.kind for item in items] == [
+        WopanItemKind.FILE,
+        WopanItemKind.FOLDER,
+    ]
+    assert items[0].size == 2048
+    assert items[0].download_id == "fid-1"
+    assert items[0].parent_id == ""
+
+
+def test_search_files_returns_empty_list_without_personal_result() -> None:
+    client, captured = _client_and_captured_params([_success_response({})])
+
+    items = client.search_files("nothing")
+
+    assert items == []
+    assert captured[0][0] == "SearchFile"
+
+
+def test_search_files_rejects_non_list_personal_result() -> None:
+    client, _captured = _client_and_captured_params([_success_response({"personalResult": "nope"})])
+
+    with pytest.raises(WopanResponseError, match="personalResult is not a list"):
+        client.search_files("kw")
+
+
+@pytest.mark.parametrize(
+    ("raw_item", "match"),
+    [
+        ({"fileName": "a.txt", "type": "1"}, "missing id"),
+        ({"id": "file-1", "type": "1"}, "missing fileName"),
+        ({"id": "file-1", "fileName": "a.txt", "type": "9"}, "unknown type"),
+    ],
+)
+def test_search_files_rejects_malformed_items(raw_item: dict[str, object], match: str) -> None:
+    client, _captured = _client_and_captured_params(
+        [_success_response({"personalResult": [raw_item]})]
+    )
+
+    with pytest.raises(WopanResponseError, match=match):
+        client.search_files("kw")
+
+
+def test_search_files_rejects_non_dict_item() -> None:
+    client, _captured = _client_and_captured_params(
+        [_success_response({"personalResult": ["str-item"]})]
+    )
+
+    with pytest.raises(WopanResponseError, match="item is not an object"):
+        client.search_files("kw")
+
+
+def test_search_files_falls_back_to_size_field() -> None:
+    client, _captured = _client_and_captured_params(
+        [
+            _success_response(
+                {
+                    "personalResult": [
+                        {"id": "file-1", "fileName": "a.txt", "type": "1", "size": 4096}
+                    ]
+                }
+            )
+        ]
+    )
+
+    items = client.search_files("a")
+
+    assert items[0].size == 4096
+
+
 def test_upload_file_gets_zone_and_posts_single_part(tmp_path: Path) -> None:
     local_file = tmp_path / "report.txt"
     local_file.write_bytes(b"upload-content")
@@ -521,7 +632,9 @@ def test_upload_cancel_after_inflight_part_does_not_report_success(tmp_path: Pat
 
     with pytest.raises(WopanUploadCancelledError):
         client.upload_file(
-            "0", local_file, cancel_requested=lambda: cancelled,
+            "0",
+            local_file,
+            cancel_requested=lambda: cancelled,
             progress_callback=lambda done, total: progress.append((done, total)),
         )
 
@@ -553,7 +666,10 @@ def test_upload_cancel_queued_parts_before_they_send(
 
     with pytest.raises(WopanUploadCancelledError):
         client.upload_file(
-            "0", local_file, upload_part_size_mb=5, max_upload_threads=1,
+            "0",
+            local_file,
+            upload_part_size_mb=5,
+            max_upload_threads=1,
             cancel_requested=lambda: cancelled,
             progress_callback=lambda done, total: progress.append((done, total)),
         )
@@ -747,6 +863,10 @@ def test_get_download_info_rejects_malformed_response(data: object, match: str) 
             lambda client: client.copy_many([("", WopanItemKind.FILE)], "0"),
             "item_id",
         ),
+        (lambda client: client.search_files(""), "keyword"),
+        (lambda client: client.search_files("   "), "keyword"),
+        (lambda client: client.search_files("kw", 0), "page_no"),
+        (lambda client: client.search_files("kw", 1, 0), "page_size"),
         (lambda client: client.upload_file("", Path("report.txt")), "parent_id"),
         (lambda client: client.get_download_info(""), "download_id"),
     ],

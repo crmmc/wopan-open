@@ -125,6 +125,11 @@ class FileBrowserBackend(Protocol):
     def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
         """Return file items for a directory."""
 
+    def search_files(
+        self, keyword: str, page_no: int = 1, page_size: int = 50
+    ) -> list[WopanItem]:
+        """Search personal-space files by keyword across directories."""
+
     def create_folder(self, parent_id: str, name: str) -> WopanItem:
         """Create a folder and return the created item."""
 
@@ -361,6 +366,24 @@ class FileBrowserService:
         LOGGER.info(
             "file_browser.list_directory.success parent_id=%s item_count=%s",
             parent_id,
+            len(items),
+        )
+        return items
+
+    def search_files(
+        self, keyword: str, page_no: int = 1, page_size: int = 50
+    ) -> list[WopanItem]:
+        """Search personal-space files and map authentication failures to UI state."""
+        LOGGER.info(
+            "file_browser.search_files.start keyword_length=%s page_no=%s page_size=%s",
+            len(keyword),
+            page_no,
+            page_size,
+        )
+        items = self._call(lambda: self._client.search_files(keyword, page_no, page_size))
+        LOGGER.info(
+            "file_browser.search_files.success keyword_length=%s item_count=%s",
+            len(keyword),
             len(items),
         )
         return items
