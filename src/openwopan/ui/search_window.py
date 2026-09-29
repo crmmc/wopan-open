@@ -117,9 +117,21 @@ class SearchResultsWindow(QWidget):
         self.result_table = TableWidget(self)
         self.result_table.setColumnCount(len(SEARCH_PAGE_COLUMNS))
         self.result_table.setHorizontalHeaderLabels(SEARCH_PAGE_COLUMNS)
-        self.result_table.horizontalHeader().setSectionResizeMode(
-            COL_SEARCH_LOCATION, QHeaderView.ResizeMode.Stretch
-        )
+        self.result_table.setBorderVisible(True)
+        vertical_header = self.result_table.verticalHeader()
+        if vertical_header is not None:
+            vertical_header.hide()
+        header = self.result_table.horizontalHeader()
+        if header is not None:  # pragma: no cover - Qt 表格恒持有表头
+            header.setSectionResizeMode(
+                COL_SEARCH_NAME, QHeaderView.ResizeMode.Stretch
+            )
+            header.setSectionResizeMode(
+                COL_SEARCH_SIZE, QHeaderView.ResizeMode.ResizeToContents
+            )
+            header.setSectionResizeMode(
+                COL_SEARCH_LOCATION, QHeaderView.ResizeMode.Stretch
+            )
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.setWordWrap(False)
