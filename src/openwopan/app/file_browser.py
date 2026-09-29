@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
@@ -19,24 +21,59 @@ from openwopan.tasks.download import (
     download_url,
     make_download_task_id,
 )
+from openwopan.tasks.scheduler import (
+    DownloadEventCallback as SchedulerEventCallback,
+)
+from openwopan.tasks.scheduler import (
+    DownloadScheduler,
+    DownloadTaskInput,
+)
 from openwopan.tasks.upload import (
+    UPLOAD_SESSION_MAX_AGE_SECONDS,
     FolderUploadJob,
     PlannedUploadFile,
+    UploadTaskRecord,
+    UploadTaskState,
+    UploadTaskStore,
+    make_upload_task_id,
     next_available_name,
     scan_folder_tree,
 )
-from openwopan.wopan.client import ORIGIN, REFERER, ROOT_DIRECTORY_ID, WopanClient
-from openwopan.wopan.errors import WopanAuthenticationError, WopanError
-from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.client import (
+    ORIGIN,
+    REFERER,
+    ROOT_DIRECTORY_ID,
+    UploadResumeContext,
+    WopanClient,
+    build_uploaded_file_item,
+    resolve_upload_part_plan,
+)
+from openwopan.wopan.errors import (
+    WopanAuthenticationError,
+    WopanError,
+    WopanUploadCancelledError,
+)
+from openwopan.wopan.models import (
+    DownloadInfo,
+    WopanCloudUsage,
+    WopanItem,
+    WopanItemKind,
+)
 
 LOGGER = logging.getLogger(__name__)
 DownloadProgressCallback = Callable[[int, int | None], None]
+UploadProgressCallback = Callable[[int, int], None]
 DownloadStatusCallback = Callable[[DownloadStatus], None]
 DownloadConnectionCallback = Callable[[int, int], None]
+DownloadEventCallback = SchedulerEventCallback
 
 
 class FileBrowserError(Exception):
     """Base error for UI-facing file browser failures."""
+
+
+class FileBrowserUploadCancelledError(FileBrowserError):
+    """Raised when an upload was cooperatively cancelled."""
 
 
 class FileBrowserLoginRequiredError(FileBrowserError):
@@ -74,16 +111,49 @@ class FileBrowserBackend(Protocol):
     ) -> DownloadResult | None:
         """Download one file to a local path."""
 
+    def set_download_event_callback(self, callback: DownloadEventCallback | None) -> None:
+        """Attach the UI observer without exposing scheduler internals."""
+        ...
+
+    def submit_download(self, item: WopanItem, local_path: Path) -> str:
+        """Queue one file download without exposing its URL to callers."""
+
+    def pause_download(self, task_id: str) -> bool:
+        """Pause one download task."""
+
+    def resume_download(self, task_id: str) -> bool:
+        """Resume one download task."""
+
+    def cancel_download(self, task_id: str, *, cleanup: bool = False) -> bool:
+        """Cancel one download task."""
+
+    def recover_downloads(self) -> tuple[DownloadTaskRecord, ...]:
+        """Restore persisted download tasks."""
+
+    def download_records(self) -> tuple[DownloadTaskRecord, ...]:
+        """Return persisted download records."""
+
     def upload_file(
         self,
         parent_id: str,
         local_path: Path,
         *,
         upload_name: str | None = None,
+        progress_callback: UploadProgressCallback | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> WopanItem:
         """Upload one local file to a directory."""
+    def recover_uploads(self) -> tuple[UploadTaskRecord, ...]:
+        """Normalize persisted upload states and surface resumable rows."""
 
-    def prepare_folder_upload(self, parent_id: str, local_root: Path) -> FolderUploadJob:
+    def prepare_folder_upload(
+        self,
+        parent_id: str,
+        local_root: Path,
+        *,
+        root_name: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> FolderUploadJob:
         """Create the cloud directory tree for a local folder upload."""
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
@@ -99,15 +169,142 @@ class FileBrowserService:
         http_client: httpx.Client | None = None,
         settings: AppSettings | None = None,
         download_store: DownloadTaskStore | None = None,
+        download_event_callback: DownloadEventCallback | None = None,
+        download_scheduler: DownloadScheduler | None = None,
+        upload_store: UploadTaskStore | None = None,
     ) -> None:
         self._client = client
         self._settings = settings or AppSettings()
         self._download_store = download_store or DownloadTaskStore()
+        self._download_scheduler = download_scheduler or DownloadScheduler(
+            max_concurrent_downloads=self._settings.max_concurrent_downloads,
+            on_event=download_event_callback,
+        )
+        # None (legacy callers / tests) disables upload persistence;
+        # the production factory injects a real store so uploads resume.
+        self._upload_store = upload_store
         self._http_client = http_client or httpx.Client(
             headers={"Origin": ORIGIN, "Referer": REFERER},
             follow_redirects=True,
             timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
         )
+
+    def set_download_event_callback(self, callback: DownloadEventCallback | None) -> None:
+        """Attach the UI observer without exposing scheduler internals."""
+        self._download_scheduler.set_event_callback(callback)
+
+    def submit_download(self, item: WopanItem, local_path: Path) -> str:
+        """Resolve one file's download information and enqueue it."""
+        download_id = self._validate_download(item, local_path)
+        download_info = self._resolve_download_info(download_id)
+        task_id = make_download_task_id(download_id, local_path)
+        if self._download_store.load(task_id) is not None:
+            task_id = f"{task_id}-{uuid.uuid4().hex}"
+        task = self._build_download_task(
+            task_id=task_id,
+            file_name=item.name,
+            local_path=local_path,
+            download_id=download_id,
+            url=download_info.url,
+        )
+        try:
+            return self._download_scheduler.submit(task)
+        except ValueError:
+            task_id = f"{task_id}-{uuid.uuid4().hex}"
+            task = self._build_download_task(
+                task_id=task_id,
+                file_name=item.name,
+                local_path=local_path,
+                download_id=download_id,
+                url=download_info.url,
+            )
+            try:
+                return self._download_scheduler.submit(task)
+            except ValueError as exc:
+                raise FileBrowserError("下载任务已存在") from exc
+
+    def pause_download(self, task_id: str) -> bool:
+        """Pause one queued or active download task."""
+        return self._download_scheduler.pause(task_id)
+
+    def resume_download(self, task_id: str) -> bool:
+        """Resume one paused or failed download task."""
+        return self._download_scheduler.resume(task_id)
+
+    def cancel_download(self, task_id: str, *, cleanup: bool = False) -> bool:
+        """Cancel one queued or active download task."""
+        return self._download_scheduler.cancel(task_id, cleanup=cleanup)
+
+    def recover_downloads(self) -> tuple[DownloadTaskRecord, ...]:
+        """Resolve persisted download ids and requeue recoverable tasks."""
+        tasks: list[DownloadTaskInput] = []
+        for state in self._download_store.load_all():
+            if state.status in {"已完成", "已取消"}:
+                continue
+            if not state.download_id:
+                state.status = "失败"
+                state.error = "文件缺少下载标识，请刷新后重试"
+                self._download_store.save(state)
+                continue
+            try:
+                download_info = self._resolve_download_info(state.download_id)
+            except FileBrowserError as exc:
+                state.status = "失败"
+                state.error = str(exc)
+                self._download_store.save(state)
+                continue
+            tasks.append(
+                self._build_download_task(
+                    task_id=state.task_id,
+                    file_name=state.file_name,
+                    local_path=state.save_path,
+                    download_id=state.download_id,
+                    url=download_info.url,
+                )
+            )
+        self._download_scheduler.recover(tasks)
+        return self.download_records()
+
+    def close_downloads(self, *, wait: bool = True) -> None:
+        """Close the download scheduler and its worker pool."""
+        self._download_scheduler.close(wait=wait)
+
+    def _resolve_download_info(self, download_id: str) -> DownloadInfo:
+        return self._call(lambda: self._client.get_download_info(download_id))
+
+    def _build_download_task(
+        self,
+        *,
+        task_id: str,
+        file_name: str,
+        local_path: Path,
+        download_id: str,
+        url: str,
+    ) -> DownloadTaskInput:
+        def refresh_download_url() -> str:
+            return self._call(lambda: self._client.get_download_info(download_id)).url
+
+        return DownloadTaskInput(
+            task_id=task_id,
+            file_name=file_name,
+            local_path=local_path,
+            url=url,
+            download_id=download_id,
+            settings=self._settings,
+            store=self._download_store,
+            http_client=self._http_client,
+            refresh_url=refresh_download_url,
+        )
+
+    @staticmethod
+    def _validate_download(item: WopanItem, local_path: Path) -> str:
+        if item.kind is not WopanItemKind.FILE:
+            raise FileBrowserError("只能下载文件")
+        if not local_path.name:
+            raise FileBrowserError("保存路径不能为空")
+        if not item.download_id:
+            raise FileBrowserError("文件缺少下载标识，请刷新后重试")
+        return item.download_id
 
     def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
         """List a directory and map protocol authentication failures to UI state."""
@@ -230,34 +427,160 @@ class FileBrowserService:
         local_path: Path,
         *,
         upload_name: str | None = None,
+        progress_callback: UploadProgressCallback | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> WopanItem:
-        """Upload one local file to a directory."""
+        """Upload one local file to a directory, resuming a persisted session."""
         if not parent_id:
             raise FileBrowserError("目标文件夹不能为空")
         if not local_path.exists():
             raise FileBrowserError("本地文件不存在")
         if not local_path.is_file():
             raise FileBrowserError("只能上传文件")
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserUploadCancelledError("上传已取消")
+        if upload_name is not None:
+            if not upload_name:
+                raise FileBrowserError("上传文件名称不能为空")
+            if upload_name in self._existing_names(parent_id):
+                raise FileBrowserError("上传目标已存在，请刷新后重试")
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserUploadCancelledError("上传已取消")
 
         LOGGER.info(
             "file_browser.upload_file.start parent_id=%s file_name_length=%s",
             parent_id,
             len(local_path.name),
         )
-        try:
-            item = self._call(
-                lambda: self._client.upload_file(
-                    parent_id,
-                    local_path,
-                    upload_part_size_mb=self._settings.upload_part_size_mb,
-                    max_upload_threads=self._settings.max_upload_threads,
-                    retry_max_attempts=self._settings.retry_max_attempts,
-                    upload_name=upload_name,
+        store = self._upload_store
+        resume: UploadResumeContext | None = None
+        upload_task_id = ""
+        if store is not None:
+            try:
+                stat_result = local_path.stat()
+            except OSError as exc:
+                LOGGER.warning(
+                    "file_browser.upload_file.stat_failed error_type=%s",
+                    type(exc).__name__,
                 )
+                raise FileBrowserError(f"无法读取本地文件：{exc}") from exc
+            part_size, total_parts = resolve_upload_part_plan(
+                stat_result.st_size, self._settings.upload_part_size_mb
             )
+            upload_task_id = make_upload_task_id(parent_id, local_path, upload_name)
+            state = self._prepare_upload_state(
+                store,
+                task_id=upload_task_id,
+                parent_id=parent_id,
+                local_path=local_path,
+                upload_name=upload_name,
+                file_size=stat_result.st_size,
+                file_mtime=stat_result.st_mtime,
+                part_size=part_size,
+                total_parts=total_parts,
+            )
+            completed = frozenset(state.completed_indexes)
+            resume = UploadResumeContext(
+                unique_id=state.unique_id,
+                batch_no=state.batch_no,
+                completed_indexes=completed,
+                known_fid=state.fid,
+                on_part_result=self._make_upload_part_recorder(store, upload_task_id),
+            )
+            if state.fid and completed == frozenset(range(1, total_parts + 1)):
+                item = build_uploaded_file_item(
+                    file_name=state.file_name,
+                    parent_id=parent_id,
+                    file_size=state.file_size,
+                    fid=state.fid,
+                )
+                store.delete(upload_task_id)
+                LOGGER.info(
+                    "file_browser.upload_file.resume_complete parent_id=%s item_id=%s",
+                    parent_id,
+                    item.item_id,
+                )
+                return item
+
+        try:
+            item = self._invoke_upload_client(
+                parent_id,
+                local_path,
+                upload_name=upload_name,
+                progress_callback=progress_callback,
+                cancel_requested=cancel_requested,
+                resume=resume,
+            )
+        except FileBrowserUploadCancelledError:
+            if store is not None:
+                store.delete(upload_task_id)
+            raise
+        except Exception as exc:
+            if store is not None:
+                message = str(exc)
+                try:
+                    store.update(
+                        upload_task_id,
+                        lambda state: _mark_upload_failed(state, message),
+                    )
+                except KeyError:
+                    LOGGER.debug("file_browser.upload_file.record_after_delete")
+            raise
+        if store is not None:
+            store.delete(upload_task_id)
+        LOGGER.info(
+            "file_browser.upload_file.success parent_id=%s item_id=%s file_name_length=%s",
+            parent_id,
+            item.item_id,
+            len(item.name),
+        )
+        return item
+
+    def _invoke_upload_client(
+        self,
+        parent_id: str,
+        local_path: Path,
+        *,
+        upload_name: str | None,
+        progress_callback: UploadProgressCallback | None,
+        cancel_requested: Callable[[], bool] | None,
+        resume: UploadResumeContext | None,
+    ) -> WopanItem:
+        """Call the client, degrading kwargs for backends without new parameters."""
+        kwargs: dict[str, object] = {
+            "upload_part_size_mb": self._settings.upload_part_size_mb,
+            "max_upload_threads": self._settings.max_upload_threads,
+            "retry_max_attempts": self._settings.retry_max_attempts,
+            "upload_name": upload_name,
+        }
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        if cancel_requested is not None:
+            kwargs["cancel_requested"] = cancel_requested
+        if resume is not None:
+            kwargs["resume"] = resume
+        try:
+            while True:
+                try:
+                    return self._call(
+                        lambda: self._client.upload_file(
+                            parent_id,
+                            local_path,
+                            **kwargs,  # type: ignore[arg-type]
+                        )
+                    )
+                except TypeError:
+                    for key in ("resume", "cancel_requested", "progress_callback"):
+                        if key in kwargs:
+                            del kwargs[key]
+                            break
+                    else:
+                        raise
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
-            LOGGER.warning("file_browser.upload_file.http_status_error status=%s", status_code)
+            LOGGER.warning(
+                "file_browser.upload_file.http_status_error status=%s", status_code
+            )
             raise FileBrowserError(f"HTTP {status_code}") from exc
         except httpx.HTTPError as exc:
             LOGGER.warning(
@@ -268,15 +591,90 @@ class FileBrowserService:
         except OSError as exc:
             LOGGER.warning("file_browser.upload_file.read_error error=%s", exc)
             raise FileBrowserError(f"无法读取本地文件：{exc}") from exc
-        LOGGER.info(
-            "file_browser.upload_file.success parent_id=%s item_id=%s file_name_length=%s",
-            parent_id,
-            item.item_id,
-            len(item.name),
-        )
-        return item
 
-    def prepare_folder_upload(self, parent_id: str, local_root: Path) -> FolderUploadJob:
+    def _prepare_upload_state(
+        self,
+        store: UploadTaskStore,
+        *,
+        task_id: str,
+        parent_id: str,
+        local_path: Path,
+        upload_name: str | None,
+        file_size: int,
+        file_mtime: float,
+        part_size: int,
+        total_parts: int,
+    ) -> UploadTaskState:
+        """Reuse a persisted upload session or start a fresh one."""
+        state = store.load(task_id)
+        if state is not None and _upload_state_reusable(
+            state,
+            parent_id=parent_id,
+            file_size=file_size,
+            file_mtime=file_mtime,
+            part_size=part_size,
+            total_parts=total_parts,
+        ):
+            return store.update(task_id, _reset_upload_session)
+        if state is not None:
+            store.delete(task_id)
+        fresh = UploadTaskState(
+            task_id=task_id,
+            file_name=upload_name if upload_name is not None else local_path.name,
+            local_path=local_path,
+            parent_id=parent_id,
+            upload_name=upload_name,
+            file_size=file_size,
+            file_mtime=file_mtime,
+            part_size=part_size,
+            total_parts=total_parts,
+            unique_id=str(int(time.time() * 1000)),
+            batch_no=time.strftime("%Y%m%d%H%M%S"),
+        )
+        store.save(fresh)
+        return fresh
+
+    def _make_upload_part_recorder(
+        self, store: UploadTaskStore, task_id: str
+    ) -> Callable[[int, str], None]:
+        """Record each confirmed part under the store lock (worker-thread safe)."""
+
+        def record_part_result(part_index: int, fid: str) -> None:
+            try:
+                store.update(
+                    task_id,
+                    lambda state: _record_upload_part(state, part_index, fid),
+                )
+            except KeyError:
+                LOGGER.debug(
+                    "file_browser.upload_file.record_after_delete part_index=%s",
+                    part_index,
+                )
+
+        return record_part_result
+
+    def recover_uploads(self) -> tuple[UploadTaskRecord, ...]:
+        """Normalize persisted upload states after an application restart."""
+        store = self._upload_store
+        if store is None:
+            return ()
+        records: list[UploadTaskRecord] = []
+        for state in store.load_all():
+            if state.status == "已完成" or not state.local_path.exists():
+                store.delete(state.task_id)
+                continue
+            updated = store.update(state.task_id, _mark_upload_interrupted)
+            records.append(_upload_state_record(updated))
+        return tuple(records)
+
+    def prepare_folder_upload(
+        self,
+        parent_id: str,
+        local_root: Path,
+        *,
+        root_name: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> FolderUploadJob:
         """Create the cloud directory tree for a local folder upload.
 
         Creates every directory (root first, parent before child, empty dirs
@@ -289,6 +687,8 @@ class FileBrowserService:
             raise FileBrowserError("目标文件夹不能为空")
         if not local_root.name:
             raise FileBrowserError("上传文件夹不能为空")
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserUploadCancelledError("上传已取消")
         LOGGER.info(
             "file_browser.prepare_folder_upload.start parent_id=%s root_name_length=%s",
             parent_id,
@@ -305,8 +705,20 @@ class FileBrowserService:
             raise FileBrowserError(f"扫描本地文件夹失败：{exc}") from exc
 
         try:
-            root_name = next_available_name(plan.root_name, self._existing_names(parent_id))
-            root_item = self.create_folder(parent_id, root_name)
+            if cancel_requested is not None and cancel_requested():
+                raise FileBrowserUploadCancelledError("上传已取消")
+            existing_root_names = self._existing_names(parent_id)
+            if root_name is None:
+                resolved_root_name = next_available_name(plan.root_name, existing_root_names)
+            else:
+                if not root_name:
+                    raise FileBrowserError("上传文件夹名称不能为空")
+                if root_name in existing_root_names:
+                    raise FileBrowserError("上传目标已存在，请刷新后重试")
+                resolved_root_name = root_name
+            if cancel_requested is not None and cancel_requested():
+                raise FileBrowserUploadCancelledError("上传已取消")
+            root_item = self.create_folder(parent_id, resolved_root_name)
             dir_ids = {"": root_item.item_id}
             used_names: dict[str, set[str]] = {}
 
@@ -316,16 +728,26 @@ class FileBrowserService:
                 return used_names[rel_dir]
 
             for rel_path in plan.folders:
+                if cancel_requested is not None and cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
                 rel_parent, _, local_name = rel_path.rpartition("/")
                 parent_names = taken_names(rel_parent)
+                if root_name is not None and local_name in parent_names:
+                    raise FileBrowserError("上传目标已存在，请刷新后重试")
                 folder_name = next_available_name(local_name, parent_names)
+                if cancel_requested is not None and cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
                 created = self.create_folder(dir_ids[rel_parent], folder_name)
                 parent_names.add(folder_name)
                 dir_ids[rel_path] = created.item_id
 
             planned_files: list[PlannedUploadFile] = []
             for planned in plan.files:
+                if cancel_requested is not None and cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
                 names = taken_names(planned.rel_dir)
+                if root_name is not None and planned.name in names:
+                    raise FileBrowserError("上传目标已存在，请刷新后重试")
                 upload_name = next_available_name(planned.name, names)
                 names.add(upload_name)
                 planned_files.append(
@@ -338,6 +760,8 @@ class FileBrowserService:
                 )
         except FileBrowserLoginRequiredError:
             raise
+        except FileBrowserUploadCancelledError:
+            raise
         except FileBrowserError as exc:
             LOGGER.warning(
                 "file_browser.prepare_folder_upload.failed error_type=%s",
@@ -345,6 +769,8 @@ class FileBrowserService:
             )
             raise FileBrowserError(f"创建目录失败：{exc}") from exc
 
+        if cancel_requested is not None and cancel_requested():
+            raise FileBrowserUploadCancelledError("上传已取消")
         total_bytes = sum(planned.size for planned in planned_files)
         LOGGER.info(
             "file_browser.prepare_folder_upload.success parent_id=%s folder_count=%s "
@@ -356,7 +782,7 @@ class FileBrowserService:
         )
         return FolderUploadJob(
             root_item_id=root_item.item_id,
-            root_name=root_name,
+            root_name=resolved_root_name,
             files=tuple(planned_files),
             total_bytes=total_bytes,
         )
@@ -382,12 +808,17 @@ class FileBrowserService:
         except WopanAuthenticationError as exc:
             LOGGER.info("file_browser.login_required")
             raise FileBrowserLoginRequiredError("登录已过期，请重新登录") from exc
+        except WopanUploadCancelledError as exc:
+            raise FileBrowserUploadCancelledError("上传已取消") from exc
         except WopanError as exc:
             LOGGER.warning("file_browser.protocol_error error=%s", exc)
             raise FileBrowserError(str(exc)) from exc
 
     def update_settings(self, settings: AppSettings) -> None:
         """Apply updated transfer settings to future operations."""
+        self._download_scheduler.set_max_concurrent_downloads(
+            settings.max_concurrent_downloads
+        )
         self._settings = settings
 
     def download_records(self) -> tuple[DownloadTaskRecord, ...]:
@@ -395,8 +826,9 @@ class FileBrowserService:
         return self._download_store.list_records()
 
     def remove_download_record(self, task_id: str) -> None:
-        """Remove a persisted download record and temporary state."""
-        self._download_store.delete(task_id)
+        """Remove a paused or finished download and its temporary state."""
+        if not self._download_scheduler.remove_record(task_id):
+            self._download_store.delete(task_id)
 
 
 def build_file_browser_service(
@@ -404,4 +836,74 @@ def build_file_browser_service(
     settings: AppSettings | None = None,
 ) -> FileBrowserService:
     """Build a file browser service for a validated Cookie header."""
-    return FileBrowserService(WopanClient(cookie_header), settings=settings)
+    return FileBrowserService(
+        WopanClient(cookie_header),
+        settings=settings,
+        upload_store=UploadTaskStore(),
+    )
+
+
+def _upload_state_reusable(
+    state: UploadTaskState,
+    *,
+    parent_id: str,
+    file_size: int,
+    file_mtime: float,
+    part_size: int,
+    total_parts: int,
+) -> bool:
+    """Return True when a persisted upload session still matches this upload."""
+    return (
+        state.status != "已完成"
+        and state.parent_id == parent_id
+        and state.file_size == file_size
+        and state.file_mtime == file_mtime
+        and state.part_size == part_size
+        and state.total_parts == total_parts
+        and time.time() - state.updated_at <= UPLOAD_SESSION_MAX_AGE_SECONDS
+    )
+
+
+def _reset_upload_session(state: UploadTaskState) -> None:
+    """Mark a reused upload session as active again."""
+    state.status = "进行中"
+    state.error = ""
+
+
+def _record_upload_part(state: UploadTaskState, part_index: int, fid: str) -> None:
+    """Merge one confirmed part into the persisted upload state."""
+    if part_index not in state.completed_indexes:
+        state.completed_indexes = [*state.completed_indexes, part_index]
+    if fid and not state.fid:
+        state.fid = fid
+
+
+def _mark_upload_failed(state: UploadTaskState, message: str) -> None:
+    """Persist a failed upload while keeping its completed parts."""
+    state.status = "失败"
+    state.error = message
+
+
+def _mark_upload_interrupted(state: UploadTaskState) -> None:
+    """Normalize a state left behind by an interrupted application run."""
+    state.status = "失败"
+    state.error = (
+        f"应用中断，可续传（已完成 {len(state.completed_indexes)}/{state.total_parts} 分片）"
+    )
+
+
+def _upload_state_record(state: UploadTaskState) -> UploadTaskRecord:
+    """Project a persisted upload state onto the transfer-center record."""
+    return UploadTaskRecord(
+        task_id=state.task_id,
+        name=state.file_name,
+        local_path=state.local_path,
+        target_parent_id=state.parent_id,
+        status=state.status,
+        completed_parts=len(state.completed_indexes),
+        total_parts=state.total_parts,
+        file_size=state.file_size,
+        upload_name=state.upload_name,
+        error=state.error,
+        resumable=True,
+    )

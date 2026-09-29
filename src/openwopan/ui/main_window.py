@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from PySide6.QtCore import (
     QItemSelectionModel,
@@ -23,12 +26,15 @@ from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QListWidget,
     QMainWindow,
     QMenu,
+    QRadioButton,
     QSplitter,
     QStackedWidget,
     QTableWidgetItem,
@@ -75,12 +81,25 @@ from openwopan.app.file_browser import (
     FileBrowserBackend,
     FileBrowserError,
     FileBrowserLoginRequiredError,
+    FileBrowserUploadCancelledError,
 )
 from openwopan.app.logging_config import app_log_path, set_logging_level
 from openwopan.auth.session import AuthSession
 from openwopan.storage.settings import AppSettings, app_settings_path, save_app_settings
-from openwopan.tasks.download import DownloadTaskControl
-from openwopan.tasks.upload import FolderUploadJob
+from openwopan.storage.transfer_records import TransferRecordStore
+from openwopan.tasks.download import DownloadTaskControl, DownloadTaskRecord
+from openwopan.tasks.scheduler import DownloadTaskEvent
+from openwopan.tasks.transfer_rate import TransferRateEstimator
+from openwopan.tasks.upload import (
+    FolderUploadJob,
+    UploadBatchSummary,
+    UploadConflictResolution,
+    UploadTaskRecord,
+    find_upload_conflicts,
+    format_upload_summary,
+    resolve_upload_targets,
+    scan_upload_inputs,
+)
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
 
@@ -98,7 +117,9 @@ TRANSFER_COL_ACTION = 5
 TRANSFER_ACTION_COLUMN_WIDTH = 156
 TRANSFER_ACTION_BUTTON_SIZE = (32, 24)
 THREAD_JOIN_TIMEOUT_MS = 3000
-UPLOAD_STATUS_FILTERS = ("全部", "等待中", "上传中", "已完成", "失败")
+UPLOAD_STATUS_FILTERS = (
+    "全部", "等待中", "上传中", "创建目录中", "已暂停", "已完成", "失败", "已取消"
+)
 DOWNLOAD_STATUS_FILTERS = (
     "全部",
     "等待中",
@@ -112,6 +133,8 @@ DOWNLOAD_STATUS_FILTERS = (
 )
 TERMINAL_TRANSFER_STATUSES = frozenset({"已完成", "失败", "已取消"})
 ACTIVE_DOWNLOAD_STATUSES = frozenset({"等待中", "校验中", "下载中", "合并中"})
+ACTIVE_UPLOAD_STATUSES = frozenset({"等待中", "上传中"})
+DownloadConflictResolution = Literal["skip", "copy"]
 FRAME_STYLE = (
     "QFrame#frame, QFrame#listFrame {"
     "border: 1px solid rgba(0, 0, 0, 15);"
@@ -123,6 +146,8 @@ LOGGER = logging.getLogger(__name__)
 # Keep abandoned (unjoinable) worker threads alive: dropping the last Python
 # reference would delete a still-running QThread and abort the process.
 _THREAD_KEEP_ALIVE: set[QThread] = set()
+# Finished handlers release worker wrappers on the GUI thread; avoid direct
+# finished -> worker.deleteLater, which can destroy PySide wrappers on macOS.
 FIF = FluentIcon
 
 
@@ -365,12 +390,219 @@ class DownloadWorker(QObject):
             self.stopped.emit(str(status), self._task_id)
 
 
+class UploadScanWorker(QObject):
+    """Scan dropped local paths without touching the GUI thread."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, paths: tuple[Path, ...]) -> None:
+        super().__init__()
+        self._paths = paths
+
+    def run(self) -> None:
+        try:
+            self.succeeded.emit(scan_upload_inputs(self._paths))
+        except Exception as exc:
+            sanitized_error = RuntimeError(
+                f"upload scan failed: {type(exc).__name__}"
+            )
+            LOGGER.exception(
+                "main_window.upload_scan.unexpected_error error_type=%s",
+                type(exc).__name__,
+                exc_info=(type(sanitized_error), sanitized_error, exc.__traceback__),
+            )
+            self.failed.emit(str(exc))
+
+
+class UploadSummaryDialog(QDialog):
+    """Confirm a bounded local upload summary and any cloud-name conflicts."""
+
+    def __init__(
+        self,
+        summary: UploadBatchSummary,
+        target_name: str,
+        parent: QWidget,
+        *,
+        conflicts: tuple[Path, ...] = (),
+    ) -> None:
+        super().__init__(parent)
+        self._skip_conflicts_button: QRadioButton | None = None
+        self.setWindowTitle("确认上传")
+        self.resize(640, 420)
+        layout = QVBoxLayout(self)
+        layout.addWidget(BodyLabel(format_upload_summary(summary), self))
+        layout.addWidget(BodyLabel(f"目标云端目录：{target_name}", self))
+        if summary.folder_count > 0 and summary.file_count == 0:
+            layout.addWidget(BodyLabel("所选文件夹为空，不会创建文件上传任务。", self))
+        preview = QListWidget(self)
+        conflict_paths = set(conflicts)
+        for entry in summary.preview:
+            marker = "（重复）" if entry.local_path in conflict_paths else ""
+            preview.addItem(
+                f"{marker}{entry.display_name}  ({entry.kind}, {_format_bytes(entry.size)})"
+            )
+        if summary.omitted_count:
+            preview.addItem(f"另有 {summary.omitted_count} 项")
+        layout.addWidget(preview, 1)
+
+        if conflicts:
+            layout.addWidget(BodyLabel(f"发现 {len(conflicts)} 个同名项目", self))
+            skip_button = QRadioButton("跳过冲突", self)
+            self._skip_conflicts_button = skip_button
+            copy_button = QRadioButton("保留副本", self)
+            skip_button.setChecked(True)
+            layout.addWidget(skip_button)
+            layout.addWidget(copy_button)
+            decision_label = BodyLabel("", self)
+            layout.addWidget(decision_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok, self
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        if conflicts:
+            confirm_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+
+            def update_choice(skip: bool) -> None:
+                count = len(summary.top_paths) - len(conflicts) if skip else len(summary.top_paths)
+                decision_label.setText(f"将添加 {count} 个上传任务")
+                confirm_button.setEnabled(count > 0)
+
+            skip_button.toggled.connect(update_choice)
+            update_choice(True)
+
+    def resolution(self) -> UploadConflictResolution:
+        if self._skip_conflicts_button is not None and self._skip_conflicts_button.isChecked():
+            return "skip"
+        return "copy"
+
+
+
+class UploadConflictDialog(QDialog):
+    """Choose how to handle top-level upload name conflicts."""
+
+    def __init__(self, conflicts: tuple[Path, ...], parent: QWidget) -> None:
+        super().__init__(parent)
+        self._resolution: UploadConflictResolution | None = None
+        self.setWindowTitle("处理同名上传项目")
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            BodyLabel(
+                f"发现 {len(conflicts)} 个同名项目，请选择冲突处理方式。",
+                self,
+            )
+        )
+        preview = QListWidget(self)
+        for path in conflicts[:20]:
+            preview.addItem(path.name)
+        if len(conflicts) > 20:
+            preview.addItem(f"另有 {len(conflicts) - 20} 项")
+        layout.addWidget(preview)
+
+        buttons = QDialogButtonBox(self)
+        skip_button = buttons.addButton("跳过冲突", QDialogButtonBox.ButtonRole.DestructiveRole)
+        copy_button = buttons.addButton("保留副本", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_button = buttons.addButton("取消本批次", QDialogButtonBox.ButtonRole.RejectRole)
+        skip_button.clicked.connect(lambda: self._finish("skip"))
+        copy_button.clicked.connect(lambda: self._finish("copy"))
+        cancel_button.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def resolution(self) -> UploadConflictResolution | None:
+        """Return the selected resolution, or None when the batch was cancelled."""
+        return self._resolution
+
+    def _finish(self, resolution: UploadConflictResolution) -> None:
+        self._resolution = resolution
+        self.accept()
+
+
+class DownloadConflictDialog(QDialog):
+    """Choose how to handle existing local download targets."""
+
+    def __init__(self, conflicts: tuple[Path, ...], parent: QWidget) -> None:
+        super().__init__(parent)
+        self._resolution: DownloadConflictResolution | None = None
+        self.setWindowTitle("处理下载文件冲突")
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            BodyLabel(
+                f"发现 {len(conflicts)} 个本地目标冲突，请选择处理方式。",
+                self,
+            )
+        )
+        preview = QListWidget(self)
+        for conflict in conflicts[:20]:
+            preview.addItem(conflict.name)
+        if len(conflicts) > 20:
+            preview.addItem(f"另有 {len(conflicts) - 20} 项")
+        layout.addWidget(preview)
+
+        buttons = QDialogButtonBox(self)
+        skip_button = buttons.addButton("跳过冲突", QDialogButtonBox.ButtonRole.DestructiveRole)
+        copy_button = buttons.addButton("保留副本", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_button = buttons.addButton("取消本批次", QDialogButtonBox.ButtonRole.RejectRole)
+        skip_button.clicked.connect(lambda: self._finish("skip"))
+        copy_button.clicked.connect(lambda: self._finish("copy"))
+        cancel_button.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def resolution(self) -> DownloadConflictResolution | None:
+        """Return the selected resolution, or None when cancelled."""
+        return self._resolution
+
+    def _finish(self, resolution: DownloadConflictResolution) -> None:
+        self._resolution = resolution
+        self.accept()
+
+
+class DroppableTableWidget(TableWidget):
+    """Accept local file URLs and pass paths to the owning file page."""
+
+    paths_dropped = Signal(object)
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: object) -> None:
+        mime_data = event.mimeData()  # type: ignore[attr-defined]
+        urls = mime_data.urls()
+        if urls and all(url.isLocalFile() for url in urls):
+            event.acceptProposedAction()  # type: ignore[attr-defined]
+        else:
+            event.ignore()  # type: ignore[attr-defined]
+
+    def dragMoveEvent(self, event: object) -> None:
+        mime_data = event.mimeData()  # type: ignore[attr-defined]
+        urls = mime_data.urls()
+        if urls and all(url.isLocalFile() for url in urls):
+            event.acceptProposedAction()  # type: ignore[attr-defined]
+        else:
+            event.ignore()  # type: ignore[attr-defined]
+
+    def dropEvent(self, event: object) -> None:
+        urls = event.mimeData().urls()  # type: ignore[attr-defined]
+        if urls and all(url.isLocalFile() for url in urls):
+            LOGGER.info("main_window.upload_drop.received count=%s", len(urls))
+            self.paths_dropped.emit(tuple(Path(url.toLocalFile()) for url in urls))
+            event.acceptProposedAction()  # type: ignore[attr-defined]
+            LOGGER.info("main_window.upload_drop.dispatched count=%s", len(urls))
+        else:
+            event.ignore()  # type: ignore[attr-defined]
+
+
 class UploadWorker(QObject):
     """Background worker for one ordinary file upload."""
 
+    progress = Signal(object, object, str)
     succeeded = Signal(object, str)
     failed = Signal(str, str)
     login_required = Signal(str, str)
+    cancelled = Signal(str)
 
     def __init__(
         self,
@@ -386,20 +618,94 @@ class UploadWorker(QObject):
         self._local_path = local_path
         self._task_id = task_id
         self._upload_name = upload_name
+        self._cancel_requested = threading.Event()
+        self._pause_requested = threading.Event()
+        self._resume_requested = threading.Event()
+        self._resume_requested.set()
+
+    def request_pause(self) -> None:
+        """Pause after the current upload request reaches a safe check."""
+        self._pause_requested.set()
+        self._resume_requested.clear()
+
+    def request_resume(self) -> None:
+        """Allow a paused upload to continue."""
+        self._pause_requested.clear()
+        self._resume_requested.set()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+        self._resume_requested.set()
+
+    def _upload_stop_requested(self) -> bool:
+        while self._pause_requested.is_set() and not self._cancel_requested.is_set():
+            self._resume_requested.wait()
+        return self._cancel_requested.is_set()
+
+    def _upload_progress_callback(self, bytes_done: int, total_bytes: int) -> None:
+        self._upload_stop_requested()
+        self.progress.emit(bytes_done, total_bytes, self._task_id)
 
     def run(self) -> None:
         """Run the blocking upload in a worker thread."""
         try:
-            if self._upload_name is None:
-                item = self._file_browser.upload_file(self._parent_id, self._local_path)
-            else:
-                item = self._file_browser.upload_file(
-                    self._parent_id, self._local_path, upload_name=self._upload_name
-                )
+            if self._upload_stop_requested():
+                raise FileBrowserUploadCancelledError("上传已取消")
+
+            def progress_callback(bytes_done: int, total_bytes: int) -> None:
+                self._upload_progress_callback(bytes_done, total_bytes)
+
+            try:
+                try:
+                    if self._upload_name is None:
+                        item = self._file_browser.upload_file(
+                            self._parent_id,
+                            self._local_path,
+                            progress_callback=progress_callback,
+                            cancel_requested=self._upload_stop_requested,
+                        )
+                    else:
+                        item = self._file_browser.upload_file(
+                            self._parent_id,
+                            self._local_path,
+                            upload_name=self._upload_name,
+                            progress_callback=progress_callback,
+                            cancel_requested=self._upload_stop_requested,
+                        )
+                except TypeError as exc:
+                    if "unexpected keyword argument 'cancel_requested'" not in str(exc):
+                        raise
+                    if self._upload_name is None:
+                        item = self._file_browser.upload_file(
+                            self._parent_id, self._local_path, progress_callback=progress_callback
+                        )
+                    else:
+                        item = self._file_browser.upload_file(
+                            self._parent_id,
+                            self._local_path,
+                            upload_name=self._upload_name,
+                            progress_callback=progress_callback,
+                        )
+            except TypeError as exc:
+                if "unexpected keyword argument 'progress_callback'" not in str(exc):
+                    raise
+                if self._upload_name is None:
+                    item = self._file_browser.upload_file(self._parent_id, self._local_path)
+                else:
+                    item = self._file_browser.upload_file(
+                        self._parent_id, self._local_path, upload_name=self._upload_name
+                    )
+            if self._upload_stop_requested():
+                raise FileBrowserUploadCancelledError("上传已取消")
+        except FileBrowserUploadCancelledError:
+            self.cancelled.emit(self._task_id)
         except FileBrowserLoginRequiredError as exc:
             self.login_required.emit(str(exc), self._task_id)
         except FileBrowserError as exc:
-            self.failed.emit(str(exc), self._task_id)
+            if self._upload_stop_requested():
+                self.cancelled.emit(self._task_id)
+            else:
+                self.failed.emit(str(exc), self._task_id)
         except Exception as exc:
             LOGGER.exception("main_window.upload.unexpected_error")
             self.failed.emit(str(exc), self._task_id)
@@ -426,6 +732,17 @@ class PlaceholderInterface(QWidget):
 
 
 @dataclass(slots=True)
+class PendingUploadTask:
+    """One upload waiting for an ordinary upload worker slot."""
+
+    parent_id: str
+    local_path: Path
+    task_id: str
+    upload_name: str | None
+    show_enqueue_status: bool
+
+
+@dataclass(slots=True)
 class TransferRecord:
     """UI-owned in-memory transfer task row."""
 
@@ -442,8 +759,15 @@ class TransferRecord:
     max_connections: int = 1
     can_resume: bool = False
     error: str = ""
+    upload_parent_id: str | None = None
+    upload_name: str | None = None
+    upload_retryable: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
+    # Wall-clock epochs persisted by the history store; the monotonic fields
+    # above stay process-local and keep serving the speed sampler.
+    created_at_epoch: float = 0.0
+    updated_at_epoch: float = 0.0
 
     def __post_init__(self) -> None:
         now = time.monotonic()
@@ -451,6 +775,11 @@ class TransferRecord:
             self.created_at = now
         if self.updated_at <= 0:
             self.updated_at = self.created_at
+        wall_now = time.time()
+        if self.created_at_epoch <= 0:
+            self.created_at_epoch = wall_now
+        if self.updated_at_epoch <= 0:
+            self.updated_at_epoch = self.created_at_epoch
 
     @property
     def progress_percent(self) -> int:
@@ -460,6 +789,34 @@ class TransferRecord:
         if not total or total <= 0:
             return 0
         return max(0, min(100, int(self.bytes_done * 100 / total)))
+
+
+class TransferRecordPersistence(Protocol):
+    """Persistence contract for transfer records (UI-side, Qt-free boundary).
+
+    Implementations live in the app layer and must never raise: persistence is
+    best-effort, and a failed write degrades to the in-memory row.
+    """
+
+    def save_record(self, record: TransferRecord) -> None:
+        """Upsert one full record row."""
+
+    def update_record_progress(
+        self,
+        direction: str,
+        task_id: str,
+        *,
+        bytes_done: int,
+        active_connections: int,
+        updated_at: float,
+    ) -> None:
+        """Persist progress-only fields of one row (no-op when the row is gone)."""
+
+    def delete_records(self, direction: str, task_ids: Iterable[str]) -> None:
+        """Delete rows by (direction, task id)."""
+
+    def load_history(self) -> tuple[TransferRecord, ...]:
+        """Load all persisted rows ordered by update time ascending."""
 
 
 @dataclass(slots=True)
@@ -472,27 +829,68 @@ class QueuedUploadFile:
     upload_name: str
 
 
+@dataclass(frozen=True, slots=True)
+class PendingFolderUpload:
+    """One folder upload waiting for its preparation slot."""
+
+    local_path: Path
+    parent_id: str
+    root_name: str | None
+    record_id: str
+
+
 class TransferInterface(QWidget):
     """Transfer center aligned with the sibling Fluent client."""
 
     PROGRESS_RENDER_INTERVAL_MS = 150
+    SPEED_SAMPLE_INTERVAL_MS = 1000
+    PROGRESS_PERSIST_INTERVAL_MS = 2000
+    # Statuses during which bytes are expected to flow; only these are sampled.
+    # Waiting/creating-dir/verifying/merging/paused/terminal tasks show no
+    # active speed (R5).
+    SAMPLING_STATUSES = frozenset({"上传中", "下载中"})
 
     remove_records_requested = Signal(str, object)
     open_download_folder_requested = Signal(object)
     pause_download_requested = Signal(str)
     resume_download_requested = Signal(str)
     cancel_download_requested = Signal(str)
+    pause_uploads_requested = Signal(object)
+    resume_uploads_requested = Signal(object)
+    pause_downloads_requested = Signal(object)
+    resume_downloads_requested = Signal(object)
+    retry_upload_requested = Signal(object)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        persistence: TransferRecordPersistence | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("TransferInterface")
         self.upload_records: list[TransferRecord] = []
         self.download_records: list[TransferRecord] = []
         self.upload_status_filter = "全部"
         self.download_status_filter = "全部"
-        self._active_direction = "upload"
+        self._active_direction = "download"
         self._pending_progress_directions: set[str] = set()
         self._progress_render_scheduled = False
+        self._speed_estimators: dict[tuple[str, str], TransferRateEstimator] = {}
+        # Injectable for tests; must return a fresh TransferRateEstimator.
+        self._new_speed_estimator: Callable[[], TransferRateEstimator] = (
+            TransferRateEstimator
+        )
+        self._speed_sampler = QTimer(self)
+        self._speed_sampler.setInterval(self.SPEED_SAMPLE_INTERVAL_MS)
+        self._speed_sampler.timeout.connect(self._sample_speeds)
+        # History persistence: progress-only writes coalesce behind a 2 s tick;
+        # status/error/terminal/add/remove writes stay immediate (design.md 3).
+        self._persistence = persistence
+        self._persist_dirty: set[tuple[str, str]] = set()
+        self._persist_timer = QTimer(self)
+        self._persist_timer.setInterval(self.PROGRESS_PERSIST_INTERVAL_MS)
+        self._persist_timer.timeout.connect(self._flush_pending_record_persist)
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(24, 20, 24, 24)
         self._main_layout.setSpacing(12)
@@ -501,19 +899,37 @@ class TransferInterface(QWidget):
         self._build_content()
         self._connect_signals()
         self._render_all()
-        self._on_segment_changed("upload")
+        self._on_segment_changed("download")
 
-    def add_upload_record(self, record: TransferRecord) -> None:
+    def add_upload_record(
+        self, record: TransferRecord, *, render: bool = True, persist: bool = True
+    ) -> None:
         """Add or replace an upload task row."""
+        self._on_record_added("upload", record)
         self._upsert_record(self.upload_records, record)
-        self.flush_progress_render()
-        self._render_upload_table()
+        if persist:
+            self._save_record(record)
+        if render:
+            self.flush_progress_render()
+            self._render_upload_table()
 
-    def add_download_record(self, record: TransferRecord) -> None:
+    def add_download_record(
+        self, record: TransferRecord, *, render: bool = True, persist: bool = True
+    ) -> None:
         """Add or replace a download task row."""
+        self._on_record_added("download", record)
         self._upsert_record(self.download_records, record)
-        self.flush_progress_render()
-        self._render_download_table()
+        if persist:
+            self._save_record(record)
+        if render:
+            self.flush_progress_render()
+            self._render_download_table()
+
+    def _on_record_added(self, direction: str, record: TransferRecord) -> None:
+        """Reset speed state for a (re-)added record; recovered tasks re-baseline."""
+        self._speed_estimators.pop((direction, record.task_id), None)
+        if record.status in self.SAMPLING_STATUSES:
+            self._ensure_speed_sampler()
 
     def update_record(
         self,
@@ -532,8 +948,7 @@ class TransferInterface(QWidget):
         record = self._find_record(direction, task_id)
         if record is None:
             return
-        previous_bytes = record.bytes_done
-        previous_time = record.updated_at
+        previous_status = record.status
         now = time.monotonic()
         progress_only = (
             status is None
@@ -554,24 +969,80 @@ class TransferInterface(QWidget):
         if can_resume is not None:
             record.can_resume = can_resume
         if bytes_done is not None:
+            # Progress callbacks only carry cumulative bytes; the speed comes
+            # from the 1-second sampler (R1/R2), never from callback intervals.
             record.bytes_done = max(0, bytes_done)
-            elapsed = max(now - previous_time, 0.001)
-            delta = record.bytes_done - previous_bytes
-            record.speed_bps = max(0.0, delta / elapsed)
         if error is not None:
             record.error = error
         if record.status in TERMINAL_TRANSFER_STATUSES:
+            # Terminal: zero the speed and release estimator state (R5).
+            self._speed_estimators.pop((direction, task_id), None)
             record.speed_bps = 0.0
             record.active_connections = 0
+        elif status is not None and status != previous_status:
+            # Status transition (pause/resume/waiting/...): re-baseline so the
+            # paused or transitional span is never counted into a new rate.
+            estimator = self._speed_estimators.get((direction, task_id))
+            if estimator is not None:
+                estimator.reset()
+            record.speed_bps = 0.0
+            if record.status in self.SAMPLING_STATUSES:
+                self._ensure_speed_sampler()
         record.updated_at = now
+        record.updated_at_epoch = time.time()
         if record.status in TERMINAL_TRANSFER_STATUSES:
             self._discard_pending_progress(direction)
+            self._save_record(record)
             self._render_direction(direction)
         elif progress_only:
+            self._mark_record_progress_dirty(direction, task_id)
             self._schedule_progress_render(direction)
         else:
             self._discard_pending_progress(direction)
+            self._save_record(record)
             self._render_direction(direction)
+
+    def _save_record(self, record: TransferRecord) -> None:
+        """Write one full record row through the persistence boundary (best-effort)."""
+        self._persist_dirty.discard((record.direction, record.task_id))
+        if self._persistence is not None:
+            self._persistence.save_record(record)
+
+    def _mark_record_progress_dirty(self, direction: str, task_id: str) -> None:
+        """Queue one progress-only write behind the 2-second persistence tick."""
+        if self._persistence is None:
+            return
+        self._persist_dirty.add((direction, task_id))
+        if not self._persist_timer.isActive():
+            self._persist_timer.start()
+
+    def _flush_pending_record_persist(self) -> None:
+        """Write every pending progress-only row through the persistence boundary."""
+        if not self._persist_dirty:
+            self._persist_timer.stop()
+            return
+        pending = tuple(self._persist_dirty)
+        self._persist_dirty.clear()
+        for direction, task_id in pending:
+            record = self._find_record(direction, task_id)
+            # A removed record's row is already deleted from the database by
+            # remove_records; a late flush must not resurrect it.
+            if record is None or self._persistence is None:
+                continue
+            self._persistence.update_record_progress(
+                direction,
+                task_id,
+                bytes_done=record.bytes_done,
+                active_connections=record.active_connections,
+                updated_at=record.updated_at_epoch,
+            )
+        if not self._persist_dirty:
+            self._persist_timer.stop()
+
+    def stop_record_persistence(self) -> None:
+        """Flush pending progress writes and stop the tick; called on window close."""
+        self._persist_timer.stop()
+        self._flush_pending_record_persist()
 
     def _discard_pending_progress(self, direction: str) -> None:
         """Drop one direction's pending coalesced render; the caller renders it now."""
@@ -601,6 +1072,55 @@ class TransferInterface(QWidget):
         else:
             self._render_download_table()
 
+    def _ensure_speed_sampler(self) -> None:
+        """Start the 1-second speed tick; runs only while active tasks exist."""
+        if not self._speed_sampler.isActive():
+            self._speed_sampler.start()
+
+    def stop_speed_sampler(self) -> None:
+        """Stop the speed tick; called on window close so no timer outlives it."""
+        self._speed_sampler.stop()
+
+    def _sample_speeds(self) -> None:
+        """Sampler tick (GUI thread): advance each active task's estimator.
+
+        Updates only the speed cells and the direction total labels; it never
+        rebuilds the table (R6). Stops itself when no task is transferring.
+        """
+        has_active = False
+        for direction in ("upload", "download"):
+            records = (
+                self.upload_records if direction == "upload" else self.download_records
+            )
+            table = self.upload_table if direction == "upload" else self.download_table
+            visible = (
+                self._filtered_upload_records()
+                if direction == "upload"
+                else self._filtered_download_records()
+            )
+            for record in records:
+                if record.status not in self.SAMPLING_STATUSES:
+                    continue
+                has_active = True
+                key = (direction, record.task_id)
+                estimator = self._speed_estimators.get(key)
+                if estimator is None:
+                    estimator = self._new_speed_estimator()
+                    self._speed_estimators[key] = estimator
+                record.speed_bps = max(0.0, estimator.sample(record.bytes_done))
+            for row, record in enumerate(visible):
+                if record.status not in self.SAMPLING_STATUSES:
+                    continue
+                speed_item = table.item(row, TRANSFER_COL_SPEED)
+                if (
+                    speed_item is not None
+                    and speed_item.data(Qt.ItemDataRole.UserRole) == record.task_id
+                ):
+                    speed_item.setText(_format_speed(record.speed_bps))
+            self._update_total_speed(direction)
+        if not has_active:
+            self._speed_sampler.stop()
+
     def remove_records(self, direction: str, task_ids: set[str]) -> None:
         """Remove task rows by id."""
         if direction == "upload":
@@ -609,12 +1129,17 @@ class TransferInterface(QWidget):
             ]
             self.flush_progress_render()
             self._render_upload_table()
-            return
-        self.download_records = [
-            record for record in self.download_records if record.task_id not in task_ids
-        ]
-        self.flush_progress_render()
-        self._render_download_table()
+        else:
+            self.download_records = [
+                record for record in self.download_records if record.task_id not in task_ids
+            ]
+            self.flush_progress_render()
+            self._render_download_table()
+        for task_id in task_ids:
+            self._speed_estimators.pop((direction, task_id), None)
+            self._persist_dirty.discard((direction, task_id))
+        if self._persistence is not None:
+            self._persistence.delete_records(direction, task_ids)
 
     def active_download_folder(self) -> Path | None:
         """Return selected download folder or the latest download folder."""
@@ -640,7 +1165,7 @@ class TransferInterface(QWidget):
         self.segmented_widget = SegmentedWidget(top_bar)
         self.segmented_widget.addItem("upload", "上传", icon=FIF.UP.icon())
         self.segmented_widget.addItem("download", "下载", icon=FIF.DOWNLOAD.icon())
-        self.segmented_widget.setCurrentItem("upload")
+        self.segmented_widget.setCurrentItem("download")
 
         self.upload_filter_label = BodyLabel("状态", top_bar)
         self.upload_filter_combo = ComboBox(top_bar)
@@ -708,6 +1233,7 @@ class TransferInterface(QWidget):
 
         layout.addWidget(batch_bar)
         layout.addWidget(table)
+        buttons["retry"].setVisible(direction == "upload")
         if direction == "upload":
             self.upload_batch_bar = batch_bar
             self.upload_batch_buttons = buttons
@@ -725,8 +1251,18 @@ class TransferInterface(QWidget):
         layout.setSpacing(6)
         select_all_button = PushButton(FIF.CHECKBOX.icon(), "全选", frame)
         invert_button = PushButton(FIF.SYNC.icon(), "反选", frame)
+        pause_button = PushButton(FIF.PAUSE.icon(), "暂停", frame)
+        resume_button = PushButton(FIF.PLAY.icon(), "继续", frame)
+        retry_button = PushButton(FIF.SYNC.icon(), "重试", frame)
         delete_button = PushButton(FIF.DELETE.icon(), "删除", frame)
-        for button in (select_all_button, invert_button, delete_button):
+        for button in (
+            select_all_button,
+            invert_button,
+            pause_button,
+            resume_button,
+            retry_button,
+            delete_button,
+        ):
             button.setFixedHeight(28)
             layout.addWidget(button)
         layout.addStretch(1)
@@ -738,6 +1274,9 @@ class TransferInterface(QWidget):
         return frame, {
             "select_all": select_all_button,
             "invert": invert_button,
+            "pause": pause_button,
+            "resume": resume_button,
+            "retry": retry_button,
             "delete": delete_button,
             "count": count_label,
             "speed": speed_label,
@@ -763,6 +1302,15 @@ class TransferInterface(QWidget):
         self.upload_batch_buttons["delete"].clicked.connect(
             lambda: self._request_delete_selected("upload")
         )
+        self.upload_batch_buttons["retry"].clicked.connect(
+            self._request_retry_selected_uploads
+        )
+        self.upload_batch_buttons["pause"].clicked.connect(
+            lambda: self._request_pause_selected("upload")
+        )
+        self.upload_batch_buttons["resume"].clicked.connect(
+            lambda: self._request_resume_selected("upload")
+        )
         self.download_batch_buttons["select_all"].clicked.connect(
             lambda: self._select_all(self.download_table)
         )
@@ -774,6 +1322,12 @@ class TransferInterface(QWidget):
         )
         self.download_batch_buttons["delete"].clicked.connect(
             lambda: self._request_delete_selected("download")
+        )
+        self.download_batch_buttons["pause"].clicked.connect(
+            lambda: self._request_pause_selected("download")
+        )
+        self.download_batch_buttons["resume"].clicked.connect(
+            lambda: self._request_resume_selected("download")
         )
 
     def _render_all(self) -> None:
@@ -823,7 +1377,8 @@ class TransferInterface(QWidget):
         records: list[TransferRecord],
         direction: str,
     ) -> None:
-        self._clear_action_widgets(table)
+        if table.rowCount() != len(records):
+            self._clear_action_widgets(table)
         table.setRowCount(len(records))
         for row, record in enumerate(records):
             values = (
@@ -846,11 +1401,20 @@ class TransferInterface(QWidget):
                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
                     )
                 table.setItem(row, column, table_item)
-            table.setCellWidget(
-                row,
-                TRANSFER_COL_ACTION,
-                self._build_row_action_widget(record, direction, table),
+            action_key = (
+                record.task_id, record.status, record.can_resume, record.upload_retryable
             )
+            widget = table.cellWidget(row, TRANSFER_COL_ACTION)
+            if widget is not None and widget.property("action_key") == action_key:
+                continue
+            if widget is not None:
+                widget.hide()
+                table.removeCellWidget(row, TRANSFER_COL_ACTION)
+                widget.setParent(None)
+                widget.deleteLater()
+            widget = self._build_row_action_widget(record, direction, table)
+            widget.setProperty("action_key", action_key)
+            table.setCellWidget(row, TRANSFER_COL_ACTION, widget)
         self._update_total_speed(direction)
 
     def _build_row_action_widget(
@@ -860,15 +1424,20 @@ class TransferInterface(QWidget):
         parent: QWidget,
     ) -> QWidget:
         widget = QWidget(parent)
-        widget.setMinimumWidth(TRANSFER_ACTION_COLUMN_WIDTH)
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(4)
         layout.addStretch(1)
         if direction == "download":
             self._add_download_action_buttons(layout, record, widget)
+        else:
+            self._add_upload_action_buttons(layout, record, widget)
         delete_button = self._build_action_button(FIF.DELETE, "删除", widget)
-        delete_button.setEnabled(record.status in TERMINAL_TRANSFER_STATUSES)
+        delete_button.setEnabled(
+            direction == "upload"
+            or record.status in TERMINAL_TRANSFER_STATUSES
+            or record.status == "已暂停"
+        )
         delete_button.clicked.connect(
             lambda _checked=False, task_id=record.task_id: self._request_delete_ids(
                 direction,
@@ -908,6 +1477,37 @@ class TransferInterface(QWidget):
         layout.addWidget(pause_button)
         layout.addWidget(resume_button)
         layout.addWidget(cancel_button)
+
+    def _add_upload_action_buttons(
+        self,
+        layout: QHBoxLayout,
+        record: TransferRecord,
+        parent: QWidget,
+    ) -> None:
+        pause_button = self._build_action_button(FIF.PAUSE, "暂停", parent)
+        pause_button.setEnabled(record.upload_retryable and record.status in ACTIVE_UPLOAD_STATUSES)
+        pause_button.clicked.connect(
+            lambda _checked=False, task_id=record.task_id: self.pause_uploads_requested.emit(
+                {task_id}
+            )
+        )
+        resume_button = self._build_action_button(FIF.PLAY, "继续", parent)
+        resume_button.setEnabled(record.upload_retryable and record.status == "已暂停")
+        resume_button.clicked.connect(
+            lambda _checked=False, task_id=record.task_id: self.resume_uploads_requested.emit(
+                {task_id}
+            )
+        )
+        retry_button = self._build_action_button(FIF.SYNC, "重试", parent)
+        retry_button.setEnabled(record.upload_retryable and record.status == "失败")
+        retry_button.clicked.connect(
+            lambda _checked=False, task_id=record.task_id: self.retry_upload_requested.emit(
+                {task_id}
+            )
+        )
+        layout.addWidget(pause_button)
+        layout.addWidget(resume_button)
+        layout.addWidget(retry_button)
 
     @staticmethod
     def _build_action_button(icon: FluentIcon, tooltip: str, parent: QWidget) -> ToolButton:
@@ -959,13 +1559,88 @@ class TransferInterface(QWidget):
             visible[row].task_id
             for row in rows
             if 0 <= row < len(visible)
-            and visible[row].status in TERMINAL_TRANSFER_STATUSES
+            and (
+                direction == "upload"
+                or visible[row].status in TERMINAL_TRANSFER_STATUSES
+                or visible[row].status == "已暂停"
+            )
         }
         self._request_delete_ids(direction, task_ids)
 
     def _request_delete_ids(self, direction: str, task_ids: set[str]) -> None:
         if task_ids:
             self.remove_records_requested.emit(direction, task_ids)
+
+    def _request_retry_selected_uploads(self) -> None:
+        visible = self._filtered_upload_records()
+        rows = sorted({index.row() for index in self.upload_table.selectionModel().selectedRows()})
+        task_ids = {
+            visible[row].task_id
+            for row in rows
+            if 0 <= row < len(visible)
+            and visible[row].status == "失败"
+            and visible[row].upload_retryable
+        }
+        if task_ids:
+            self.retry_upload_requested.emit(task_ids)
+
+    def _request_pause_selected(self, direction: str) -> None:
+        visible = (
+            self._filtered_upload_records()
+            if direction == "upload"
+            else self._filtered_download_records()
+        )
+        selected = self._selected_task_ids(direction)
+        task_ids = {
+            record.task_id for record in visible
+            if record.task_id in selected and (
+                (direction == "upload" and record.upload_retryable
+                 and record.status in ACTIVE_UPLOAD_STATUSES)
+                or (direction == "download" and record.status in ACTIVE_DOWNLOAD_STATUSES)
+            )
+        }
+        if not task_ids:
+            return
+        if direction == "upload":
+            self.pause_uploads_requested.emit(task_ids)
+        else:
+            self.pause_downloads_requested.emit(task_ids)
+
+    def _request_resume_selected(self, direction: str) -> None:
+        visible = (
+            self._filtered_upload_records()
+            if direction == "upload"
+            else self._filtered_download_records()
+        )
+        selected = self._selected_task_ids(direction)
+        task_ids = {
+            record.task_id for record in visible
+            if record.task_id in selected and (
+                (direction == "upload" and record.upload_retryable
+                 and record.status == "已暂停")
+                or (direction == "download" and record.can_resume
+                    and record.status in {"已暂停", "失败"})
+            )
+        }
+        if not task_ids:
+            return
+        if direction == "upload":
+            self.resume_uploads_requested.emit(task_ids)
+        else:
+            self.resume_downloads_requested.emit(task_ids)
+
+    def _selected_task_ids(self, direction: str) -> set[str]:
+        table = self.upload_table if direction == "upload" else self.download_table
+        visible = (
+            self._filtered_upload_records()
+            if direction == "upload"
+            else self._filtered_download_records()
+        )
+        return {
+            visible[index.row()].task_id
+            for index in table.selectionModel().selectedRows()
+            if 0 <= index.row() < len(visible)
+        }
 
     @staticmethod
     def _select_all(table: TableWidget) -> None:
@@ -1002,6 +1677,51 @@ class TransferInterface(QWidget):
         count_label = buttons["count"]
         if isinstance(count_label, BodyLabel):  # pragma: no cover - docs/testing-exemptions.md
             count_label.setText(f"已选 {count} 项")
+        if direction == "upload":
+            visible = self._filtered_upload_records()
+            rows = {index.row() for index in table.selectionModel().selectedRows()}
+            buttons["retry"].setEnabled(
+                any(
+                    0 <= row < len(visible)
+                    and visible[row].status == "失败"
+                    and visible[row].upload_retryable
+                    for row in rows
+                )
+            )
+            buttons["pause"].setEnabled(
+                any(
+                    0 <= row < len(visible)
+                    and visible[row].upload_retryable
+                    and visible[row].status in ACTIVE_UPLOAD_STATUSES
+                    for row in rows
+                )
+            )
+            buttons["resume"].setEnabled(
+                any(
+                    0 <= row < len(visible)
+                    and visible[row].upload_retryable
+                    and visible[row].status == "已暂停"
+                    for row in rows
+                )
+            )
+            return
+        visible = self._filtered_download_records()
+        rows = {index.row() for index in table.selectionModel().selectedRows()}
+        buttons["pause"].setEnabled(
+            any(
+                0 <= row < len(visible)
+                and visible[row].status in ACTIVE_DOWNLOAD_STATUSES
+                for row in rows
+            )
+        )
+        buttons["resume"].setEnabled(
+            any(
+                0 <= row < len(visible)
+                and visible[row].can_resume
+                and visible[row].status in {"已暂停", "失败"}
+                for row in rows
+            )
+        )
 
     def _update_total_speed(self, direction: str) -> None:
         records = self.upload_records if direction == "upload" else self.download_records
@@ -1584,13 +2304,11 @@ class FileInterface(QWidget):
         storage_top_layout.setSpacing(8)
         self.storage_icon = IconWidget(FIF.CLOUD.icon(), self.storage_card)
         self.storage_icon.setFixedSize(20, 20)
-        self.storage_label = BodyLabel("云盘空间", self.storage_card)
         self.storage_value_label = BodyLabel("-- / --", self.storage_card)
         self.storage_value_label.setStyleSheet("font-size: 12px; color: gray;")
         storage_top_layout.addWidget(self.storage_icon)
-        storage_top_layout.addWidget(self.storage_label)
-        storage_top_layout.addStretch(1)
         storage_top_layout.addWidget(self.storage_value_label)
+        storage_top_layout.addStretch(1)
         storage_layout.addLayout(storage_top_layout)
         self.storage_progress_bar = ProgressBar(self.storage_card)
         self.storage_progress_bar.setRange(0, 100)
@@ -1606,7 +2324,7 @@ class FileInterface(QWidget):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 8, 0, 0)
         right_layout.setSpacing(0)
-        self.file_table = TableWidget(right_panel)
+        self.file_table = DroppableTableWidget(right_panel)
         self.file_table.setColumnCount(3)
         self.file_table.setHorizontalHeaderLabels(["名称", "类型", "大小"])
         self.file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1640,7 +2358,8 @@ class FileInterface(QWidget):
         self.new_folder_button.clicked.connect(self._window.prompt_create_folder)
         self.upload_button.clicked.connect(self._window.prompt_upload_file)
         self.upload_file_action.triggered.connect(self._window.prompt_upload_file)
-        self.refresh_button.clicked.connect(self._window.refresh_current_directory)
+        self.upload_folder_action.triggered.connect(self._window.prompt_upload_folder)
+        self.refresh_button.clicked.connect(lambda: self._window.refresh_current_directory())
         self.back_button.clicked.connect(self._window.go_up_one_level)
         self.download_button.clicked.connect(self._download_selected_row)
         self.delete_button.clicked.connect(self._delete_selected_row)
@@ -1649,6 +2368,7 @@ class FileInterface(QWidget):
             lambda item: self._window.enter_displayed_folder(item.row())
         )
         self.file_table.itemSelectionChanged.connect(self._window.update_operation_controls)
+        self.file_table.paths_dropped.connect(self._window.handle_upload_drop)
         self.file_table.customContextMenuRequested.connect(self._window.open_file_context_menu)
 
     def _render_breadcrumb(self, breadcrumb: tuple[BreadcrumbEntry, ...]) -> None:
@@ -1701,9 +2421,9 @@ class FileInterface(QWidget):
             self._window.prompt_delete_item(row)
 
     def _download_selected_row(self) -> None:
-        row = self._window.selected_download_row()
-        if row is not None:
-            self._window.prompt_download_item(row)
+        rows = self._window.selected_download_rows()
+        if rows:
+            self._window.prompt_download_item(rows[0])
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem) -> None:
         item_id = item.data(0, Qt.ItemDataRole.UserRole)
@@ -1720,6 +2440,7 @@ class MainWindow(_MainWindowBase):
     """Main OpenWoPan window aligned with the sibling Fluent desktop client."""
 
     login_required = Signal(str)
+    _download_event_signal = Signal(object)
     logout_requested = Signal()
 
     def __init__(
@@ -1729,6 +2450,7 @@ class MainWindow(_MainWindowBase):
         settings: AppSettings | None = None,
         settings_path: Path | None = None,
         log_path: Path | None = None,
+        transfer_record_store: TransferRecordStore | None = None,
     ) -> None:
         super().__init__()
         self._file_browser = file_browser
@@ -1763,26 +2485,81 @@ class MainWindow(_MainWindowBase):
         self._download_task_id: str | None = None
         self._download_controls: dict[str, DownloadTaskControl] = {}
         self._download_items_by_task: dict[str, WopanItem] = {}
+        self._pending_download_events: dict[str, DownloadTaskEvent] = {}
+        self._removed_download_task_ids: set[str] = set()
+        self._download_target_thread: QThread | None = None
+        self._download_target_worker: BrowserOperationWorker | None = None
+        self._download_target_pending: list[tuple[list[tuple[WopanItem, Path]], bool, bool]] = []
+        self._download_submit_thread: QThread | None = None
+        self._download_submit_worker: BrowserOperationWorker | None = None
+        self._download_submit_threads: set[QThread] = set()
+        self._download_submit_workers: dict[QThread, BrowserOperationWorker] = {}
+        self._download_submit_paths: dict[QThread, set[Path]] = {}
+        self._download_reserved_targets: set[Path] = set()
+        self._download_recovery_thread: QThread | None = None
+        self._upload_recovery_thread: QThread | None = None
+        self._upload_recovery_worker: BrowserOperationWorker | None = None
+        self._download_recovery_worker: BrowserOperationWorker | None = None
+        self._download_close_thread: QThread | None = None
+        self._download_close_worker: BrowserOperationWorker | None = None
+        self._download_operation_thread: QThread | None = None
+        self._download_operation_worker: BrowserOperationWorker | None = None
+        self._download_operations: list[tuple[str, str, Callable[[], object]]] = []
         self._upload_thread: QThread | None = None
         self._upload_worker: UploadWorker | None = None
         self._upload_path: Path | None = None
         self._upload_task_id: str | None = None
+        self._upload_threads: dict[str, QThread] = {}
+        self._upload_workers: dict[str, UploadWorker] = {}
+        self._upload_pending: list[PendingUploadTask] = []
+        self._paused_uploads: dict[str, PendingUploadTask] = {}
+        self._upload_removal_requested: set[str] = set()
+        self._upload_delete_batch = False
         self._folder_prepare_thread: QThread | None = None
         self._folder_prepare_worker: BrowserOperationWorker | None = None
+        self._folder_prepare_cancel: threading.Event | None = None
         self._folder_upload_record_id: str | None = None
         self._folder_upload_queue: list[QueuedUploadFile] = []
         self._folder_upload_active: QueuedUploadFile | None = None
+        self._folder_upload_child_ids: set[str] = set()
+        self._folder_upload_failed_ids: set[str] = set()
         self._folder_upload_success_count = 0
         self._folder_upload_failure_count = 0
+        self._folder_upload_cancel_count = 0
         self._folder_upload_target_dir_id: str | None = None
+        self._folder_prepare_pending: list[PendingFolderUpload] = []
+        self._closing = False
         self._transfer_sequence = 0
+        self._transfer_history: TransferRecordPersistence | None = None
+        self._transfer_history_thread: QThread | None = None
+        self._transfer_history_worker: BrowserOperationWorker | None = None
+        self._transfer_history_loaded = False
+        self._scan_thread: QThread | None = None
+        self._scan_worker: UploadScanWorker | None = None
+        self._upload_scan_pending: list[tuple[tuple[Path, ...], str]] = []
+        self._upload_scan_parent_id: str | None = None
+        self._upload_conflict_thread: QThread | None = None
+        self._upload_conflict_worker: BrowserOperationWorker | None = None
+        self._upload_conflict_pending: list[
+            tuple[tuple[Path, ...], str, bool, UploadBatchSummary | None]
+        ] = []
+        self._upload_conflict_dialog_open = False
+        self._upload_conflict_current: (
+            tuple[tuple[Path, ...], str, bool, UploadBatchSummary | None] | None
+        ) = None
 
         self.setWindowTitle("OpenWoPan")
         self.resize(*MAIN_WINDOW_DEFAULT_SIZE)
         self.setMinimumSize(*MAIN_WINDOW_MINIMUM_SIZE)
 
         self.file_interface = FileInterface(self)
-        self.transfer_interface = TransferInterface(self)
+        if transfer_record_store is not None:
+            # Local import: app.transfer_history imports TransferRecord from this
+            # module, so a module-level import would be circular.
+            from openwopan.app.transfer_history import TransferHistoryAdapter
+
+            self._transfer_history = TransferHistoryAdapter(transfer_record_store)
+        self.transfer_interface = TransferInterface(self, persistence=self._transfer_history)
         self.account_interface = AccountInterface(self)
         self.setting_interface = SettingsInterface(
             self._settings,
@@ -1800,6 +2577,12 @@ class MainWindow(_MainWindowBase):
         self.transfer_interface.pause_download_requested.connect(self._pause_download_task)
         self.transfer_interface.resume_download_requested.connect(self._resume_download_task)
         self.transfer_interface.cancel_download_requested.connect(self._cancel_download_task)
+        self.transfer_interface.pause_uploads_requested.connect(self._pause_selected_uploads)
+        self.transfer_interface.resume_uploads_requested.connect(self._resume_selected_uploads)
+        self.transfer_interface.pause_downloads_requested.connect(self._pause_selected_downloads)
+        self.transfer_interface.resume_downloads_requested.connect(self._resume_selected_downloads)
+        self.transfer_interface.retry_upload_requested.connect(self._retry_selected_uploads)
+        self._download_event_signal.connect(self._on_download_event)
 
         self._stacked_widget: QStackedWidget | None = None
         self._navigation_interface: NavigationInterface | None = None
@@ -1813,17 +2596,77 @@ class MainWindow(_MainWindowBase):
         # all of them against one shared budget — waiting per thread in turn
         # would stack each THREAD_JOIN_TIMEOUT_MS on a pathological close.
         running: list[tuple[QThread, str, str | None]] = []
-        for thread, direction in (
-            (self._directory_thread, "directory"),
-            (self._create_thread, "create"),
-            (self._rename_thread, "rename"),
-            (self._delete_thread, "delete"),
-            (self._move_thread, "move"),
-            (self._usage_thread, "usage"),
-            (self._download_thread, "download"),
-            (self._upload_thread, "upload"),
-            (self._folder_prepare_thread, "folder_upload"),
-        ):
+        self._closing = True
+        self.transfer_interface.stop_speed_sampler()
+        self.transfer_interface.stop_record_persistence()
+        if self._folder_prepare_cancel is not None:
+            self._folder_prepare_cancel.set()
+        close_downloads = getattr(self._file_browser, "close_downloads", None)
+        if callable(close_downloads):
+            close_thread = QThread(self)
+            close_worker = BrowserOperationWorker(lambda: close_downloads(wait=False))
+            close_worker.moveToThread(close_thread)
+            close_thread.started.connect(close_worker.run)
+            close_worker.succeeded.connect(close_thread.quit)
+            close_worker.failed.connect(close_thread.quit)
+            close_worker.login_required.connect(close_thread.quit)
+            close_thread.finished.connect(self._clear_download_close)
+            self._download_close_thread = close_thread
+            self._download_close_worker = close_worker
+            close_thread.start()
+        self._download_target_pending.clear()
+        self._download_operations.clear()
+        self._download_reserved_targets.clear()
+        self._upload_conflict_pending.clear()
+        self._upload_scan_pending.clear()
+        for folder_pending in self._folder_prepare_pending:
+            self.transfer_interface.update_record(
+                "upload", folder_pending.record_id, status="已取消"
+            )
+        for paused_task_id in self._paused_uploads:
+            self.transfer_interface.update_record("upload", paused_task_id, status="已取消")
+        self._paused_uploads.clear()
+        self._folder_prepare_pending.clear()
+        for queued in self._folder_upload_queue:
+            self.transfer_interface.update_record("upload", queued.task_id, status="已取消")
+        self._folder_upload_queue.clear()
+        if self._folder_upload_record_id is not None:
+            self.transfer_interface.update_record(
+                "upload", self._folder_upload_record_id, status="已取消"
+            )
+        for pending in self._upload_pending:
+            self.transfer_interface.update_record(
+                "upload", pending.task_id, status="已取消"
+            )
+        self._upload_pending.clear()
+        thread_entries: list[tuple[QThread | None, str, str | None]] = [
+            (self._directory_thread, "directory", None),
+            (self._create_thread, "create", None),
+            (self._rename_thread, "rename", None),
+            (self._delete_thread, "delete", None),
+            (self._move_thread, "move", None),
+            (self._usage_thread, "usage", None),
+            (self._download_thread, "download", None),
+            (self._download_target_thread, "download_target", None),
+            (self._download_recovery_thread, "download_recovery", None),
+            (self._upload_recovery_thread, "upload_recovery", None),
+            (self._transfer_history_thread, "transfer_history", None),
+            (self._download_close_thread, "download_close", None),
+            (self._download_operation_thread, "download_operation", None),
+            (self._scan_thread, "upload_scan", None),
+            (self._upload_conflict_thread, "upload_conflict_check", None),
+            (self._folder_prepare_thread, "folder_upload", None),
+        ]
+        thread_entries.extend(
+            (thread, "download_submit", None) for thread in self._download_submit_threads
+        )
+        upload_threads: list[tuple[QThread, str, str | None]] = [
+            (thread, "upload", task_id) for task_id, thread in self._upload_threads.items()
+        ]
+        if not upload_threads and self._upload_thread is not None:
+            upload_threads.append((self._upload_thread, "upload", self._upload_task_id))
+        thread_entries.extend(upload_threads)
+        for thread, direction, upload_task_id in thread_entries:
             if thread is None or not thread.isRunning():
                 continue
             if direction == "download":
@@ -1833,15 +2676,24 @@ class MainWindow(_MainWindowBase):
                     if control is not None:
                         control.request_cancel()
             elif direction == "upload":
-                task_id = self._upload_task_id
+                task_id = upload_task_id
+                worker = self._upload_workers.get(task_id) if task_id is not None else None
+                if worker is not None:
+                    worker.request_cancel()
             else:
                 task_id = None
             thread.quit()
             running.append((thread, direction, task_id))
 
+        join_deadline = time.monotonic() + THREAD_JOIN_TIMEOUT_MS / 1000
         for thread, direction, task_id in running:
-            if thread.isRunning() and not thread.wait(THREAD_JOIN_TIMEOUT_MS):
-                self._abandon_thread_after_timeout(thread, direction, task_id)
+            if thread.isRunning():
+                remaining_ms = max(
+                    0,
+                    math.ceil((join_deadline - time.monotonic()) * 1000),
+                )
+                if not thread.wait(remaining_ms):
+                    self._abandon_thread_after_timeout(thread, direction, task_id)
 
         super().closeEvent(event)
 
@@ -1971,9 +2823,102 @@ class MainWindow(_MainWindowBase):
     def set_file_browser(self, file_browser: FileBrowserBackend) -> None:
         """Attach a UI-safe file browser backend and load the root directory."""
         self._file_browser = file_browser
-        self._load_persisted_download_records()
+        set_callback = getattr(file_browser, "set_download_event_callback", None)
+        if callable(set_callback):
+            set_callback(self._receive_download_event)
+            self._load_transfer_history()
+            self._recover_downloads()
+        else:
+            self._load_transfer_history()
+            self._load_persisted_download_records()
+        self._recover_uploads()
         self.refresh_root()
         self.refresh_cloud_usage()
+
+    def _load_transfer_history(self) -> None:
+        """Load persisted transfer history once per session on a worker thread."""
+        if (
+            self._transfer_history is None
+            or self._transfer_history_loaded
+            or self._transfer_history_thread is not None
+        ):
+            return
+        self._transfer_history_loaded = True
+        thread = QThread(self)
+        worker = BrowserOperationWorker(self._transfer_history.load_history)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_transfer_history_loaded)
+        worker.failed.connect(self._on_transfer_history_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_transfer_history)
+        self._transfer_history_thread = thread
+        self._transfer_history_worker = worker
+        thread.start()
+
+    def _on_transfer_history_loaded(self, result: object) -> None:
+        if not isinstance(result, tuple) or self._closing:
+            return
+        uploads: list[TransferRecord] = []
+        downloads: list[TransferRecord] = []
+        for record in result:
+            if not isinstance(record, TransferRecord):
+                continue
+            if (
+                self.transfer_interface._find_record(record.direction, record.task_id)
+                is not None
+            ):
+                # Same id is already alive this session (user-created race): the
+                # restored row is dropped and its database row deleted; the live
+                # record re-upserts its own row right away so its history is not
+                # lost (design.md 4).
+                if self._transfer_history is not None:
+                    self._transfer_history.delete_records(
+                        record.direction, [record.task_id]
+                    )
+                    live_record = self.transfer_interface._find_record(
+                        record.direction, record.task_id
+                    )
+                    if live_record is not None:
+                        self.transfer_interface._save_record(live_record)
+                LOGGER.warning(
+                    "main_window.transfer_history.conflict_dropped "
+                    "direction=%s task_id=%s",
+                    record.direction,
+                    record.task_id,
+                )
+                continue
+            self._raise_transfer_sequence(record.direction, record.task_id)
+            if record.direction == "upload":
+                uploads.append(record)
+            else:
+                downloads.append(record)
+        for record in uploads:
+            self.transfer_interface.add_upload_record(record, render=False, persist=False)
+        for record in downloads:
+            self.transfer_interface.add_download_record(record, render=False, persist=False)
+        if uploads:
+            self.transfer_interface._render_upload_table()
+        if downloads:
+            self.transfer_interface._render_download_table()
+
+    def _raise_transfer_sequence(self, direction: str, task_id: str) -> None:
+        """Lift the id sequence above restored numeric ids to avoid collisions."""
+        match = re.fullmatch(rf"{direction}-(\d+)", task_id)
+        if match is None:
+            return
+        number = int(match.group(1))
+        if number > self._transfer_sequence:
+            self._transfer_sequence = number
+
+    def _on_transfer_history_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.transfer_history.load_failed error=%s", message)
+
+    def _clear_transfer_history(self) -> None:
+        self._delete_finished_thread()
+        self._transfer_history_thread = None
+        self._transfer_history_worker = None
 
     def set_auth_session(self, session: AuthSession) -> None:
         """Attach a safe authenticated-session summary to the UI."""
@@ -2019,8 +2964,6 @@ class MainWindow(_MainWindowBase):
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_cloud_usage)
 
         self._usage_thread = thread
@@ -2048,7 +2991,18 @@ class MainWindow(_MainWindowBase):
         LOGGER.info("main_window.cloud_usage.login_required")
         self._show_login_required_error(message)
 
+    def _delete_finished_thread(self) -> None:
+        thread = self.sender()
+        if isinstance(thread, QThread):
+            thread.deleteLater()
+
+    def _clear_download_close(self) -> None:
+        self._delete_finished_thread()
+        self._download_close_thread = None
+        self._download_close_worker = None
+
     def _clear_cloud_usage(self) -> None:
+        self._delete_finished_thread()
         self._usage_thread = None
         self._usage_worker = None
 
@@ -2115,8 +3069,6 @@ class MainWindow(_MainWindowBase):
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_directory_refresh)
 
         self._directory_thread = thread
@@ -2162,6 +3114,7 @@ class MainWindow(_MainWindowBase):
         self._render_items()
 
     def _clear_directory_refresh(self) -> None:
+        self._delete_finished_thread()
         self._directory_thread = None
         self._directory_worker = None
         self._directory_parent_id = None
@@ -2207,8 +3160,6 @@ class MainWindow(_MainWindowBase):
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_create_folder)
         self._create_thread = thread
         self._create_worker = worker
@@ -2250,6 +3201,7 @@ class MainWindow(_MainWindowBase):
         self._show_login_required_error(message)
 
     def _clear_create_folder(self) -> None:
+        self._delete_finished_thread()
         self._create_thread = None
         self._create_worker = None
         self._create_parent_id = None
@@ -2283,8 +3235,6 @@ class MainWindow(_MainWindowBase):
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_rename)
         self._rename_thread = thread
         self._rename_worker = worker
@@ -2301,6 +3251,7 @@ class MainWindow(_MainWindowBase):
         self._show_login_required_error(message)
 
     def _clear_rename(self) -> None:
+        self._delete_finished_thread()
         self._rename_thread = None
         self._rename_worker = None
 
@@ -2327,8 +3278,6 @@ class MainWindow(_MainWindowBase):
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_delete)
         self._delete_thread = thread
         self._delete_worker = worker
@@ -2345,6 +3294,7 @@ class MainWindow(_MainWindowBase):
         self._show_login_required_error(message)
 
     def _clear_delete(self) -> None:
+        self._delete_finished_thread()
         self._delete_thread = None
         self._delete_worker = None
 
@@ -2376,8 +3326,6 @@ class MainWindow(_MainWindowBase):
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_move)
         self._move_thread = thread
         self._move_worker = worker
@@ -2394,57 +3342,576 @@ class MainWindow(_MainWindowBase):
         self._show_login_required_error(message)
 
     def _clear_move(self) -> None:
+        self._delete_finished_thread()
         self._move_thread = None
         self._move_worker = None
 
     def download_displayed_item(
-        self,
-        row: int,
-        local_path: Path,
-        *,
-        run_in_background: bool = True,
+        self, row: int, local_path: Path, *, run_in_background: bool = True
     ) -> None:
-        """Download a displayed file row to a local path."""
+        """Submit one displayed file through the same scheduler path as batches."""
         item = self._item_at_row(row)
         if item is None:
             return
-        if item.kind is not WopanItemKind.FILE:
-            self._set_status("只能下载文件")
-            InfoBar.warning(title="下载", content="只能下载文件", parent=self)
+        self._submit_download_items([(item, local_path)], run_in_background=run_in_background)
+
+    def _submit_download_items(
+        self, items: list[tuple[WopanItem, Path]], *, run_in_background: bool = True,
+        automatic: bool = False,
+    ) -> None:
+        if self._file_browser is None:
+            self._set_status("请先登录")
             return
-        if not local_path.name:
-            self._set_status("保存路径不能为空")
-            InfoBar.warning(title="下载", content="保存路径不能为空", parent=self)
+        valid = []
+        for item, path in items:
+            if item.kind is not WopanItemKind.FILE:
+                self._set_status("只能下载文件")
+                return
+            if not path.name:
+                self._set_status("保存路径不能为空")
+                return
+            valid.append((item, path))
+        if not valid:
+            return
+        if run_in_background:
+            if self._download_target_thread is not None:
+                self._download_target_pending.append((valid, automatic, run_in_background))
+                return
+            self._start_download_target_scan(valid, automatic, run_in_background)
+            return
+        try:
+            names = self._scan_download_target_names(valid, automatic)
+        except OSError as exc:
+            self._on_download_target_scan_failed(str(exc))
+            return
+        self._on_download_targets_scanned((valid, automatic, run_in_background, names))
+
+    @staticmethod
+    def _scan_download_target_names(
+        items: list[tuple[WopanItem, Path]], automatic: bool,
+    ) -> dict[Path, set[str]]:
+        names: dict[Path, set[str]] = {}
+        for _item, path in items:
+            parent = path.parent
+            if parent in names:
+                continue
+            if automatic:
+                parent.mkdir(parents=True, exist_ok=True)
+            if not parent.is_dir():
+                raise OSError("下载目录不可用")
+            names[parent] = {entry.name for entry in parent.iterdir()}
+        return names
+
+    def _start_download_target_scan(
+        self, items: list[tuple[WopanItem, Path]], automatic: bool, run_in_background: bool,
+    ) -> None:
+        thread = QThread(self)
+        worker = BrowserOperationWorker(
+            lambda: (
+                items, automatic, run_in_background,
+                self._scan_download_target_names(items, automatic),
+            )
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_download_targets_scanned)
+        worker.failed.connect(self._on_download_target_scan_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_download_target_scan)
+        self._download_target_thread = thread
+        self._download_target_worker = worker
+        self._set_status("正在检查下载目标...")
+        thread.start()
+
+    def _clear_download_target_scan(self) -> None:
+        self._delete_finished_thread()
+        self._download_target_thread = None
+        self._download_target_worker = None
+        if self._download_target_pending and not self._closing:
+            items, automatic, run_in_background = self._download_target_pending.pop(0)
+            self._start_download_target_scan(items, automatic, run_in_background)
+
+    def _on_download_target_scan_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        self._set_status(f"下载目录不可用：{message}")
+        InfoBar.error(title="下载目录不可用", content=message, parent=self)
+
+    def _on_download_targets_scanned(self, result: object) -> None:
+        if self._closing:
+            return
+        valid, automatic, run_in_background, names = cast(
+            tuple[list[tuple[WopanItem, Path]], bool, bool, dict[Path, set[str]]], result
+        )
+        resolved = self._resolve_download_targets(valid, names, automatic=automatic)
+        if resolved is None:
+            return
+        skipped_count = len(valid) - len(resolved)
+        if not resolved:
+            self._set_status(f"已跳过 {skipped_count} 个冲突项目")
+            return
+        if skipped_count:
+            self._set_status(f"已跳过 {skipped_count} 个冲突项目")
+        if callable(getattr(self._file_browser, "submit_download", None)):
+            self._download_reserved_targets.update(path for _, path in resolved)
+        self._submit_resolved_download_items(resolved, run_in_background=run_in_background)
+
+    def _submit_resolved_download_items(
+        self, valid: list[tuple[WopanItem, Path]], *, run_in_background: bool,
+    ) -> None:
+        submit = getattr(self._file_browser, "submit_download", None)
+        if not callable(submit):
+            # Keep test doubles and older backends on the original worker boundary.
+            for item, path in valid:
+                task_id = self._create_download_record(item, path)
+                if run_in_background:
+                    self._start_download_task(item, path, task_id)
+                else:
+                    try:
+                        self._download_with_callbacks(item, path, task_id)
+                    except FileBrowserLoginRequiredError as exc:
+                        self._mark_transfer_failed("download", task_id, str(exc))
+                        self._show_login_required_error(str(exc))
+                    except FileBrowserError as exc:
+                        self._on_download_failed(str(exc), task_id=task_id)
+                    else:
+                        self._on_download_succeeded(item.name, str(path), task_id=task_id)
+            return
+
+        def submit_all() -> list[tuple[WopanItem, Path, str | None, str]]:
+            results: list[tuple[WopanItem, Path, str | None, str]] = []
+            for item, path in valid:
+                try:
+                    task_id = submit(item, path)
+                except FileBrowserError as exc:
+                    results.append((item, path, None, str(exc)))
+                else:
+                    results.append((item, path, task_id, ""))
+            return results
+
+        thread = QThread(self)
+        worker = BrowserOperationWorker(submit_all)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_download_submissions_succeeded)
+        worker.failed.connect(self._on_download_submissions_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_download_submission)
+        self._download_submit_threads.add(thread)
+        self._download_submit_workers[thread] = worker
+        self._download_submit_paths[thread] = {path for _, path in valid}
+        self._download_submit_thread = thread
+        self._download_submit_worker = worker
+        self._set_status("正在加入下载队列...")
+        thread.start()
+
+    def _on_download_submissions_succeeded(self, result: object) -> None:
+        if self._closing:
+            return
+        submissions = cast(list[tuple[WopanItem, Path, str | None, str]], result)
+        succeeded = 0
+        failed = 0
+        for item, path, task_id, error in submissions:
+            if task_id is None:
+                failed += 1
+                self._create_download_record(item, path, status="失败", error=error)
+                if error == "登录已过期，请重新登录":
+                    self._show_login_required_error(error)
+                continue
+            succeeded += 1
+            self._removed_download_task_ids.discard(task_id)
+            self._create_download_record(item, path, task_id=task_id)
+            event = self._pending_download_events.pop(task_id, None)
+            if event is not None:
+                self._on_download_event(event)
+        self._set_status(f"已添加 {succeeded} 个下载任务，失败 {failed} 个")
+        self.update_operation_controls()
+
+    def _on_download_submissions_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        self._set_status(f"下载失败：{message}")
+        InfoBar.error(title="下载失败", content=message, parent=self)
+
+    def _clear_download_submission(self) -> None:
+        self._delete_finished_thread()
+        thread = self.sender()
+        if isinstance(thread, QThread):
+            self._download_submit_threads.discard(thread)
+            self._download_submit_workers.pop(thread, None)
+            self._download_reserved_targets.difference_update(
+                self._download_submit_paths.pop(thread, set())
+            )
+            if self._download_submit_thread is not thread:
+                return
+        self._download_submit_thread = None
+        self._download_submit_worker = None
+
+    def _resolve_download_targets(
+        self,
+        items: list[tuple[WopanItem, Path]],
+        existing_names: dict[Path, set[str]],
+        *,
+        automatic: bool = False,
+    ) -> list[tuple[WopanItem, Path]] | None:
+        """Resolve scanned local targets without doing filesystem work on the GUI thread."""
+        targets: list[tuple[WopanItem, Path]] = []
+        occupied = {parent: names.copy() for parent, names in existing_names.items()}
+        for record in self.transfer_interface.download_records:
+            path = record.target_path
+            if record.status in ACTIVE_DOWNLOAD_STATUSES and path is not None:
+                if path.parent in occupied:
+                    occupied[path.parent].add(path.name)
+        for path in self._download_reserved_targets:
+            if path.parent in occupied:
+                occupied[path.parent].add(path.name)
+        if automatic:
+            used_names = occupied
+            for item, path in items:
+                names = used_names[path.parent]
+                copy_name = _next_available_file_name(path.name, names)
+                targets.append((item, path.with_name(copy_name)))
+                names.add(copy_name)
+            return targets
+
+        seen_names = {parent: names.copy() for parent, names in occupied.items()}
+        conflicts: list[Path] = []
+        for _item, path in items:
+            names = seen_names[path.parent]
+            if path.name in names:
+                conflicts.append(path)
+            names.add(path.name)
+        if not conflicts:
+            return items
+
+        dialog = DownloadConflictDialog(tuple(conflicts), self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if self._closing or not accepted:
+            self._set_status("已取消下载")
+            return None
+        resolution = dialog.resolution()
+        if resolution is None:
+            self._set_status("已取消下载")
+            return None
+
+        used_names = occupied
+        for item, path in items:
+            names = used_names[path.parent]
+            if path.name not in names:
+                targets.append((item, path))
+                names.add(path.name)
+                continue
+            if resolution == "skip":
+                continue
+            copy_name = _next_available_file_name(path.name, names)
+            targets.append((item, path.with_name(copy_name)))
+            names.add(copy_name)
+        return targets
+
+    def _receive_download_event(self, event: DownloadTaskEvent) -> None:
+        self._download_event_signal.emit(event)
+
+    def _on_download_event(self, event: object) -> None:
+        if self._closing or not isinstance(event, DownloadTaskEvent):
+            return
+        if event.task_id in self._removed_download_task_ids:
+            return
+        record = self.transfer_interface._find_record("download", event.task_id)
+        if record is None:
+            self._pending_download_events[event.task_id] = event
+            return
+
+        terminal = event.status in TERMINAL_TRANSFER_STATUSES
+        status = event.status if terminal or event.status != record.status else None
+        total_bytes = (
+            event.total_bytes
+            if event.total_bytes is not None and event.total_bytes != record.total_bytes
+            else None
+        )
+        max_connections = (
+            event.max_connections
+            if event.max_connections != record.max_connections
+            else None
+        )
+        can_resume = event.status in {"已暂停", "失败"}
+        can_resume_value = can_resume if can_resume != record.can_resume else None
+        error = event.error if event.error != record.error else None
+        self.transfer_interface.update_record(
+            "download",
+            event.task_id,
+            status=status,
+            bytes_done=event.bytes_done,
+            total_bytes=total_bytes,
+            active_connections=event.active_connections,
+            max_connections=max_connections,
+            can_resume=can_resume_value,
+            error=error,
+        )
+        if event.status == "已完成":
+            self._set_status("下载完成")
+        elif event.status == "失败":
+            self._set_status(f"下载失败：{event.error}")
+
+    def handle_upload_drop(self, paths: object) -> None:
+        """Start a background summary scan for local paths dropped on the file list."""
+        if self._file_browser is None:
+            self._set_status("请先登录")
+            return
+        if not isinstance(paths, tuple) or not all(isinstance(path, Path) for path in paths):
+            return
+        unique_paths = tuple(dict.fromkeys(paths))
+        if not unique_paths:
+            return
+        parent_id = self.current_directory_id()
+        if self._scan_thread is not None:
+            self._upload_scan_pending.append((unique_paths, parent_id))
+            self._set_status("已排队待扫描")
+            return
+        self._start_upload_scan(unique_paths, parent_id)
+
+    def _start_upload_scan(self, paths: tuple[Path, ...], parent_id: str) -> None:
+        self._upload_scan_parent_id = parent_id
+        thread = QThread(self)
+        worker = UploadScanWorker(paths)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_upload_scan_succeeded)
+        worker.failed.connect(self._on_upload_scan_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_upload_scan)
+        self._scan_thread = thread
+        self._scan_worker = worker
+        self._set_status("正在扫描待上传内容...")
+        LOGGER.info("main_window.upload_scan.start top_count=%s", len(paths))
+        thread.start()
+
+    def _on_upload_scan_succeeded(self, result: object) -> None:
+        if self._closing:
+            return
+        if not isinstance(result, UploadBatchSummary):
+            self._on_upload_scan_failed("扫描结果无效")
+            return
+        LOGGER.info(
+            "main_window.upload_scan.success top_count=%s file_count=%s folder_count=%s",
+            len(result.top_paths),
+            result.file_count,
+            result.folder_count,
+        )
+        parent_id = self._upload_scan_parent_id
+        if parent_id is None or self.current_directory_id() != parent_id:
+            self._set_status("目录已变化，请重新提交上传任务")
+            return
+        self._submit_upload_paths(result.top_paths, parent_id=parent_id, summary=result)
+
+    def _submit_upload_paths(
+        self,
+        paths: tuple[Path, ...],
+        *,
+        parent_id: str | None = None,
+        run_in_background: bool = True,
+        summary: UploadBatchSummary | None = None,
+    ) -> None:
+        """Queue a background target-directory check before creating upload tasks."""
+        if self._closing:
             return
         if self._file_browser is None:
             self._set_status("请先登录")
             return
-
-        LOGGER.info(
-            "main_window.download.start item_id=%s name_length=%s",
-            item.item_id,
-            len(item.name),
-        )
-        task_id = self._create_download_record(item, local_path)
-        if run_in_background:
-            self._start_download_task(item, local_path, task_id)
+        unique_paths = tuple(dict.fromkeys(paths))
+        if not unique_paths:
             return
-        self._set_status(f"正在下载「{item.name}」...")
+        requested_parent_id = parent_id if parent_id is not None else self.current_directory_id()
+        self._upload_conflict_pending.append(
+            (unique_paths, requested_parent_id, run_in_background, summary)
+        )
+        self._start_next_upload_conflict_check()
+
+    def _start_next_upload_conflict_check(self) -> None:
+        if (
+            self._closing
+            or self._upload_conflict_thread is not None
+            or self._upload_conflict_dialog_open
+            or not self._upload_conflict_pending
+        ):
+            return
+        request = self._upload_conflict_pending.pop(0)
+        self._upload_conflict_current = request
+        paths, parent_id, _run_in_background, _summary = request
+        file_browser = self._file_browser
+        if file_browser is None:
+            self._upload_conflict_current = None
+            return
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.list_directory(parent_id))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_upload_conflict_check_succeeded)
+        worker.failed.connect(self._on_upload_conflict_check_failed)
+        worker.login_required.connect(self._on_upload_conflict_check_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(self._clear_upload_conflict_check)
+        self._upload_conflict_thread = thread
+        self._upload_conflict_worker = worker
+        self._set_status("正在检查上传名称...")
+        LOGGER.info("main_window.upload_conflict_check.start top_count=%s", len(paths))
+        thread.start()
+
+    def _on_upload_conflict_check_succeeded(self, result: object) -> None:
+        if self._closing:
+            return
+        request = self._upload_conflict_current
+        if request is None or not isinstance(result, list):
+            self._on_upload_conflict_check_failed("上传目录检查结果无效")
+            return
+        if not all(isinstance(item, WopanItem) for item in result):
+            self._on_upload_conflict_check_failed("上传目录检查结果无效")
+            return
+        paths, parent_id, run_in_background, summary = request
+        if self.current_directory_id() != parent_id:
+            self._set_status("目录已变化，请重新提交上传任务")
+            return
+        existing_names = {item.name for item in result}
+        LOGGER.info(
+            "main_window.upload_conflict_check.success top_count=%s cloud_count=%s",
+            len(paths),
+            len(result),
+        )
+        self._upload_conflict_dialog_open = True
         try:
-            self._download_with_callbacks(item, local_path, task_id)
-        except FileBrowserLoginRequiredError as exc:
-            self._mark_transfer_failed("download", task_id, str(exc))
-            self._show_login_required_error(str(exc))
-        except FileBrowserError as exc:
-            self._on_download_failed(str(exc), task_id=task_id)
+            resolution: UploadConflictResolution | None = None
+            if summary is not None:
+                conflicts = find_upload_conflicts(paths, existing_names)
+                dialog = UploadSummaryDialog(
+                    summary, self.breadcrumb_names()[-1], self, conflicts=conflicts
+                )
+                accepted = dialog.exec() == QDialog.DialogCode.Accepted
+                if self._closing:
+                    return
+                if not accepted:
+                    self._set_status("已取消上传")
+                    return
+                resolution = dialog.resolution()
+            self._resolve_upload_paths(
+                paths,
+                existing_names,
+                parent_id=parent_id,
+                run_in_background=run_in_background,
+                resolution=resolution,
+            )
+        finally:
+            self._upload_conflict_dialog_open = False
+            self._start_next_upload_conflict_check()
+
+    def _on_upload_conflict_check_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        LOGGER.warning("main_window.upload_conflict_check.failed error_length=%s", len(message))
+        self._set_status(f"检查上传名称失败：{message}")
+        InfoBar.error(title="检查上传名称失败", content=message, parent=self)
+
+    def _on_upload_conflict_check_login_required(self, message: str) -> None:
+        if self._closing:
+            return
+        self._show_login_required_error(message)
+
+    def _clear_upload_conflict_check(self) -> None:
+        self._delete_finished_thread()
+        self._upload_conflict_thread = None
+        self._upload_conflict_worker = None
+        self._upload_conflict_current = None
+        self._start_next_upload_conflict_check()
+
+    def _resolve_upload_paths(
+        self,
+        paths: tuple[Path, ...],
+        existing_names: set[str],
+        *,
+        parent_id: str,
+        run_in_background: bool,
+        resolution: UploadConflictResolution | None = None,
+    ) -> None:
+        conflicts = find_upload_conflicts(paths, existing_names)
+        if resolution is None:
+            resolution = "copy"
+            if conflicts:
+                dialog = UploadConflictDialog(conflicts, self)
+                dialog.exec()
+                if self._closing:
+                    return
+                selected_resolution = dialog.resolution()
+                if selected_resolution is None:
+                    self._set_status("已取消上传")
+                    return
+                resolution = selected_resolution
+        if self._closing:
+            return
+        if self.current_directory_id() != parent_id:
+            self._set_status("目录已变化，请重新提交上传任务")
+            return
+        targets = resolve_upload_targets(paths, existing_names, resolution)
+        skipped_count = len(paths) - len(targets)
+        if skipped_count:
+            self._set_status(
+                f"已跳过 {skipped_count} 个冲突项目，已添加 {len(targets)} 个上传任务"
+            )
         else:
-            self._on_download_succeeded(item.name, str(local_path), task_id=task_id)
+            self._set_status(f"已添加 {len(targets)} 个上传任务")
+        for target in targets:
+            if target.local_path.is_dir():
+                self.upload_folder_to_current_directory(
+                    target.local_path,
+                    root_name=(
+                        target.upload_name
+                        if target.upload_name is not None
+                        else target.local_path.name
+                    ),
+                    _parent_id=parent_id,
+                    _conflict_checked=True,
+                )
+            else:
+                self.upload_file_to_current_directory(
+                    target.local_path,
+                    run_in_background=run_in_background,
+                    upload_name=(
+                        target.upload_name
+                        if target.upload_name is not None
+                        else target.local_path.name
+                    ),
+                    _parent_id=parent_id,
+                    _conflict_checked=True,
+                    _show_enqueue_status=len(targets) == 1,
+                )
+
+    def _on_upload_scan_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        LOGGER.warning("main_window.upload_scan.failed error_length=%s", len(message))
+        self._set_status(f"扫描上传内容失败：{message}")
+        InfoBar.error(title="扫描上传内容失败", content=message, parent=self)
+
+    def _clear_upload_scan(self) -> None:
+        self._delete_finished_thread()
+        self._scan_thread = None
+        self._scan_worker = None
+        self._upload_scan_parent_id = None
+        if self._upload_scan_pending:
+            paths, parent_id = self._upload_scan_pending.pop(0)
+            self._start_upload_scan(paths, parent_id)
 
     def upload_file_to_current_directory(
         self,
         local_path: Path,
         *,
         run_in_background: bool = True,
+        upload_name: str | None = None,
+        _conflict_checked: bool = False,
+        _parent_id: str | None = None,
+        _show_enqueue_status: bool = True,
     ) -> None:
         """Upload one local file to the current directory."""
         if self._file_browser is None:
@@ -2454,20 +3921,42 @@ class MainWindow(_MainWindowBase):
             self._set_status("上传文件不能为空")
             InfoBar.warning(title="上传", content="上传文件不能为空", parent=self)
             return
+        if upload_name is None and not _conflict_checked:
+            self._submit_upload_paths((local_path,), run_in_background=run_in_background)
+            return
 
-        parent_id = self.current_directory_id()
+        parent_id = (
+            _parent_id if _parent_id is not None else self.current_directory_id()
+        )
         LOGGER.info(
             "main_window.upload.start parent_id=%s file_name_length=%s",
             parent_id,
             len(local_path.name),
         )
-        task_id = self._create_upload_record(local_path)
+        task_id = self._create_upload_record(
+            local_path,
+            name=upload_name if upload_name is not None else local_path.name,
+            parent_id=parent_id,
+            upload_name=upload_name,
+            retryable=True,
+        )
         if run_in_background:
-            self._start_upload_task(parent_id, local_path, task_id)
+            self._start_upload_task(
+                parent_id,
+                local_path,
+                task_id,
+                upload_name=upload_name,
+                show_enqueue_status=_show_enqueue_status,
+            )
             return
         self._set_status(f"正在上传「{local_path.name}」...")
         try:
-            uploaded_item = self._file_browser.upload_file(parent_id, local_path)
+            if upload_name is None:
+                uploaded_item = self._file_browser.upload_file(parent_id, local_path)
+            else:
+                uploaded_item = self._file_browser.upload_file(
+                    parent_id, local_path, upload_name=upload_name
+                )
         except FileBrowserLoginRequiredError as exc:
             self._mark_transfer_failed("upload", task_id, str(exc))
             self._show_login_required_error(str(exc))
@@ -2476,7 +3965,15 @@ class MainWindow(_MainWindowBase):
         else:
             self._on_upload_succeeded(uploaded_item, task_id=task_id)
 
-    def upload_folder_to_current_directory(self, local_root: Path) -> None:
+    def upload_folder_to_current_directory(
+        self,
+        local_root: Path,
+        *,
+        root_name: str | None = None,
+        _conflict_checked: bool = False,
+        _parent_id: str | None = None,
+        _record_id: str | None = None,
+    ) -> None:
         """Upload one local folder tree to the current directory (two phases)."""
         if self._file_browser is None:
             self._set_status("请先登录")
@@ -2485,24 +3982,73 @@ class MainWindow(_MainWindowBase):
             self._set_status("上传文件夹不能为空")
             InfoBar.warning(title="上传", content="上传文件夹不能为空", parent=self)
             return
-        if self._upload_thread is not None or self._folder_prepare_thread is not None:
-            self._set_status("已有上传任务正在进行")
-            InfoBar.warning(title="上传", content="已有上传任务正在进行", parent=self)
+        if root_name is None and not _conflict_checked:
+            self._submit_upload_paths((local_root,))
+            return
+        if (
+            self._folder_prepare_thread is not None
+            or self._folder_upload_active is not None
+            or self._folder_upload_queue
+        ):
+            record_id = self._create_upload_record(
+                local_root,
+                name=root_name if root_name is not None else local_root.name,
+                parent_id=(
+                    _parent_id
+                    if _parent_id is not None
+                    else self.current_directory_id()
+                ),
+            )
+            self._folder_prepare_pending.append(
+                PendingFolderUpload(
+                    local_path=local_root,
+                    parent_id=(
+                        _parent_id
+                        if _parent_id is not None
+                        else self.current_directory_id()
+                    ),
+                    root_name=root_name,
+                    record_id=record_id,
+                )
+            )
+            self._set_status(f"已添加「{local_root.name}」上传任务")
             return
 
-        parent_id = self.current_directory_id()
+        parent_id = (
+            _parent_id if _parent_id is not None else self.current_directory_id()
+        )
         LOGGER.info(
             "main_window.folder_upload.prepare.start parent_id=%s root_name_length=%s",
             parent_id,
             len(local_root.name),
         )
-        record_id = self._create_upload_record(local_root)
+        if _record_id is None:
+            record_id = self._create_upload_record(
+                local_root,
+                name=root_name if root_name is not None else local_root.name,
+                parent_id=parent_id,
+            )
+        else:
+            record_id = _record_id
+        self._folder_upload_record_id = record_id
         self.transfer_interface.update_record("upload", record_id, status="创建目录中")
         file_browser = self._file_browser
         thread = QThread(self)
-        worker = BrowserOperationWorker(
-            lambda: file_browser.prepare_folder_upload(parent_id, local_root)
-        )
+        prepare_cancel = threading.Event()
+        if root_name is None:
+            def operation() -> FolderUploadJob:
+                return file_browser.prepare_folder_upload(
+                    parent_id, local_root, cancel_requested=prepare_cancel.is_set
+                )
+        else:
+            resolved_root_name = root_name
+
+            def operation() -> FolderUploadJob:
+                return file_browser.prepare_folder_upload(
+                    parent_id, local_root, root_name=resolved_root_name,
+                    cancel_requested=prepare_cancel.is_set,
+                )
+        worker = BrowserOperationWorker(operation)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._on_folder_upload_prepared)
@@ -2511,22 +4057,26 @@ class MainWindow(_MainWindowBase):
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_folder_prepare)
 
         self._folder_prepare_thread = thread
         self._folder_prepare_worker = worker
+        self._folder_prepare_cancel = prepare_cancel
         self._folder_upload_record_id = record_id
         self._folder_upload_target_dir_id = parent_id
         self._set_status(f"正在创建目录「{local_root.name}」...")
         thread.start()
 
     def _on_folder_upload_prepared(self, result: object) -> None:
+        if self._closing:
+            return
+        if self._folder_upload_record_id in self._upload_removal_requested:
+            self._finish_folder_upload()
+            return
         job = cast(FolderUploadJob, result)
         record_id = self._folder_upload_record_id
         if record_id is not None:
-            self.transfer_interface.update_record("upload", record_id, status="已完成")
+            self.transfer_interface.update_record("upload", record_id, status="上传中")
         LOGGER.info(
             "main_window.folder_upload.prepare.success root_item_id=%s file_count=%s",
             job.root_item_id,
@@ -2538,6 +4088,9 @@ class MainWindow(_MainWindowBase):
                 planned.local_path,
                 name=planned.name,
                 size=planned.size,
+                parent_id=planned.target_dir_id,
+                upload_name=planned.name,
+                retryable=True,
             )
             queue.append(
                 QueuedUploadFile(
@@ -2548,9 +4101,16 @@ class MainWindow(_MainWindowBase):
                 )
             )
         self._folder_upload_queue = queue
+        self._folder_upload_child_ids = {item.task_id for item in queue}
+        self._set_status(f"已添加 {len(queue)} 个上传任务")
         self._start_next_folder_upload_file()
 
     def _on_folder_upload_prepare_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        if self._folder_upload_record_id in self._upload_removal_requested:
+            self._finish_folder_upload()
+            return
         LOGGER.warning(
             "main_window.folder_upload.prepare.failed error_length=%s", len(message)
         )
@@ -2559,56 +4119,135 @@ class MainWindow(_MainWindowBase):
         InfoBar.error(title="上传文件夹失败", content=message, parent=self)
 
     def _on_folder_upload_prepare_login_required(self, message: str) -> None:
+        if self._closing:
+            return
+        if self._folder_upload_record_id in self._upload_removal_requested:
+            self._finish_folder_upload()
+            return
         self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
         self._show_login_required_error(message)
 
     def _clear_folder_prepare(self) -> None:
+        self._delete_finished_thread()
         self._folder_prepare_thread = None
         self._folder_prepare_worker = None
-        self._folder_upload_record_id = None
+        self._folder_prepare_cancel = None
+        if self._folder_upload_active is None and not self._folder_upload_queue:
+            self._folder_upload_record_id = None
+        self._start_next_pending_folder()
+
+    def _start_next_pending_folder(self) -> None:
+        if (
+            self._closing
+            or self._upload_delete_batch
+            or self._folder_prepare_thread is not None
+            or self._folder_upload_active is not None
+            or self._folder_upload_queue
+            or not self._folder_prepare_pending
+        ):
+            return
+        pending = self._take_pending_folder()
+        self.upload_folder_to_current_directory(
+            pending.local_path,
+            root_name=pending.root_name,
+            _conflict_checked=True,
+            _parent_id=pending.parent_id,
+            _record_id=pending.record_id,
+        )
+
+    def _take_pending_folder(self) -> PendingFolderUpload:
+        return self._folder_prepare_pending.pop(0)
 
     def _start_next_folder_upload_file(self) -> None:
         """Dequeue and start the next folder-upload file when the slot is free."""
+        if self._upload_delete_batch:
+            return
         if not self._folder_upload_queue:
             self._finish_folder_upload()
             return
-        if self._upload_thread is not None:
-            # Slot holds a single-file upload; retried from _clear_upload_task.
-            LOGGER.debug("main_window.folder_upload.deferred_busy")
+        queued = next(
+            (
+                item
+                for item in self._folder_upload_queue
+                if item.task_id not in self._paused_uploads
+            ),
+            None,
+        )
+        if queued is None:
             return
-        queued = self._folder_upload_queue.pop(0)
+        self._folder_upload_queue.remove(queued)
         self._folder_upload_active = queued
         self._start_upload_task(
             queued.target_dir_id,
             queued.local_path,
             queued.task_id,
             upload_name=queued.upload_name,
+            show_enqueue_status=False,
         )
 
     def _continue_folder_upload_queue(self) -> None:
         """Advance the folder-upload queue after the upload slot cleared."""
-        if self._folder_upload_active is None and not self._folder_upload_queue:
+        if self._closing:
             return
+        active = self._folder_upload_active
+        if active is not None and (
+            active.task_id in self._upload_threads
+            or active.task_id in self._paused_uploads
+            or any(pending.task_id == active.task_id for pending in self._upload_pending)
+        ):
+            return
+        self._folder_upload_active = None
         if self._folder_upload_queue:
             self._start_next_folder_upload_file()
             return
-        self._finish_folder_upload()
+        if active is not None:
+            self._finish_folder_upload()
 
     def _finish_folder_upload(self) -> None:
         success_count = self._folder_upload_success_count
         failure_count = self._folder_upload_failure_count
+        cancel_count = self._folder_upload_cancel_count
         target_dir_id = self._folder_upload_target_dir_id
+        root_id = self._folder_upload_record_id
+        if (
+            any(child_id in self._upload_workers for child_id in self._folder_upload_child_ids)
+            or any(
+                pending.task_id in self._folder_upload_child_ids for pending in self._upload_pending
+            )
+            or any(task_id in self._paused_uploads for task_id in self._folder_upload_child_ids)
+        ):
+            return
         self._folder_upload_active = None
         self._folder_upload_queue = []
+        self._folder_upload_child_ids.clear()
+        self._folder_upload_failed_ids.clear()
         self._folder_upload_success_count = 0
         self._folder_upload_failure_count = 0
+        self._folder_upload_cancel_count = 0
         self._folder_upload_target_dir_id = None
+        self._folder_upload_record_id = None
+        if root_id in self._upload_removal_requested:
+            self._upload_removal_requested.discard(root_id)
+            self.transfer_interface.remove_records("upload", {root_id})
+            if target_dir_id is not None and self.current_directory_id() == target_dir_id:
+                self.refresh_current_directory()
+            self._start_next_pending_folder()
+            return
         LOGGER.info(
             "main_window.folder_upload.finished success=%s failed=%s",
             success_count,
             failure_count,
         )
         content = f"成功 {success_count} 个，失败 {failure_count} 个"
+        if cancel_count:
+            content += f"，取消 {cancel_count} 个"
+        if root_id is not None:
+            if cancel_count:
+                self.transfer_interface.update_record("upload", root_id, status="已取消")
+            elif failure_count:
+                self._mark_transfer_failed("upload", root_id, content)
+            else:
+                self.transfer_interface.update_record("upload", root_id, status="已完成")
         if failure_count == 0:
             InfoBar.info(title="上传完成", content=content, parent=self)
         else:
@@ -2616,6 +4255,7 @@ class MainWindow(_MainWindowBase):
         self._set_status(f"文件夹上传完成：{content}")
         if target_dir_id is not None and self.current_directory_id() == target_dir_id:
             self.refresh_current_directory()
+        self._start_next_pending_folder()
 
     def prompt_create_folder(self) -> None:
         """Prompt for a folder name and create it."""
@@ -2680,30 +4320,45 @@ class MainWindow(_MainWindowBase):
         dialog.deleteLater()
 
     def prompt_download_item(self, row: int) -> None:
-        """Download a row, prompting for a path only when configured."""
-        item = self._item_at_row(row)
-        if item is None:
+        """Prompt for one save path or a directory for the selected files."""
+        if self._file_browser is None:
+            self._set_status("请先登录")
             return
-        if item.kind is not WopanItemKind.FILE:
+        rows = self.selected_download_rows()
+        if row not in rows:
+            rows = [row]
+        items = [self._item_at_row(index) for index in rows]
+        if not items or all(item is None for item in items):
+            self._set_status("请先登录")
+            return
+        files = [
+            (index, item)
+            for index, item in zip(rows, items, strict=True)
+            if item is not None and item.kind is WopanItemKind.FILE and item.download_id
+        ]
+        if not files:
             self._set_status("只能下载文件")
             InfoBar.warning(title="下载", content="只能下载文件", parent=self)
             return
-
-        if not self._settings.ask_download_location:
-            local_path = self._resolve_automatic_download_path(item.name)
-            if local_path is None:
+        if len(files) == 1 and self._settings.ask_download_location:
+            index, item = files[0]
+            assert item is not None
+            path_text, _selected_filter = QFileDialog.getSaveFileName(self, "保存文件", item.name)
+            if path_text:
+                self.download_displayed_item(index, Path(path_text))
+            return
+        if self._settings.ask_download_location:
+            folder_text = QFileDialog.getExistingDirectory(self, "选择下载目录")
+            if not folder_text:
                 return
-            self.download_displayed_item(row, local_path)
-            return
-
-        path_text, _selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "保存文件",
-            item.name,
-        )
-        if not path_text:
-            return
-        self.download_displayed_item(row, Path(path_text))
+            folder = Path(folder_text)
+        else:
+            folder = self._settings.default_download_path
+        paths = [
+            (item, folder / _safe_local_file_name(item.name))
+            for _, item in files
+        ]
+        self._submit_download_items(paths, automatic=not self._settings.ask_download_location)
 
     def _resolve_automatic_download_path(self, remote_name: str) -> Path | None:
         folder = self._settings.default_download_path
@@ -2736,7 +4391,7 @@ class MainWindow(_MainWindowBase):
         )
         if not path_text:
             return
-        self.upload_file_to_current_directory(Path(path_text))
+        self._submit_upload_paths((Path(path_text),))
 
     def prompt_upload_folder(self) -> None:
         """Prompt for one local folder and upload it to the current directory."""
@@ -2750,7 +4405,7 @@ class MainWindow(_MainWindowBase):
         )
         if not path_text:
             return
-        self.upload_folder_to_current_directory(Path(path_text))
+        self._submit_upload_paths((Path(path_text),))
 
     def enter_displayed_folder(self, row: int) -> None:
         """Enter a displayed folder row."""
@@ -2807,32 +4462,34 @@ class MainWindow(_MainWindowBase):
         """Return the current displayed file items."""
         return tuple(self._items)
 
+    def selected_download_rows(self) -> list[int]:
+        """Return selected file rows that have a downloadable identifier."""
+        selection_model = self.file_interface.file_table.selectionModel()
+        if selection_model is None:  # pragma: no cover - docs/testing-exemptions.md
+            return []
+        rows: list[int] = []
+        for index in sorted(selection_model.selectedRows(), key=lambda value: value.row()):
+            item = self._item_at_row(index.row())
+            if item is not None and item.kind is WopanItemKind.FILE and item.download_id:
+                rows.append(index.row())
+        return rows
+
     def selected_download_row(self) -> int | None:
         """Return the single selected file row if it can be downloaded."""
-        table = self.file_interface.file_table
-        selection_model = table.selectionModel()
-        if selection_model is None:  # pragma: no cover - docs/testing-exemptions.md
-            return None
-        rows = sorted({index.row() for index in selection_model.selectedRows()})
-        if len(rows) != 1:
-            return None
-        item = self._item_at_row(rows[0])
-        if item is None or item.kind is not WopanItemKind.FILE or not item.download_id:
-            return None
-        return rows[0]
+        rows = self.selected_download_rows()
+        return rows[0] if len(rows) == 1 else None
 
     def update_operation_controls(self) -> None:
         """Update selection-sensitive operation controls."""
         can_download = (
             self._file_browser is not None
-            and self._download_thread is None
-            and self.selected_download_row() is not None
+            and bool(self.selected_download_rows())
         )
         self.file_interface.download_button.setEnabled(can_download)
-        can_upload = self._file_browser is not None and self._upload_thread is None
+        can_upload = self._file_browser is not None
         self.file_interface.upload_button_group.setEnabled(can_upload)
         self.file_interface.upload_file_action.setEnabled(can_upload)
-        self.file_interface.upload_folder_action.setEnabled(False)
+        self.file_interface.upload_folder_action.setEnabled(can_upload)
 
     def status_message(self) -> str:
         """Return the current non-sensitive status message."""
@@ -2864,8 +4521,6 @@ class MainWindow(_MainWindowBase):
         worker.stopped.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_download_task)
 
         self._download_thread = thread
@@ -2878,6 +4533,22 @@ class MainWindow(_MainWindowBase):
         self._set_status(f"正在下载「{item.name}」...")
         self.update_operation_controls()
         thread.start()
+
+    def _start_next_upload_task(self) -> None:
+        while self._upload_pending:
+            active_count = len(self._upload_threads)
+            if active_count >= max(1, self._settings.max_concurrent_uploads):
+                return
+            if self._upload_pending[0].task_id in self._upload_threads:
+                return
+            pending = self._upload_pending.pop(0)
+            self._launch_upload_task(
+                pending.parent_id,
+                pending.local_path,
+                pending.task_id,
+                upload_name=pending.upload_name,
+                show_enqueue_status=pending.show_enqueue_status,
+            )
 
     def _download_with_callbacks(self, item: WopanItem, local_path: Path, task_id: str) -> None:
         if self._file_browser is None:
@@ -2915,37 +4586,80 @@ class MainWindow(_MainWindowBase):
         task_id: str,
         *,
         upload_name: str | None = None,
+        show_enqueue_status: bool = True,
     ) -> None:
         if self._file_browser is None:
             self._set_status("请先登录")
             return
-        if self._upload_thread is not None:
-            self._set_status("已有上传任务正在进行")
-            InfoBar.warning(title="上传", content="已有上传任务正在进行", parent=self)
+        active_count = len(self._upload_threads)
+        if active_count == 0 and self._upload_thread is not None:
+            active_count = 1
+        if (
+            self._upload_pending
+            or task_id in self._upload_threads
+            or active_count >= max(1, self._settings.max_concurrent_uploads)
+        ):
+            self._upload_pending.append(
+                PendingUploadTask(
+                    parent_id=parent_id,
+                    local_path=local_path,
+                    task_id=task_id,
+                    upload_name=upload_name,
+                    show_enqueue_status=show_enqueue_status,
+                )
+            )
+            if show_enqueue_status:
+                display_name = upload_name if upload_name is not None else local_path.name
+                self._set_status(f"已添加「{display_name}」上传任务")
+            if active_count < max(1, self._settings.max_concurrent_uploads):
+                self._start_next_upload_task()
             return
+        self._launch_upload_task(
+            parent_id,
+            local_path,
+            task_id,
+            upload_name=upload_name,
+            show_enqueue_status=show_enqueue_status,
+        )
 
+    def _launch_upload_task(
+        self,
+        parent_id: str,
+        local_path: Path,
+        task_id: str,
+        *,
+        upload_name: str | None,
+        show_enqueue_status: bool,
+    ) -> None:
+        if self._file_browser is None:
+            self._set_status("请先登录")
+            return
         thread = QThread(self)
         worker = UploadWorker(self._file_browser, parent_id, local_path, task_id, upload_name)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
+        worker.progress.connect(self._on_upload_progress)
         worker.succeeded.connect(self._on_upload_succeeded)
         worker.failed.connect(self._on_upload_failed)
         worker.login_required.connect(self._on_upload_login_required)
+        worker.cancelled.connect(self._on_upload_cancelled)
         worker.succeeded.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        worker.cancelled.connect(thread.quit)
         thread.finished.connect(self._clear_upload_task)
 
+        self._upload_threads[task_id] = thread
+        self._upload_workers[task_id] = worker
         self._upload_thread = thread
         self._upload_worker = worker
         self._upload_path = local_path
         self._upload_task_id = task_id
         self.transfer_interface.update_record("upload", task_id, status="上传中")
-        display_name = upload_name if upload_name is not None else local_path.name
-        self._set_status(f"正在上传「{display_name}」...")
+        if show_enqueue_status:
+            display_name = upload_name if upload_name is not None else local_path.name
+            self._set_status(f"已添加「{display_name}」上传任务")
         self.update_operation_controls()
         thread.start()
 
@@ -3047,6 +4761,7 @@ class MainWindow(_MainWindowBase):
         self._show_login_required_error(message)
 
     def _clear_download_task(self) -> None:
+        self._delete_finished_thread()
         if self._download_task_id is not None:
             self._download_controls.pop(self._download_task_id, None)
         self._download_thread = None
@@ -3055,7 +4770,41 @@ class MainWindow(_MainWindowBase):
         self._download_task_id = None
         self.update_operation_controls()
 
+    def _on_upload_progress(
+        self,
+        bytes_done: object,
+        total_bytes: object,
+        task_id: str,
+    ) -> None:
+        if not isinstance(bytes_done, int) or not isinstance(total_bytes, int):
+            return
+        if task_id in self._upload_removal_requested:
+            return
+        self.transfer_interface.update_record(
+            "upload",
+            task_id,
+            bytes_done=bytes_done,
+            total_bytes=total_bytes,
+        )
+
+    def _on_upload_cancelled(self, task_id: str) -> None:
+        folder_child = task_id in self._folder_upload_child_ids or (
+            self._folder_upload_active is not None
+            and self._folder_upload_active.task_id == task_id
+        )
+        if folder_child:
+            self._folder_upload_cancel_count += 1
+        self.transfer_interface.update_record("upload", task_id, status="已取消")
+        if task_id in self._upload_removal_requested:
+            self._upload_removal_requested.discard(task_id)
+            self.transfer_interface.remove_records("upload", {task_id})
+        if not self._closing and not folder_child:
+            self.refresh_current_directory()
+
     def _on_upload_succeeded(self, item: object, task_id: str | None = None) -> None:
+        if task_id in self._upload_removal_requested:
+            self._on_upload_cancelled(task_id)
+            return
         if not isinstance(item, WopanItem):
             LOGGER.warning("main_window.upload.invalid_success_payload")
             self._on_upload_failed("上传结果无效", task_id=task_id)
@@ -3075,10 +4824,20 @@ class MainWindow(_MainWindowBase):
                 bytes_done=total or 0,
                 total_bytes=total,
             )
-        if self._folder_upload_active is not None and record_id == (
-            self._folder_upload_active.task_id
+        if (
+            record_id is not None
+            and self._folder_upload_record_id is not None
+            and (
+                record_id in self._folder_upload_child_ids
+                or (
+                    self._folder_upload_active is not None
+                    and record_id == self._folder_upload_active.task_id
+                )
+            )
         ):
-            # Folder-queue files refresh once at queue drain, not per file.
+            if record_id in self._folder_upload_failed_ids:
+                self._folder_upload_failed_ids.remove(record_id)
+                self._folder_upload_failure_count -= 1
             self._folder_upload_success_count += 1
             return
         self.refresh_current_directory(
@@ -3101,46 +4860,102 @@ class MainWindow(_MainWindowBase):
         self._set_status(f"已上传「{item.name}」，但刷新后未在当前目录看到，请稍后再刷新")
 
     def _on_upload_failed(self, message: str, task_id: str | None = None) -> None:
+        if task_id in self._upload_removal_requested:
+            self._on_upload_cancelled(task_id)
+            return
         LOGGER.warning("main_window.upload.failed error=%s", message)
         record_id = task_id or self._upload_task_id
-        if self._folder_upload_active is not None and record_id == (
-            self._folder_upload_active.task_id
+        if record_id is not None and (
+            record_id in self._folder_upload_child_ids
+            or (
+                self._folder_upload_active is not None
+                and record_id == self._folder_upload_active.task_id
+            )
         ):
-            self._folder_upload_failure_count += 1
+            if record_id not in self._folder_upload_failed_ids:
+                self._folder_upload_failed_ids.add(record_id)
+                self._folder_upload_failure_count += 1
         self._mark_transfer_failed("upload", record_id, message)
         self._set_status(f"上传失败：{message}")
         InfoBar.error(title="上传失败", content=message, parent=self)
 
     def _on_upload_login_required(self, message: str, task_id: str | None = None) -> None:
-        self._mark_transfer_failed("upload", task_id or self._upload_task_id, message)
+        if task_id in self._upload_removal_requested:
+            self._on_upload_cancelled(task_id)
+            self._show_login_required_error(message)
+            return
+        failed_task_id = task_id or self._upload_task_id
+        self._mark_transfer_failed("upload", failed_task_id, message)
         self._show_login_required_error(message)
-        if self._folder_upload_active is not None or self._folder_upload_queue:
-            LOGGER.info(
-                "main_window.folder_upload.login_stopped pending=%s",
-                len(self._folder_upload_queue),
-            )
-            self._folder_upload_active = None
-            self._folder_upload_queue = []
-            self._folder_upload_success_count = 0
-            self._folder_upload_failure_count = 0
-            self._folder_upload_target_dir_id = None
+        folder_task_ids = {queued.task_id for queued in self._folder_upload_queue}
+        if self._folder_upload_active is not None:
+            folder_task_ids.add(self._folder_upload_active.task_id)
+        if failed_task_id not in folder_task_ids:
+            return
+        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
+        self._folder_upload_record_id = None
+        self._folder_upload_child_ids.clear()
+        self._folder_upload_failed_ids.clear()
+        LOGGER.info(
+            "main_window.folder_upload.login_stopped pending=%s",
+            len(self._folder_upload_queue),
+        )
+        for pending_task_id in folder_task_ids:
+            if pending_task_id != failed_task_id:
+                self._mark_transfer_failed(
+                    "upload", pending_task_id, "登录已过期，请重新登录"
+                )
+        self._folder_upload_active = None
+        self._folder_upload_queue = []
+        self._folder_upload_success_count = 0
+        self._folder_upload_failure_count = 0
+        self._folder_upload_target_dir_id = None
 
     def _clear_upload_task(self) -> None:
-        self._upload_thread = None
-        self._upload_worker = None
-        self._upload_path = None
-        self._upload_task_id = None
-        self.update_operation_controls()
+        self._delete_finished_thread()
+        thread = self.sender()
+        task_id = next(
+            (candidate for candidate, candidate_thread in self._upload_threads.items()
+             if candidate_thread is thread),
+            self._upload_task_id,
+        )
+        if task_id is not None:
+            self._upload_threads.pop(task_id, None)
+            self._upload_workers.pop(task_id, None)
+        if self._upload_thread is thread or self._upload_thread is None:
+            next_task_id = next(iter(self._upload_threads), None)
+            self._upload_thread = (
+                self._upload_threads[next_task_id] if next_task_id is not None else None
+            )
+            self._upload_worker = (
+                self._upload_workers[next_task_id] if next_task_id is not None else None
+            )
+            self._upload_task_id = next_task_id
+            self._upload_path = None
         self._continue_folder_upload_queue()
+        if (
+            self._folder_upload_record_id is not None
+            and self._folder_upload_active is None
+            and not self._folder_upload_queue
+        ):
+            self._finish_folder_upload()
+        self._start_next_upload_task()
+        self.update_operation_controls()
+        self._start_next_pending_folder()
 
-    def _create_download_record(self, item: WopanItem, local_path: Path) -> str:
-        task_id = self._next_transfer_task_id("download")
+    def _create_download_record(
+        self, item: WopanItem, local_path: Path, *, task_id: str | None = None,
+        status: str = "等待中", error: str = ""
+    ) -> str:
+        task_id = task_id or self._next_transfer_task_id("download")
         record = TransferRecord(
             task_id=task_id,
             direction="download",
             name=item.name,
             size=item.size,
             target_path=local_path,
+            status=status,
+            error=error,
         )
         self.transfer_interface.add_download_record(record)
         self._download_items_by_task[task_id] = item
@@ -3152,6 +4967,9 @@ class MainWindow(_MainWindowBase):
         *,
         name: str | None = None,
         size: int | None = None,
+        parent_id: str | None = None,
+        upload_name: str | None = None,
+        retryable: bool = False,
     ) -> str:
         task_id = self._next_transfer_task_id("upload")
         if size is None:
@@ -3166,6 +4984,9 @@ class MainWindow(_MainWindowBase):
             name=name if name is not None else local_path.name,
             size=size,
             target_path=local_path,
+            upload_parent_id=parent_id,
+            upload_name=upload_name,
+            upload_retryable=retryable,
         )
         self.transfer_interface.add_upload_record(record)
         return task_id
@@ -3189,48 +5010,379 @@ class MainWindow(_MainWindowBase):
             error=message,
         )
 
+    def _pause_selected_downloads(self, task_ids: object) -> None:
+        if not isinstance(task_ids, set):
+            return
+        for task_id in sorted(task_ids):
+            self._pause_download_task(task_id)
+
+    def _resume_selected_downloads(self, task_ids: object) -> None:
+        if not isinstance(task_ids, set):
+            return
+        for task_id in sorted(task_ids):
+            self._resume_download_task(task_id)
+
+    def _pause_selected_uploads(self, task_ids: object) -> None:
+        if not isinstance(task_ids, set):
+            return
+        for task_id in sorted(task_ids):
+            self._pause_upload_task(task_id)
+
+    def _resume_selected_uploads(self, task_ids: object) -> None:
+        if not isinstance(task_ids, set):
+            return
+        for task_id in sorted(task_ids):
+            self._resume_upload_task(task_id)
+
+    def _pause_upload_task(self, task_id: str) -> None:
+        record = self.transfer_interface._find_record("upload", task_id)
+        if record is None or not record.upload_retryable:
+            return
+        worker = self._upload_workers.get(task_id)
+        if worker is not None:
+            worker.request_pause()
+            self.transfer_interface.update_record(
+                "upload", task_id, status="已暂停", can_resume=True
+            )
+            active = self._folder_upload_active
+            if active is not None and active.task_id == task_id:
+                self._paused_uploads[task_id] = PendingUploadTask(
+                    parent_id=active.target_dir_id,
+                    local_path=active.local_path,
+                    task_id=active.task_id,
+                    upload_name=active.upload_name,
+                    show_enqueue_status=False,
+                )
+                self._folder_upload_active = None
+                self._continue_folder_upload_queue()
+                self._start_next_upload_task()
+            return
+        pending = next((item for item in self._upload_pending if item.task_id == task_id), None)
+        if pending is None:
+            queued = next(
+                (item for item in self._folder_upload_queue if item.task_id == task_id), None
+            )
+            if queued is not None:
+                pending = PendingUploadTask(
+                    parent_id=queued.target_dir_id,
+                    local_path=queued.local_path,
+                    task_id=queued.task_id,
+                    upload_name=queued.upload_name,
+                    show_enqueue_status=False,
+                )
+        else:
+            self._upload_pending.remove(pending)
+        if pending is None:
+            return
+        if task_id in self._paused_uploads or record.status not in ACTIVE_UPLOAD_STATUSES:
+            return
+        self._paused_uploads[task_id] = pending
+        self.transfer_interface.update_record(
+            "upload", task_id, status="已暂停", can_resume=True
+        )
+        self._continue_folder_upload_queue()
+        self._start_next_upload_task()
+
+    def _resume_upload_task(self, task_id: str) -> None:
+        record = self.transfer_interface._find_record("upload", task_id)
+        if record is None or record.status != "已暂停":
+            return
+        worker = self._upload_workers.get(task_id)
+        if worker is not None:
+            worker.request_resume()
+            self._paused_uploads.pop(task_id, None)
+            self.transfer_interface.update_record(
+                "upload", task_id, status="上传中", can_resume=False
+            )
+            return
+        pending = self._paused_uploads.pop(task_id, None)
+        if pending is None:
+            return
+        if any(item.task_id == task_id for item in self._folder_upload_queue):
+            self.transfer_interface.update_record(
+                "upload", task_id, status="等待中", can_resume=False
+            )
+            if self._folder_upload_active is None:
+                self._start_next_folder_upload_file()
+            return
+        self.transfer_interface.update_record(
+            "upload", task_id, status="等待中", can_resume=False
+        )
+        self._start_upload_task(
+            pending.parent_id,
+            pending.local_path,
+            pending.task_id,
+            upload_name=pending.upload_name,
+            show_enqueue_status=False,
+        )
+
+    def _retry_selected_uploads(self, task_ids: object) -> None:
+        """Retry selected failed uploads in their original targets."""
+        if not isinstance(task_ids, set):
+            return
+        records = {
+            record.task_id: record
+            for record in self.transfer_interface.upload_records
+            if record.task_id in task_ids
+        }
+        for task_id in sorted(task_ids):
+            record = records.get(task_id)
+            if record is None or not record.upload_retryable or record.status != "失败":
+                continue
+            self._retry_upload_task(record)
+
+    def _retry_upload_task(self, record: TransferRecord) -> None:
+        if self._file_browser is None:
+            self._set_status("请先登录")
+            return
+        if record.target_path is None or not record.upload_parent_id:
+            message = "缺少上传任务信息，请重新选择文件上传"
+            self._set_status(f"重试上传失败：{message}")
+            InfoBar.warning(title="重试上传", content=message, parent=self)
+            return
+        self.transfer_interface.update_record(
+            "upload",
+            record.task_id,
+            status="等待中",
+            bytes_done=0,
+            can_resume=False,
+            error="",
+        )
+        self._start_upload_task(
+            record.upload_parent_id,
+            record.target_path,
+            record.task_id,
+            upload_name=record.upload_name if record.upload_name is not None else record.name,
+            show_enqueue_status=True,
+        )
+
     def _remove_transfer_records(self, direction: str, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
         normalized_ids = {task_id for task_id in task_ids if isinstance(task_id, str)}
         if direction == "download" and self._file_browser is not None:
-            remove_download_record = getattr(self._file_browser, "remove_download_record", None)
-            if callable(remove_download_record):
+            remove_record = getattr(self._file_browser, "remove_download_record", None)
+            if callable(remove_record):
                 for task_id in normalized_ids:
-                    remove_download_record(task_id)
+                    self._queue_download_operation(
+                        "remove", task_id, partial(remove_record, task_id)
+                    )
+                return
+        if direction == "upload":
+            self._upload_delete_batch = True
+            try:
+                for task_id in sorted(
+                    normalized_ids,
+                    key=lambda value: (
+                        value == self._folder_upload_record_id,
+                        value in self._upload_workers,
+                    ),
+                ):
+                    self._remove_upload_task(task_id)
+            finally:
+                self._upload_delete_batch = False
+            self._continue_folder_upload_queue()
+            self._start_next_upload_task()
+            self._start_next_pending_folder()
+            return
         self.transfer_interface.remove_records(direction, normalized_ids)
-        if direction == "download":
-            for task_id in normalized_ids:
-                self._download_items_by_task.pop(task_id, None)
-                self._download_controls.pop(task_id, None)
+        for task_id in normalized_ids:
+            self._download_items_by_task.pop(task_id, None)
+            self._download_controls.pop(task_id, None)
+
+    def _remove_upload_task(self, task_id: str) -> None:
+        record = self.transfer_interface._find_record("upload", task_id)
+        if record is None or task_id in self._upload_removal_requested:
+            return
+        if record.status in TERMINAL_TRANSFER_STATUSES:
+            self.transfer_interface.remove_records("upload", {task_id})
+            return
+        if task_id == self._folder_upload_record_id:
+            self._cancel_folder_upload()
+            return
+        paused = self._paused_uploads.pop(task_id, None)
+        if paused is not None:
+            worker = self._upload_workers.get(task_id)
+            if worker is not None:
+                self._upload_removal_requested.add(task_id)
+                worker.request_cancel()
+                self._set_status("正在停止上传；已发出的请求可能仍会在云端完成")
+                return
+            queued = next(
+                (item for item in self._folder_upload_queue if item.task_id == task_id), None
+            )
+            if queued is not None:
+                self._folder_upload_queue.remove(queued)
+            if task_id in self._folder_upload_child_ids:
+                self._folder_upload_cancel_count += 1
+            if (
+                self._folder_upload_active is not None
+                and self._folder_upload_active.task_id == task_id
+            ):
+                self._folder_upload_active = None
+            self.transfer_interface.remove_records("upload", {task_id})
+            self._continue_folder_upload_queue()
+            if self._folder_upload_record_id is not None and not self._folder_upload_queue:
+                self._finish_folder_upload()
+            return
+        pending = next((item for item in self._upload_pending if item.task_id == task_id), None)
+        if pending is not None:
+            self._upload_pending.remove(pending)
+        folder_pending = next(
+            (item for item in self._folder_prepare_pending if item.record_id == task_id), None
+        )
+        if folder_pending is not None:
+            self._folder_prepare_pending.remove(folder_pending)
+        queued = next((item for item in self._folder_upload_queue if item.task_id == task_id), None)
+        if queued is not None:
+            self._folder_upload_queue.remove(queued)
+            self._folder_upload_cancel_count += 1
+        active = self._folder_upload_active
+        if active is not None and active.task_id == task_id and task_id not in self._upload_workers:
+            self._folder_upload_cancel_count += 1
+            self._folder_upload_active = None
+            self.transfer_interface.remove_records("upload", {task_id})
+            if self._folder_upload_queue:
+                self._start_next_folder_upload_file()
+            else:
+                self._finish_folder_upload()
+            return
+        if pending is not None or folder_pending is not None or queued is not None:
+            self.transfer_interface.remove_records("upload", {task_id})
+            self._start_next_pending_folder()
+            return
+        worker = self._upload_workers.get(task_id)
+        if worker is not None:
+            self._upload_removal_requested.add(task_id)
+            worker.request_cancel()
+            self._set_status("正在停止上传；已发出的请求可能仍会在云端完成")
+            return
+        InfoBar.warning(title="删除上传任务", content="任务尚未退出，请稍后重试", parent=self)
+
+    def _cancel_folder_upload(self) -> None:
+        root_id = self._folder_upload_record_id
+        if root_id is None:
+            return
+        self._upload_removal_requested.add(root_id)
+        if self._folder_prepare_cancel is not None:
+            self._folder_prepare_cancel.set()
+        pending_ids = {queued.task_id for queued in self._folder_upload_queue}
+        self._folder_upload_queue.clear()
+        for child_id in self._folder_upload_child_ids:
+            paused = self._paused_uploads.pop(child_id, None)
+            worker = self._upload_workers.get(child_id)
+            if worker is not None:
+                self._upload_removal_requested.add(child_id)
+                worker.request_cancel()
+            elif paused is not None:
+                pending_ids.add(child_id)
+            pending_ids.update(
+                pending.task_id for pending in self._upload_pending
+                if pending.task_id == child_id
+            )
+        active = self._folder_upload_active
+        if active is not None:
+            pending_ids.update(
+                pending.task_id for pending in self._upload_pending
+                if pending.task_id == active.task_id
+            )
+        self._upload_pending = [
+            pending for pending in self._upload_pending if pending.task_id not in pending_ids
+        ]
+        if pending_ids:
+            self.transfer_interface.remove_records("upload", pending_ids)
+        if active is not None:
+            worker = self._upload_workers.get(active.task_id)
+            if worker is not None:
+                if active.task_id not in self._folder_upload_child_ids:
+                    self._upload_removal_requested.add(active.task_id)
+                    worker.request_cancel()
+            else:
+                self._folder_upload_active = None
+        self._set_status("正在停止文件夹上传；已创建的云端内容不会自动删除")
+        if self._folder_prepare_thread is None and self._folder_upload_active is None:
+            self._finish_folder_upload()
+
+    def _queue_download_operation(
+        self, action: str, task_id: str, operation: Callable[[], object]
+    ) -> None:
+        self._download_operations.append((action, task_id, operation))
+        if self._download_operation_thread is None:
+            self._start_next_download_operation()
+
+    def _start_next_download_operation(self) -> None:
+        if self._closing or not self._download_operations:
+            return
+        action, task_id, operation = self._download_operations.pop(0)
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: (action, task_id, operation()))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_download_operation_succeeded)
+        worker.failed.connect(self._on_download_operation_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_download_operation)
+        self._download_operation_thread = thread
+        self._download_operation_worker = worker
+        thread.start()
+
+    def _on_download_operation_succeeded(self, result: object) -> None:
+        if self._closing:
+            return
+        action, task_id, _outcome = cast(tuple[str, str, object], result)
+        if action == "remove":
+            self._removed_download_task_ids.add(task_id)
+            self.transfer_interface.remove_records("download", {task_id})
+            self._download_items_by_task.pop(task_id, None)
+            self._download_controls.pop(task_id, None)
+            self._pending_download_events.pop(task_id, None)
+
+    def _on_download_operation_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        self._set_status(f"下载任务操作失败：{message}")
+        InfoBar.error(title="下载任务操作失败", content=message, parent=self)
+
+    def _clear_download_operation(self) -> None:
+        self._delete_finished_thread()
+        self._download_operation_thread = None
+        self._download_operation_worker = None
+        self._start_next_download_operation()
 
     def _pause_download_task(self, task_id: str) -> None:
         control = self._download_controls.get(task_id)
-        if control is None:
+        if control is not None:
+            control.request_pause()
+            self.transfer_interface.update_record(
+                "download", task_id, status="已暂停", can_resume=True
+            )
             return
-        control.request_pause()
-        self.transfer_interface.update_record("download", task_id, status="已暂停", can_resume=True)
+        pause_download = getattr(self._file_browser, "pause_download", None)
+        if callable(pause_download):
+            self._queue_download_operation("pause", task_id, partial(pause_download, task_id))
 
     def _cancel_download_task(self, task_id: str) -> None:
         control = self._download_controls.get(task_id)
-        if control is None:
+        if control is not None:
+            control.request_cancel(cleanup=True)
+            self.transfer_interface.update_record(
+                "download", task_id, status="已取消", active_connections=0, can_resume=False
+            )
             return
-        control.request_cancel(cleanup=True)
-        self.transfer_interface.update_record(
-            "download",
-            task_id,
-            status="已取消",
-            active_connections=0,
-            can_resume=False,
-        )
+        cancel_download = getattr(self._file_browser, "cancel_download", None)
+        if callable(cancel_download):
+            self._queue_download_operation(
+                "cancel", task_id, partial(cancel_download, task_id, cleanup=True)
+            )
 
     def _resume_download_task(self, task_id: str) -> None:
+        resume_download = getattr(self._file_browser, "resume_download", None)
+        if callable(resume_download):
+            self._queue_download_operation("resume", task_id, partial(resume_download, task_id))
+            return
         record = self.transfer_interface._find_record("download", task_id)
         if record is None or record.target_path is None:
-            return
-        if self._download_thread is not None:
-            self._set_status("已有下载任务正在进行")
-            InfoBar.warning(title="下载", content="已有下载任务正在进行", parent=self)
             return
         item = self._download_items_by_task.get(task_id) or self._find_displayed_item_for_download(
             record
@@ -3252,33 +5404,133 @@ class MainWindow(_MainWindowBase):
                 return item
         return None
 
+    def _recover_downloads(self) -> None:
+        if self._file_browser is None:
+            return
+        recover = getattr(self._file_browser, "recover_downloads", None)
+        if not callable(recover):
+            self._load_persisted_download_records()
+            return
+        thread = QThread(self)
+        worker = BrowserOperationWorker(recover)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_download_recovery_succeeded)
+        worker.failed.connect(self._on_download_recovery_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_download_recovery)
+        self._download_recovery_thread = thread
+        self._download_recovery_worker = worker
+        thread.start()
+
+    def _on_download_recovery_succeeded(self, result: object) -> None:
+        if not isinstance(result, tuple) or self._closing:
+            return
+        for persisted in result:
+            self._add_persisted_download_record(persisted, render=False)
+        if result:
+            self.transfer_interface.flush_progress_render()
+            self.transfer_interface._render_download_table()
+
+    def _on_download_recovery_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.download.recovery.failed error=%s", message)
+        self._set_status(f"恢复下载任务失败：{message}")
+
+    def _clear_download_recovery(self) -> None:
+        self._delete_finished_thread()
+        self._download_recovery_thread = None
+        self._download_recovery_worker = None
+
+    def _recover_uploads(self) -> None:
+        if self._file_browser is None:
+            return
+        recover = getattr(self._file_browser, "recover_uploads", None)
+        if not callable(recover):
+            return
+        thread = QThread(self)
+        worker = BrowserOperationWorker(recover)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_upload_recovery_succeeded)
+        worker.failed.connect(self._on_upload_recovery_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_upload_recovery)
+        self._upload_recovery_thread = thread
+        self._upload_recovery_worker = worker
+        thread.start()
+
+    def _on_upload_recovery_succeeded(self, result: object) -> None:
+        if not isinstance(result, tuple) or self._closing:
+            return
+        for persisted in result:
+            self._add_persisted_upload_record(persisted)
+        if result:
+            self.transfer_interface.flush_progress_render()
+            self.transfer_interface._render_upload_table()
+
+    def _on_upload_recovery_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.upload.recovery.failed error=%s", message)
+        self._set_status(f"恢复上传任务失败：{message}")
+
+    def _clear_upload_recovery(self) -> None:
+        self._delete_finished_thread()
+        self._upload_recovery_thread = None
+        self._upload_recovery_worker = None
+
+    def _add_persisted_upload_record(self, persisted: object) -> None:
+        required = ("task_id", "name", "local_path", "target_parent_id", "status")
+        if not all(hasattr(persisted, attribute) for attribute in required):
+            return
+        persisted_record = cast(UploadTaskRecord, persisted)
+        record = TransferRecord(
+            task_id=persisted_record.task_id,
+            direction="upload",
+            name=persisted_record.name,
+            size=getattr(persisted_record, "file_size", None),
+            target_path=persisted_record.local_path,
+            status=persisted_record.status,
+            error=str(getattr(persisted_record, "error", "") or ""),
+            upload_parent_id=persisted_record.target_parent_id,
+            upload_name=getattr(persisted_record, "upload_name", None),
+            upload_retryable=bool(getattr(persisted_record, "resumable", False)),
+        )
+        self.transfer_interface.add_upload_record(record)
+
     def _load_persisted_download_records(self) -> None:
         if self._file_browser is None:
             return
         download_records = getattr(self._file_browser, "download_records", None)
         if not callable(download_records):
             return
-        for persisted in download_records():
-            if not all(
-                hasattr(persisted, attribute)
-                for attribute in ("task_id", "name", "target_path", "status")
-            ):
-                continue
-            record = TransferRecord(
-                task_id=str(persisted.task_id),
-                direction="download",
-                name=str(persisted.name),
-                size=getattr(persisted, "total_bytes", None),
-                target_path=Path(persisted.target_path),
-                status=str(persisted.status),
-                bytes_done=int(getattr(persisted, "bytes_done", 0) or 0),
-                total_bytes=getattr(persisted, "total_bytes", None),
-                active_connections=int(getattr(persisted, "active_connections", 0) or 0),
-                max_connections=int(getattr(persisted, "max_connections", 1) or 1),
-                can_resume=bool(getattr(persisted, "supports_resume", False)),
-                error=str(getattr(persisted, "error", "") or ""),
-            )
-            self.transfer_interface.add_download_record(record)
+        persisted_records = download_records()
+        for persisted in persisted_records:
+            self._add_persisted_download_record(persisted, render=False)
+        if persisted_records:
+            self.transfer_interface.flush_progress_render()
+            self.transfer_interface._render_download_table()
+
+    def _add_persisted_download_record(self, persisted: object, *, render: bool = True) -> None:
+        required = ("task_id", "name", "target_path", "status")
+        if not all(hasattr(persisted, attribute) for attribute in required):
+            return
+        persisted_record = cast(DownloadTaskRecord, persisted)
+        record = TransferRecord(
+            task_id=persisted_record.task_id,
+            direction="download",
+            name=persisted_record.name,
+            size=persisted_record.total_bytes,
+            target_path=persisted_record.target_path,
+            status=persisted_record.status,
+            bytes_done=persisted_record.bytes_done,
+            total_bytes=persisted_record.total_bytes,
+            active_connections=persisted_record.active_connections,
+            max_connections=persisted_record.max_connections,
+            can_resume=persisted_record.supports_resume,
+            error=str(getattr(persisted, "error", "") or ""),
+        )
+        self.transfer_interface.add_download_record(record, render=render)
 
     def _open_transfer_download_folder(self, folder: object) -> None:
         if not isinstance(folder, Path):

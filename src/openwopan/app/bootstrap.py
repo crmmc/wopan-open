@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from openwopan.app.file_browser import FileBrowserService, build_file_browser_service
 from openwopan.auth.web_login import ValidatedLoginUser, WebLoginCoordinator
 from openwopan.storage.credentials import CredentialStore
 from openwopan.storage.settings import AppSettings
+from openwopan.storage.transfer_records import TransferRecordStore
 from openwopan.wopan.client import WopanClient
 
 
@@ -32,6 +33,9 @@ class AppDependencies:
     web_login_coordinator: WebLoginCoordinator
     file_browser_factory: Callable[[str, AppSettings | None], FileBrowserService]
     settings: AppSettings = AppSettings()
+    # Constructing the store performs no I/O; the database opens when the main
+    # window builds its history adapter.
+    transfer_record_store: TransferRecordStore = field(default_factory=TransferRecordStore)
 
 
 def build_dependencies() -> AppDependencies:
