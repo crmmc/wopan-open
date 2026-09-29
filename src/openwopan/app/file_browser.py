@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -95,8 +95,14 @@ class FileBrowserBackend(Protocol):
     def delete_item(self, item: WopanItem) -> None:
         """Delete a file or folder."""
 
+    def delete_items(self, items: Sequence[WopanItem]) -> None:
+        """Delete one or more files or folders in a single request."""
+
     def move_item(self, item: WopanItem, target_parent_id: str) -> None:
         """Move a file or folder."""
+
+    def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        """Move one or more files or folders in a single request."""
 
     def download_file(
         self,
@@ -340,23 +346,33 @@ class FileBrowserService:
 
     def delete_item(self, item: WopanItem) -> None:
         """Delete a file or folder."""
-        LOGGER.info("file_browser.delete_item.start item_id=%s kind=%s", item.item_id, item.kind)
-        self._call(lambda: self._client.delete(item.item_id, item.kind))
-        LOGGER.info("file_browser.delete_item.success item_id=%s kind=%s", item.item_id, item.kind)
+        self.delete_items([item])
+
+    def delete_items(self, items: Sequence[WopanItem]) -> None:
+        """Delete one or more files or folders in a single request."""
+        LOGGER.info("file_browser.delete_items.start count=%s", len(items))
+        self._call(lambda: self._client.delete_many([(item.item_id, item.kind) for item in items]))
+        LOGGER.info("file_browser.delete_items.success count=%s", len(items))
 
     def move_item(self, item: WopanItem, target_parent_id: str) -> None:
         """Move a file or folder to another directory."""
+        self.move_items([item], target_parent_id)
+
+    def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        """Move one or more files or folders in a single request."""
         LOGGER.info(
-            "file_browser.move_item.start item_id=%s kind=%s target_parent_id=%s",
-            item.item_id,
-            item.kind,
+            "file_browser.move_items.start count=%s target_parent_id=%s",
+            len(items),
             target_parent_id,
         )
-        self._call(lambda: self._client.move(item.item_id, item.kind, target_parent_id))
+        self._call(
+            lambda: self._client.move_many(
+                [(item.item_id, item.kind) for item in items], target_parent_id
+            )
+        )
         LOGGER.info(
-            "file_browser.move_item.success item_id=%s kind=%s target_parent_id=%s",
-            item.item_id,
-            item.kind,
+            "file_browser.move_items.success count=%s target_parent_id=%s",
+            len(items),
             target_parent_id,
         )
 

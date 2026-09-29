@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import types
+from collections.abc import Sequence
 from pathlib import Path
 
 import httpx
@@ -84,10 +85,20 @@ class FakeClient:
         if self.error is not None:
             raise self.error
 
+    def delete_many(self, items: Sequence[tuple[str, WopanItemKind]]) -> None:
+        for item_id, kind in items:
+            self.delete(item_id, kind)
+
     def move(self, item_id: str, kind: WopanItemKind, target_parent_id: str) -> None:
         self.moved_items.append((item_id, kind, target_parent_id))
         if self.error is not None:
             raise self.error
+
+    def move_many(
+        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
+    ) -> None:
+        for item_id, kind in items:
+            self.move(item_id, kind, target_parent_id)
 
     def get_download_info(self, item_id: str) -> DownloadInfo:
         self.downloaded_item_ids.append(item_id)
@@ -151,6 +162,38 @@ def test_file_browser_service_delegates_basic_operations() -> None:
     assert client.renamed_items == [("file-1", "renamed.txt", WopanItemKind.FILE, "4")]
     assert client.deleted_items == [("file-1", WopanItemKind.FILE)]
     assert client.moved_items == [("file-1", WopanItemKind.FILE, "folder-2")]
+
+
+def test_file_browser_service_deletes_many_items_in_one_request() -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    folder = WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)
+    file_item = WopanItem(
+        item_id="file-1", name="report.txt", kind=WopanItemKind.FILE, file_type="4"
+    )
+
+    service.delete_items([folder, file_item])
+
+    assert client.deleted_items == [
+        ("folder-1", WopanItemKind.FOLDER),
+        ("file-1", WopanItemKind.FILE),
+    ]
+
+
+def test_file_browser_service_moves_many_items_in_one_request() -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    file_item = WopanItem(
+        item_id="file-1", name="report.txt", kind=WopanItemKind.FILE, file_type="4"
+    )
+    folder = WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)
+
+    service.move_items([file_item, folder], "folder-2")
+
+    assert client.moved_items == [
+        ("file-1", WopanItemKind.FILE, "folder-2"),
+        ("folder-1", WopanItemKind.FOLDER, "folder-2"),
+    ]
 
 
 def test_file_browser_service_downloads_file_to_local_path(tmp_path: Path) -> None:

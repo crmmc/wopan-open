@@ -242,6 +242,55 @@ def test_move_file_routes_id_to_file_list() -> None:
     ]
 
 
+def test_delete_many_sends_one_request_with_dir_and_file_lists() -> None:
+    client, captured = _client_and_captured_params([_success_response("")])
+
+    client.delete_many(
+        [
+            ("folder-1", WopanItemKind.FOLDER),
+            ("file-1", WopanItemKind.FILE),
+            ("folder-2", WopanItemKind.FOLDER),
+        ]
+    )
+
+    assert captured == [
+        (
+            "DeleteFile",
+            {
+                "spaceType": "0",
+                "vipLevel": "0",
+                "dirList": ["folder-1", "folder-2"],
+                "fileList": ["file-1"],
+                "clientId": "1001000021",
+            },
+        )
+    ]
+
+
+def test_move_many_sends_one_request_with_dir_and_file_lists() -> None:
+    client, captured = _client_and_captured_params([_success_response("")])
+
+    client.move_many(
+        [("file-1", WopanItemKind.FILE), ("folder-1", WopanItemKind.FOLDER)],
+        "folder-2",
+    )
+
+    assert captured == [
+        (
+            "MoveFile",
+            {
+                "targetDirId": "folder-2",
+                "sourceType": "0",
+                "targetType": "0",
+                "dirList": ["folder-1"],
+                "fileList": ["file-1"],
+                "secret": False,
+                "clientId": "1001000021",
+            },
+        )
+    ]
+
+
 def test_upload_file_gets_zone_and_posts_single_part(tmp_path: Path) -> None:
     local_file = tmp_path / "report.txt"
     local_file.write_bytes(b"upload-content")
@@ -650,8 +699,19 @@ def test_get_download_info_rejects_malformed_response(data: object, match: str) 
         (lambda client: client.rename("", "name", WopanItemKind.FOLDER), "item_id"),
         (lambda client: client.rename("item-1", "", WopanItemKind.FOLDER), "new_name"),
         (lambda client: client.delete("", WopanItemKind.FILE), "item_id"),
+        (lambda client: client.delete_many([]), "items"),
+        (lambda client: client.delete_many([("", WopanItemKind.FILE)]), "item_id"),
         (lambda client: client.move("", WopanItemKind.FILE, "0"), "item_id"),
         (lambda client: client.move("item-1", WopanItemKind.FILE, ""), "target_parent_id"),
+        (lambda client: client.move_many([], "0"), "items"),
+        (
+            lambda client: client.move_many([("item-1", WopanItemKind.FILE)], ""),
+            "target_parent_id",
+        ),
+        (
+            lambda client: client.move_many([("", WopanItemKind.FILE)], "0"),
+            "item_id",
+        ),
         (lambda client: client.upload_file("", Path("report.txt")), "parent_id"),
         (lambda client: client.get_download_info(""), "download_id"),
     ],

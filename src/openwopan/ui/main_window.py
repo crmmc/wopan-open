@@ -6,7 +6,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -2416,9 +2416,9 @@ class FileInterface(QWidget):
                 self.file_table.setItem(row, column, table_item)
 
     def _delete_selected_row(self) -> None:
-        row = self.file_table.currentRow()
-        if row >= 0:
-            self._window.prompt_delete_item(row)
+        rows = self._window.selected_rows()
+        if rows:
+            self._window.prompt_delete_items(rows)
 
     def _download_selected_row(self) -> None:
         rows = self._window.selected_download_rows()
@@ -3257,8 +3257,16 @@ class MainWindow(_MainWindowBase):
 
     def delete_displayed_item(self, row: int) -> None:
         """Delete a displayed file or folder row."""
-        item = self._item_at_row(row)
-        if item is None:
+        self.delete_displayed_items([row])
+
+    def delete_displayed_items(self, rows: Sequence[int]) -> None:
+        """Delete one or more displayed rows in a single batch request."""
+        items = [
+            item
+            for row in rows
+            if (item := self._item_at_row(row)) is not None
+        ]
+        if not items:
             return
         if self._file_browser is None:
             self._set_status("请先登录")
@@ -3268,8 +3276,9 @@ class MainWindow(_MainWindowBase):
             LOGGER.debug("main_window.delete.skipped_busy")
             return
         file_browser = self._file_browser
+        batch = tuple(items)
         thread = QThread(self)
-        worker = BrowserOperationWorker(lambda: file_browser.delete_item(item))
+        worker = BrowserOperationWorker(lambda: file_browser.delete_items(batch))
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._on_delete_succeeded)
@@ -3300,8 +3309,16 @@ class MainWindow(_MainWindowBase):
 
     def move_displayed_item(self, row: int, target_parent_id: str) -> None:
         """Move a displayed file or folder row to another directory."""
-        item = self._item_at_row(row)
-        if item is None:
+        self.move_displayed_items([row], target_parent_id)
+
+    def move_displayed_items(self, rows: Sequence[int], target_parent_id: str) -> None:
+        """Move one or more displayed rows in a single batch request."""
+        items = [
+            item
+            for row in rows
+            if (item := self._item_at_row(row)) is not None
+        ]
+        if not items:
             return
         target_id = target_parent_id.strip()
         if not target_id:
@@ -3316,8 +3333,9 @@ class MainWindow(_MainWindowBase):
             LOGGER.debug("main_window.move.skipped_busy")
             return
         file_browser = self._file_browser
+        batch = tuple(items)
         thread = QThread(self)
-        worker = BrowserOperationWorker(lambda: file_browser.move_item(item, target_id))
+        worker = BrowserOperationWorker(lambda: file_browser.move_items(batch, target_id))
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._on_move_succeeded)
@@ -4285,27 +4303,53 @@ class MainWindow(_MainWindowBase):
         dialog.deleteLater()
 
     def prompt_delete_item(self, row: int) -> None:
-        """Confirm and delete a row."""
-        item = self._item_at_row(row)
-        if item is None:
+        """Confirm and delete a row, batching the full selection when included."""
+        rows = self.selected_rows()
+        if row not in rows:
+            rows = [row]
+        self.prompt_delete_items(rows)
+
+    def prompt_delete_items(self, rows: Sequence[int]) -> None:
+        """Confirm and delete one or more displayed rows."""
+        items = [
+            item
+            for row in rows
+            if (item := self._item_at_row(row)) is not None
+        ]
+        if not items:
             return
-        message = MessageBox("确认删除", f"确定要删除「{item.name}」吗？此操作不可恢复。", self)
+        if len(items) == 1:
+            summary = f"「{items[0].name}」"
+        else:
+            preview = "、".join(item.name for item in items[:3])
+            if len(items) > 3:
+                preview += " 等"
+            summary = f" {len(items)} 个对象（{preview}）"
+        message = MessageBox("确认删除", f"确定要删除{summary}吗？此操作不可恢复。", self)
         accepted = message.exec()
         message.deleteLater()
         if accepted:
-            self.delete_displayed_item(row)
+            self.delete_displayed_items(rows)
 
     def prompt_move_item(self, row: int) -> None:
-        """Prompt for a target directory and move a row."""
-        item = self._item_at_row(row)
-        if item is None:
+        """Prompt for a target directory and move a row (or the full selection)."""
+        rows = self.selected_rows()
+        if row not in rows:
+            rows = [row]
+        items = [
+            item
+            for moved_row in rows
+            if (item := self._item_at_row(moved_row)) is not None
+        ]
+        if not items:
             return
 
+        selected_ids = {item.item_id for item in items}
         target_entries = [*self._breadcrumb[:-1]]
         target_entries.extend(
             BreadcrumbEntry(item_id=folder.item_id, name=folder.name)
             for folder in self._items
-            if folder.kind is WopanItemKind.FOLDER and folder.item_id != item.item_id
+            if folder.kind is WopanItemKind.FOLDER and folder.item_id not in selected_ids
         )
         if not target_entries:
             self._set_status("没有可用的目标文件夹")
@@ -4316,7 +4360,7 @@ class MainWindow(_MainWindowBase):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             selected_entry = dialog.selected_entry()
             if selected_entry is not None:
-                self.move_displayed_item(row, selected_entry.item_id)
+                self.move_displayed_items(rows, selected_entry.item_id)
         dialog.deleteLater()
 
     def prompt_download_item(self, row: int) -> None:
@@ -4462,16 +4506,20 @@ class MainWindow(_MainWindowBase):
         """Return the current displayed file items."""
         return tuple(self._items)
 
-    def selected_download_rows(self) -> list[int]:
-        """Return selected file rows that have a downloadable identifier."""
+    def selected_rows(self) -> list[int]:
+        """Return currently selected file rows in display order."""
         selection_model = self.file_interface.file_table.selectionModel()
         if selection_model is None:  # pragma: no cover - docs/testing-exemptions.md
             return []
+        return sorted(index.row() for index in selection_model.selectedRows())
+
+    def selected_download_rows(self) -> list[int]:
+        """Return selected file rows that have a downloadable identifier."""
         rows: list[int] = []
-        for index in sorted(selection_model.selectedRows(), key=lambda value: value.row()):
-            item = self._item_at_row(index.row())
+        for row in self.selected_rows():
+            item = self._item_at_row(row)
             if item is not None and item.kind is WopanItemKind.FILE and item.download_id:
-                rows.append(index.row())
+                rows.append(row)
         return rows
 
     def selected_download_row(self) -> int | None:
@@ -4486,6 +4534,8 @@ class MainWindow(_MainWindowBase):
             and bool(self.selected_download_rows())
         )
         self.file_interface.download_button.setEnabled(can_download)
+        can_delete = self._file_browser is not None and bool(self.selected_rows())
+        self.file_interface.delete_button.setEnabled(can_delete)
         can_upload = self._file_browser is not None
         self.file_interface.upload_button_group.setEnabled(can_upload)
         self.file_interface.upload_file_action.setEnabled(can_upload)

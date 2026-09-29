@@ -7,7 +7,7 @@ import json
 import logging
 import mimetypes
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -402,33 +402,59 @@ class WopanClient:
 
     def delete(self, item_id: str, kind: WopanItemKind) -> None:
         """Delete a file or folder."""
-        if not item_id:
-            raise ValueError("item_id must not be empty")
+        self.delete_many([(item_id, kind)])
 
-        LOGGER.info("wopan.delete.start item_id=%s kind=%s", item_id, kind)
+    def delete_many(self, items: Sequence[tuple[str, WopanItemKind]]) -> None:
+        """Delete one or more files and folders in a single request."""
+        if not items:
+            raise ValueError("items must not be empty")
+        for item_id, _kind in items:
+            if not item_id:
+                raise ValueError("item_id must not be empty")
+
+        dir_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FOLDER]
+        file_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FILE]
+
+        LOGGER.info(
+            "wopan.delete_many.start folders=%s files=%s", len(dir_ids), len(file_ids)
+        )
         self._dispatch_wohome(
             "DeleteFile",
             {
                 "spaceType": PERSONAL_SPACE_TYPE,
                 "vipLevel": DEFAULT_VIP_LEVEL,
-                "dirList": [item_id] if kind is WopanItemKind.FOLDER else [],
-                "fileList": [item_id] if kind is WopanItemKind.FILE else [],
+                "dirList": dir_ids,
+                "fileList": file_ids,
                 "clientId": CLIENT_ID,
             },
         )
-        LOGGER.info("wopan.delete.success item_id=%s kind=%s", item_id, kind)
+        LOGGER.info(
+            "wopan.delete_many.success folders=%s files=%s", len(dir_ids), len(file_ids)
+        )
 
     def move(self, item_id: str, kind: WopanItemKind, target_parent_id: str) -> None:
         """Move a file or folder to another parent directory."""
-        if not item_id:
-            raise ValueError("item_id must not be empty")
+        self.move_many([(item_id, kind)], target_parent_id)
+
+    def move_many(
+        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
+    ) -> None:
+        """Move one or more files and folders in a single request."""
         if not target_parent_id:
             raise ValueError("target_parent_id must not be empty")
+        if not items:
+            raise ValueError("items must not be empty")
+        for item_id, _kind in items:
+            if not item_id:
+                raise ValueError("item_id must not be empty")
+
+        dir_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FOLDER]
+        file_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FILE]
 
         LOGGER.info(
-            "wopan.move.start item_id=%s kind=%s target_parent_id=%s",
-            item_id,
-            kind,
+            "wopan.move_many.start folders=%s files=%s target_parent_id=%s",
+            len(dir_ids),
+            len(file_ids),
             target_parent_id,
         )
         self._dispatch_wohome(
@@ -437,16 +463,16 @@ class WopanClient:
                 "targetDirId": target_parent_id,
                 "sourceType": PERSONAL_SPACE_TYPE,
                 "targetType": PERSONAL_SPACE_TYPE,
-                "dirList": [item_id] if kind is WopanItemKind.FOLDER else [],
-                "fileList": [item_id] if kind is WopanItemKind.FILE else [],
+                "dirList": dir_ids,
+                "fileList": file_ids,
                 "secret": False,
                 "clientId": CLIENT_ID,
             },
         )
         LOGGER.info(
-            "wopan.move.success item_id=%s kind=%s target_parent_id=%s",
-            item_id,
-            kind,
+            "wopan.move_many.success folders=%s files=%s target_parent_id=%s",
+            len(dir_ids),
+            len(file_ids),
             target_parent_id,
         )
 
