@@ -78,9 +78,15 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     ),
 )
 
-_SQL_UPSERT = f"""
-INSERT INTO transfer_records ({", ".join(_COLUMNS)})
-VALUES ({", ".join("?" for _ in _COLUMNS)})
+# Plain literal: columns mirror _COLUMNS/_row_parameters order and every value
+# is bound through the ? placeholders, so no formatting ever enters the SQL text.
+_SQL_UPSERT = """
+INSERT INTO transfer_records (
+    direction, task_id, name, size, local_path, status, bytes_done,
+    total_bytes, error, active_connections, max_connections,
+    upload_parent_id, upload_name, upload_retryable, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(direction, task_id) DO UPDATE SET
     name = excluded.name,
     size = excluded.size,
@@ -245,7 +251,9 @@ class TransferRecordStore:
             connection.executescript(script)
             # PRAGMA values cannot be parameterized; the version is an internal
             # constant, not external input.
-            connection.execute(f"PRAGMA user_version = {int(version)}")
+            connection.execute(  # nosemgrep: formatted-sql-query, sqlalchemy-execute-raw-query
+                f"PRAGMA user_version = {int(version)}"
+            )
 
     def _require_connection(self) -> sqlite3.Connection:
         connection = self._connection
