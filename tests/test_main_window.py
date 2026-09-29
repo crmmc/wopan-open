@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -107,9 +108,17 @@ class FakeFileBrowser:
             if existing.item_id != item.item_id
         ]
 
+    def delete_items(self, items: Sequence[WopanItem]) -> None:
+        for item in items:
+            self.delete_item(item)
+
     def move_item(self, item: WopanItem, target_parent_id: str) -> None:
         self.moved_items.append((item.item_id, target_parent_id))
         self.delete_item(item)
+
+    def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        for item in items:
+            self.move_item(item, target_parent_id)
 
     def download_file(
         self,
@@ -157,7 +166,13 @@ class LoginExpiredFileBrowser:
     def delete_item(self, item: WopanItem) -> None:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
+    def delete_items(self, items: Sequence[WopanItem]) -> None:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
     def move_item(self, item: WopanItem, target_parent_id: str) -> None:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
     def download_file(
@@ -492,6 +507,21 @@ def test_main_window_basic_operations_refresh_current_directory(qapp: QApplicati
         ROOT_DIRECTORY_ID,
         ROOT_DIRECTORY_ID,
     ]
+
+
+def test_main_window_batch_operations_delete_and_move_multiple_rows(
+    qapp: QApplication,
+) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.move_displayed_items([1], "folder-2")
+    window.delete_displayed_items([0])
+
+    assert browser.moved_items == [("file-1", "folder-2")]
+    # FakeFileBrowser.move_item 内部复用 delete_item 记录，因此 file-1 也会出现
+    assert browser.deleted_items == ["file-1", "folder-1"]
 
 
 def test_main_window_enables_download_for_single_file_selection(qapp: QApplication) -> None:

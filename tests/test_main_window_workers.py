@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -193,6 +193,10 @@ class WorkerFileBrowser:
             if existing.item_id != item.item_id
         ]
 
+    def delete_items(self, items: Sequence[WopanItem]) -> None:
+        for item in items:
+            self.delete_item(item)
+
     def move_item(self, item: WopanItem, target_parent_id: str) -> None:
         self.delete_item(item)
         from dataclasses import replace
@@ -202,6 +206,10 @@ class WorkerFileBrowser:
             *self.items_by_parent.get(target_parent_id, []),
             moved,
         ]
+
+    def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        for item in items:
+            self.move_item(item, target_parent_id)
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         return WopanCloudUsage(used_bytes=1, total_bytes=2)
@@ -2154,6 +2162,193 @@ def test_prompt_delete_item_ignores_missing_row(
     window.prompt_delete_item(9)
 
     assert stub_message_box.instances == []
+
+
+def test_prompt_delete_items_batches_all_selected_rows(
+    qapp: QApplication, stub_message_box
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface.file_table.selectAll()
+    stub_message_box.accept_result = 1
+
+    window.file_interface._delete_selected_row()
+
+    assert stub_message_box.instances[0].title == "确认删除"
+    assert (
+        stub_message_box.instances[0].content
+        == "确定要删除 2 个对象（Folder、report.txt）吗？此操作不可恢复。"
+    )
+    assert window.displayed_items() == ()
+
+
+def test_prompt_delete_item_batches_full_selection(
+    qapp: QApplication, stub_message_box
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface.file_table.selectAll()
+    stub_message_box.accept_result = 1
+
+    window.prompt_delete_item(1)
+
+    assert stub_message_box.instances[0].content.startswith("确定要删除 2 个对象")
+    assert window.displayed_items() == ()
+
+
+def test_prompt_delete_item_outside_selection_deletes_only_clicked_row(
+    qapp: QApplication, stub_message_box
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface.file_table.selectRow(0)
+    stub_message_box.accept_result = 1
+
+    window.prompt_delete_item(1)
+
+    assert stub_message_box.instances[0].content == (
+        "确定要删除「report.txt」吗？此操作不可恢复。"
+    )
+    assert [item.name for item in window.displayed_items()] == ["Folder"]
+
+
+def test_prompt_move_item_batches_all_selected_rows(
+    qapp: QApplication, stub_move_dialog
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID].append(
+        WopanItem(
+            item_id="file-2",
+            name="notes.txt",
+            kind=WopanItemKind.FILE,
+            parent_id=ROOT_DIRECTORY_ID,
+            download_id="fid-2",
+            size=3,
+        )
+    )
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    table = window.file_interface.file_table
+    table.selectRow(1)
+    table.selectionModel().select(
+        table.model().index(2, 0),
+        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    stub_move_dialog.entry = main_window_module.BreadcrumbEntry(
+        item_id="target-folder", name="Target"
+    )
+
+    window.prompt_move_item(1)
+
+    entries = stub_move_dialog.instances[0].entries
+    assert all(entry.item_id not in {"file-1", "file-2"} for entry in entries)
+    assert [item.name for item in window.displayed_items()] == ["Folder"]
+
+
+class _DeleteErrorBrowser(WorkerFileBrowser):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    def delete_items(self, items: Sequence[WopanItem]) -> None:
+        raise self.error
+
+
+def test_delete_displayed_items_reports_batch_failure(qapp: QApplication) -> None:
+    browser = _DeleteErrorBrowser(FileBrowserError("网络错误"))
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.delete_displayed_items([0, 1])
+
+    assert window.status_message() == "删除失败：网络错误"
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+
+
+def test_delete_displayed_items_maps_login_required(qapp: QApplication) -> None:
+    messages: list[str] = []
+    browser = _DeleteErrorBrowser(FileBrowserLoginRequiredError("登录已过期，请重新登录"))
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.login_required.connect(messages.append)
+
+    window.delete_displayed_items([0, 1])
+
+    assert messages == ["登录已过期，请重新登录"]
+
+
+def test_delete_displayed_items_skips_while_busy(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window._delete_thread = object()
+
+    window.delete_displayed_items([0, 1])
+
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+    window._delete_thread = None
+
+
+def test_move_displayed_items_skips_while_busy(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window._move_thread = object()
+
+    window.move_displayed_items([0, 1], "target-folder")
+
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+    window._move_thread = None
+
+
+def test_prompt_delete_items_previews_first_three_names(
+    qapp: QApplication, stub_message_box
+) -> None:
+    browser = WorkerFileBrowser()
+    for index in range(2, 5):
+        browser.items_by_parent[ROOT_DIRECTORY_ID].append(
+            WopanItem(
+                item_id=f"file-{index}",
+                name=f"notes-{index}.txt",
+                kind=WopanItemKind.FILE,
+                parent_id=ROOT_DIRECTORY_ID,
+                download_id=f"fid-{index}",
+                size=1,
+            )
+        )
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface.file_table.selectAll()
+    stub_message_box.accept_result = 1
+
+    window.prompt_delete_item(0)
+
+    assert stub_message_box.instances[0].content == (
+        "确定要删除 5 个对象（Folder、report.txt、notes-2.txt 等）吗？此操作不可恢复。"
+    )
+    assert window.displayed_items() == ()
+
+
+def test_update_operation_controls_disables_delete_without_selection(
+    qapp: QApplication,
+) -> None:
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    delete_button = window.file_interface.delete_button
+
+    assert not delete_button.isEnabled()
+
+    window.file_interface.file_table.selectRow(0)
+    window.update_operation_controls()
+    assert delete_button.isEnabled()
+
+    window.file_interface.file_table.clearSelection()
+    window.update_operation_controls()
+    assert not delete_button.isEnabled()
 
 
 def test_prompt_move_item_moves_to_selected_entry(
