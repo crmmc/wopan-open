@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import BodyLabel, TableWidget
 
+from openwopan.ui.formatting import format_size as _format_item_size
 from openwopan.wopan.client import SEARCH_DEFAULT_PAGE_SIZE
 from openwopan.wopan.models import WopanItem, WopanItemKind
 
@@ -88,7 +89,7 @@ class SearchResultsWindow(QDialog):
     父窗口内部绘制，无法作为弹出窗口使用）。
     """
 
-    jump_requested = Signal(object, object)  # path_ids, path_names
+    jump_requested = Signal(object, object, object)  # path_ids, path_names, select_item_id
     download_requested = Signal(object)  # WopanItem
 
     def __init__(
@@ -130,15 +131,9 @@ class SearchResultsWindow(QDialog):
             vertical_header.hide()
         header = self.result_table.horizontalHeader()
         if header is not None:  # pragma: no cover - Qt 表格恒持有表头
-            header.setSectionResizeMode(
-                COL_SEARCH_NAME, QHeaderView.ResizeMode.Stretch
-            )
-            header.setSectionResizeMode(
-                COL_SEARCH_SIZE, QHeaderView.ResizeMode.ResizeToContents
-            )
-            header.setSectionResizeMode(
-                COL_SEARCH_LOCATION, QHeaderView.ResizeMode.Stretch
-            )
+            header.setSectionResizeMode(COL_SEARCH_NAME, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(COL_SEARCH_SIZE, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(COL_SEARCH_LOCATION, QHeaderView.ResizeMode.Stretch)
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.setWordWrap(False)
@@ -197,7 +192,9 @@ class SearchResultsWindow(QDialog):
             self._items.append(item)
             self.result_table.setItem(row, COL_SEARCH_NAME, QTableWidgetItem(item.name))
             self.result_table.setItem(
-                row, COL_SEARCH_SIZE, QTableWidgetItem(_format_size(item.size))
+                row,
+                COL_SEARCH_SIZE,
+                QTableWidgetItem(_format_item_size(item.size, item.kind)),
             )
             location_item = QTableWidgetItem(UNRESOLVED_LOCATION)
             location_item.setData(Qt.ItemDataRole.UserRole, item.parent_id)
@@ -302,10 +299,15 @@ class SearchResultsWindow(QDialog):
             self._resolve_locations()
             return
         if result_item.kind is WopanItemKind.FOLDER:
+            # 文件夹结果：跳进该文件夹本身，无需选中行
             path = (*path, (result_item.item_id, result_item.name))
+            select_item_id: str | None = None
+        else:
+            # 文件结果：跳到所在文件夹并选中该文件行
+            select_item_id = result_item.item_id
         path_ids = tuple(directory_id for directory_id, _name in path)
         path_names = tuple(name for _id, name in path)
-        self.jump_requested.emit(path_ids, path_names)
+        self.jump_requested.emit(path_ids, path_names, select_item_id)
 
     def _open_result_context_menu(self, position: QPoint) -> None:
         row = self.result_table.rowAt(position.y())
@@ -317,12 +319,6 @@ class SearchResultsWindow(QDialog):
         viewport = self.result_table.viewport()
         if viewport is not None:
             menu.exec(viewport.mapToGlobal(position))
-
-
-def _format_size(size: int | None) -> str:
-    if size is None:
-        return "--"
-    return f"{size} B"
 
 
 def _format_path(path: tuple[tuple[str, str], ...]) -> str:

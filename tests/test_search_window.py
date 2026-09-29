@@ -12,6 +12,7 @@ from openwopan.ui.main_window import MainWindow
 from openwopan.ui.search_window import (
     COL_SEARCH_LOCATION,
     COL_SEARCH_NAME,
+    COL_SEARCH_SIZE,
     SearchResultsWindow,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
@@ -23,6 +24,9 @@ def _sync_search_threads(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run window worker threads synchronously, mirroring workers tests."""
     monkeypatch.setattr(main_window_module, "QThread", SyncQThread)
     monkeypatch.setattr(search_window_module, "QThread", SyncQThread)
+    monkeypatch.setattr(
+        main_window_module.BrowserOperationWorker, "moveToThread", lambda self, t: None
+    )
     monkeypatch.setattr(
         search_window_module.SearchResultsWindow, "moveToThread", lambda self, t: None
     )
@@ -427,14 +431,96 @@ def test_double_click_folder_result_appends_folder_to_path(
     ]
     backend.paths["folder-1"] = [(ROOT_DIRECTORY_ID, "个人云")]
     window = _make_window(backend, qapp)
-    jumps: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
-    window.jump_requested.connect(lambda ids, names: jumps.append((tuple(ids), tuple(names))))
+    jumps: list[tuple[tuple[str, ...], tuple[str, ...], str | None]] = []
+    window.jump_requested.connect(
+        lambda ids, names, select: jumps.append((tuple(ids), tuple(names), select))
+    )
     window.start_search("docs")
 
     window._on_item_double_clicked(window.result_table.item(0, COL_SEARCH_NAME))
 
-    # 文件夹结果：跳转目标 = 父路径 + 该文件夹自身
-    assert jumps == [((ROOT_DIRECTORY_ID, "folder-9"), ("个人云", "docs"))]
+    # 文件夹结果：跳转目标 = 父路径 + 该文件夹自身，不携带选中 id
+    assert jumps == [((ROOT_DIRECTORY_ID, "folder-9"), ("个人云", "docs"), None)]
+
+
+def test_double_click_file_result_carries_select_id(
+    qapp: QApplication, backend: _FakeSearchBackend
+) -> None:
+    backend.pages[1] = [_file_item("file-7", "a.txt", parent_id="folder-9")]
+    backend.paths["folder-9"] = [(ROOT_DIRECTORY_ID, "个人云"), ("folder-9", "test")]
+    window = _make_window(backend, qapp)
+    jumps: list[tuple[tuple[str, ...], tuple[str, ...], str | None]] = []
+    window.jump_requested.connect(
+        lambda ids, names, select: jumps.append((tuple(ids), tuple(names), select))
+    )
+    window.start_search("a")
+
+    window._on_item_double_clicked(window.result_table.item(0, COL_SEARCH_NAME))
+
+    # 文件结果：跳转到所在文件夹并携带该文件的选中 id
+    assert jumps == [((ROOT_DIRECTORY_ID, "folder-9"), ("个人云", "test"), "file-7")]
+
+
+def test_size_column_uses_human_friendly_units(
+    qapp: QApplication, backend: _FakeSearchBackend
+) -> None:
+    backend.pages[1] = [
+        WopanItem(
+            item_id="file-1",
+            name="big.dmg",
+            kind=WopanItemKind.FILE,
+            parent_id="0",
+            download_id="fid-1",
+            size=74604492,
+        )
+    ]
+    window = _make_window(backend, qapp)
+
+    window.start_search("big")
+
+    assert window.result_table.item(0, COL_SEARCH_SIZE).text() == "71.1 MB"
+
+
+def test_main_window_jump_selects_target_file_row(qapp: QApplication) -> None:
+    browser = _MainBrowser()
+    browser.items_by_parent["folder-1"] = [
+        WopanItem(
+            item_id="folder-2",
+            name="inner",
+            kind=WopanItemKind.FOLDER,
+            parent_id="folder-1",
+        ),
+        WopanItem(
+            item_id="file-9",
+            name="deep.txt",
+            kind=WopanItemKind.FILE,
+            parent_id="folder-1",
+            download_id="fid-9",
+            size=1024,
+        ),
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    # 从根目录带选中 id 跳进 folder-1
+    window._on_search_jump_requested(
+        (ROOT_DIRECTORY_ID, "folder-1"), ("个人云", "Folder"), "file-9"
+    )
+
+    table = window.file_interface.file_table
+    assert window.current_directory_id() == "folder-1"
+    assert table.currentRow() == 1
+    assert table.item(table.currentRow(), 0).text() == "deep.txt"
+
+
+def test_main_window_jump_missing_selection_reports_hint(qapp: QApplication) -> None:
+    browser = _MainBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window._select_item_row("ghost-item")
+
+    assert "不在当前列表中" in window.status_message()
 
 
 def test_request_page_without_keyword_is_ignored(

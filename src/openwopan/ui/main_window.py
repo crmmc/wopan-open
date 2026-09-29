@@ -101,6 +101,9 @@ from openwopan.tasks.upload import (
     resolve_upload_targets,
     scan_upload_inputs,
 )
+from openwopan.ui.formatting import format_bytes as _format_bytes
+from openwopan.ui.formatting import format_optional_bytes as _format_optional_bytes
+from openwopan.ui.formatting import format_size as _format_size
 from openwopan.ui.search_window import SearchResultsWindow
 from openwopan.ui.target_folder_dialog import (
     TargetEntry,
@@ -3142,6 +3145,46 @@ class MainWindow(_MainWindowBase):
         self._tree_sync_thread = None
         self._tree_sync_worker = None
 
+    def _on_search_jump_requested(
+        self,
+        path_ids: tuple[str, ...],
+        path_names: tuple[str, ...],
+        select_item_id: str | None,
+    ) -> None:
+        """Jump the file view to the folder and optionally select the item."""
+        already_there = [entry.item_id for entry in self._breadcrumb] == list(path_ids)
+        if already_there and select_item_id is None:
+            return
+        if not already_there:
+            self._breadcrumb = [
+                BreadcrumbEntry(item_id=item_id, name=name)
+                for item_id, name in zip(path_ids, path_names, strict=True)
+            ]
+        if select_item_id is not None:
+            # 刷新落地后在 GUI 线程选中目标行（_after_refresh 契约：不读旧列表）；
+            # 已在目标目录时同样等待刷新，避免选中跑在列表更新前。
+            self.refresh_current_directory(
+                after=lambda items, still_current: (
+                    self._select_item_row(select_item_id) if still_current else None
+                )
+            )
+        else:
+            self.refresh_current_directory()
+
+    def _select_item_row(self, item_id: str) -> None:
+        """Select and scroll to the row whose item id matches."""
+        for row, item in enumerate(self._items):
+            if item.item_id == item_id:
+                table = self.file_interface.file_table
+                table.selectRow(row)
+                table.scrollToItem(
+                    table.item(row, 0),
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
+                self.update_operation_controls()
+                return
+        self._set_status("目标对象不在当前列表中（可能已被移动或删除）")
+
     def open_tree_path(self, path_ids: tuple[str, ...], path_names: tuple[str, ...]) -> None:
         """Navigate to the folder identified by a folder-tree node path."""
         if not path_ids or not path_names:
@@ -3208,7 +3251,7 @@ class MainWindow(_MainWindowBase):
                 self._resolve_directory_path_callable,
                 parent=self,
             )
-            self._search_window.jump_requested.connect(self.open_tree_path)
+            self._search_window.jump_requested.connect(self._on_search_jump_requested)
             self._search_window.download_requested.connect(self.download_search_item)
         self._search_window.show()
         self._search_window.raise_()
@@ -5934,33 +5977,6 @@ def _format_kind(kind: WopanItemKind) -> str:
     if kind is WopanItemKind.FOLDER:
         return "文件夹"
     return "文件"
-
-
-def _format_size(size: int | None, kind: WopanItemKind) -> str:
-    if kind is WopanItemKind.FOLDER:
-        return "-"
-    if size is None:
-        return "-"
-    return _format_bytes(size)
-
-
-def _format_optional_bytes(size: int | None) -> str:
-    if size is None:
-        return "-"
-    return _format_bytes(size)
-
-
-def _format_bytes(size: int) -> str:
-    units = ("B", "KB", "MB", "GB", "TB", "PB")
-    value = float(size)
-    unit = units[0]
-    for unit in units:  # pragma: no branch - docs/testing-exemptions.md
-        if value < 1024 or unit == units[-1]:
-            break
-        value /= 1024
-    if unit == "B":
-        return f"{int(value)} {unit}"
-    return f"{value:.1f} {unit}"
 
 
 def _format_speed(speed_bps: float) -> str:
