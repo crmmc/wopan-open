@@ -1249,7 +1249,8 @@ def test_finished_thread_is_deleted_by_gui_cleanup(
 
     window.refresh_current_directory()
 
-    assert delete_later_calls == [True]
+    # 目录刷新会连带触发一次树同步线程，两个线程结束后都被 GUI 清理回收
+    assert delete_later_calls == [True, True]
     assert worker_delete_later_calls == []
 
 
@@ -4778,45 +4779,138 @@ def test_file_interface_download_action_starts_download_for_selected_row(
 
 
 @pytest.mark.parametrize(
-    ("clicked_id", "expected_directory_id"),
+    ("ids_data", "names_data"),
     [
-        # Unknown id: the displayed-items loop exhausts without navigating anywhere.
-        ("ghost-folder", ROOT_DIRECTORY_ID),
-        # Known id on row 1: the loop skips the non-matching row 0, then navigates.
-        ("folder-9", "folder-9"),
+        # No path data at all (stray node): the handler ignores the click.
+        (None, None),
+        # Ids without the names tuple: incomplete path data is also ignored.
+        (("folder-9",), None),
     ],
 )
-def test_tree_item_click_non_root_navigation_branches(
-    qapp: QApplication, clicked_id: str, expected_directory_id: str
+def test_tree_item_click_ignores_nodes_without_path_data(
+    qapp: QApplication,
+    ids_data: tuple[str, ...] | None,
+    names_data: tuple[str, ...] | None,
 ) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    window.refresh_current_directory()
+    clicked = QTreeWidgetItem(["clicked"])
+    if ids_data is not None:
+        clicked.setData(0, Qt.ItemDataRole.UserRole, ids_data)
+    if names_data is not None:
+        clicked.setData(0, Qt.ItemDataRole.UserRole + 1, names_data)
+
+    window.file_interface._on_tree_item_clicked(clicked)
+
+    assert window.current_directory_id() == ROOT_DIRECTORY_ID
+
+
+def test_folder_tree_expands_along_current_path(qapp: QApplication) -> None:
     browser = WorkerFileBrowser()
     browser.items_by_parent[ROOT_DIRECTORY_ID] = [
-        _file_item("file-0", "first.txt"),
         WopanItem(
             item_id="folder-9",
-            name="Deep",
+            name="Sibling",
             kind=WopanItemKind.FOLDER,
             parent_id=ROOT_DIRECTORY_ID,
         ),
+        WopanItem(
+            item_id="folder-1",
+            name="Folder",
+            kind=WopanItemKind.FOLDER,
+            parent_id=ROOT_DIRECTORY_ID,
+        ),
+        _file_item(),
     ]
-    browser.items_by_parent["folder-9"] = [
+    browser.items_by_parent["folder-1"] = [
+        WopanItem(
+            item_id="folder-2",
+            name="2",
+            kind=WopanItemKind.FOLDER,
+            parent_id="folder-1",
+        )
+    ]
+    browser.items_by_parent["folder-2"] = [
         WopanItem(
             item_id="deep-file",
             name="deep.txt",
             kind=WopanItemKind.FILE,
-            parent_id="folder-9",
-            download_id="deep-fid",
-            size=1,
+            parent_id="folder-2",
         )
     ]
     window = MainWindow(browser)
     window.refresh_current_directory()
-    clicked = QTreeWidgetItem(["clicked"])
-    clicked.setData(0, Qt.ItemDataRole.UserRole, clicked_id)
+    window.enter_displayed_folder(1)
+    window.enter_displayed_folder(0)
 
-    window.file_interface._on_tree_item_clicked(clicked)
+    tree = window.file_interface.folder_tree
+    root_item = tree.topLevelItem(0)
+    assert root_item is not None
+    assert root_item.childCount() == 2
+    folder_node = root_item.child(1)
+    assert folder_node.text(0) == "Folder"
+    assert folder_node.isExpanded() is True
+    deep_node = folder_node.child(0)
+    assert deep_node.text(0) == "2"
+    assert tree.currentItem() is deep_node
 
-    assert window.current_directory_id() == expected_directory_id
+
+def test_tree_click_deep_node_navigates_with_full_path(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = [
+        WopanItem(
+            item_id="folder-1",
+            name="Folder",
+            kind=WopanItemKind.FOLDER,
+            parent_id=ROOT_DIRECTORY_ID,
+        ),
+        _file_item(),
+    ]
+    browser.items_by_parent["folder-1"] = [
+        WopanItem(
+            item_id="folder-2",
+            name="2",
+            kind=WopanItemKind.FOLDER,
+            parent_id="folder-1",
+        )
+    ]
+    browser.items_by_parent["folder-2"] = [
+        WopanItem(
+            item_id="deep-file",
+            name="deep.txt",
+            kind=WopanItemKind.FILE,
+            parent_id="folder-2",
+        )
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    window.enter_displayed_folder(0)
+
+    tree = window.file_interface.folder_tree
+    deep_node = tree.topLevelItem(0).child(0).child(0)
+    window.file_interface._on_tree_item_clicked(deep_node)
+
+    assert window.breadcrumb_names() == ("/", "Folder", "2")
+    assert window.current_directory_id() == "folder-2"
+
+
+def test_search_mode_does_not_resync_tree(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    browser.search_pages[1] = [
+        WopanItem(item_id="hit-1", name="report.txt", kind=WopanItemKind.FILE)
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    tree = window.file_interface.folder_tree
+    root_children_before = tree.topLevelItem(0).childCount()
+    requested_before = len(browser.requested_parent_ids)
+    window.file_interface.search_bar.setText("report")
+    window.request_search()
+
+    assert window._search_keyword == "report"
+    assert tree.topLevelItem(0).childCount() == root_children_before
+    assert len(browser.requested_parent_ids) == requested_before
 
 
 def test_switch_to_interface_activates_widget_and_navigation(qapp: QApplication) -> None:

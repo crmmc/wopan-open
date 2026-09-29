@@ -126,7 +126,14 @@ TRANSFER_ACTION_COLUMN_WIDTH = 156
 TRANSFER_ACTION_BUTTON_SIZE = (32, 24)
 THREAD_JOIN_TIMEOUT_MS = 3000
 UPLOAD_STATUS_FILTERS = (
-    "全部", "等待中", "上传中", "创建目录中", "已暂停", "已完成", "失败", "已取消"
+    "全部",
+    "等待中",
+    "上传中",
+    "创建目录中",
+    "已暂停",
+    "已完成",
+    "失败",
+    "已取消",
 )
 DOWNLOAD_STATUS_FILTERS = (
     "全部",
@@ -349,9 +356,7 @@ class UploadScanWorker(QObject):
         try:
             self.succeeded.emit(scan_upload_inputs(self._paths))
         except Exception as exc:
-            sanitized_error = RuntimeError(
-                f"upload scan failed: {type(exc).__name__}"
-            )
+            sanitized_error = RuntimeError(f"upload scan failed: {type(exc).__name__}")
             LOGGER.exception(
                 "main_window.upload_scan.unexpected_error error_type=%s",
                 type(exc).__name__,
@@ -423,7 +428,6 @@ class UploadSummaryDialog(QDialog):
         if self._skip_conflicts_button is not None and self._skip_conflicts_button.isChecked():
             return "skip"
         return "copy"
-
 
 
 class UploadConflictDialog(QDialog):
@@ -823,9 +827,7 @@ class TransferInterface(QWidget):
         self._progress_render_scheduled = False
         self._speed_estimators: dict[tuple[str, str], TransferRateEstimator] = {}
         # Injectable for tests; must return a fresh TransferRateEstimator.
-        self._new_speed_estimator: Callable[[], TransferRateEstimator] = (
-            TransferRateEstimator
-        )
+        self._new_speed_estimator: Callable[[], TransferRateEstimator] = TransferRateEstimator
         self._speed_sampler = QTimer(self)
         self._speed_sampler.setInterval(self.SPEED_SAMPLE_INTERVAL_MS)
         self._speed_sampler.timeout.connect(self._sample_speeds)
@@ -1034,9 +1036,7 @@ class TransferInterface(QWidget):
         """
         has_active = False
         for direction in ("upload", "download"):
-            records = (
-                self.upload_records if direction == "upload" else self.download_records
-            )
+            records = self.upload_records if direction == "upload" else self.download_records
             table = self.upload_table if direction == "upload" else self.download_table
             visible = (
                 self._filtered_upload_records()
@@ -1232,12 +1232,8 @@ class TransferInterface(QWidget):
         self.upload_filter_combo.currentTextChanged.connect(self._on_upload_filter_changed)
         self.download_filter_combo.currentTextChanged.connect(self._on_download_filter_changed)
         self.open_download_folder_button.clicked.connect(self._request_open_download_folder)
-        self.upload_table.itemSelectionChanged.connect(
-            lambda: self._update_batch_bar("upload")
-        )
-        self.download_table.itemSelectionChanged.connect(
-            lambda: self._update_batch_bar("download")
-        )
+        self.upload_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("upload"))
+        self.download_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("download"))
         self.upload_batch_buttons["select_all"].clicked.connect(
             lambda: self._select_all(self.upload_table)
         )
@@ -1247,9 +1243,7 @@ class TransferInterface(QWidget):
         self.upload_batch_buttons["delete"].clicked.connect(
             lambda: self._request_delete_selected("upload")
         )
-        self.upload_batch_buttons["retry"].clicked.connect(
-            self._request_retry_selected_uploads
-        )
+        self.upload_batch_buttons["retry"].clicked.connect(self._request_retry_selected_uploads)
         self.upload_batch_buttons["pause"].clicked.connect(
             lambda: self._request_pause_selected("upload")
         )
@@ -1346,9 +1340,7 @@ class TransferInterface(QWidget):
                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
                     )
                 table.setItem(row, column, table_item)
-            action_key = (
-                record.task_id, record.status, record.can_resume, record.upload_retryable
-            )
+            action_key = (record.task_id, record.status, record.can_resume, record.upload_retryable)
             widget = table.cellWidget(row, TRANSFER_COL_ACTION)
             if widget is not None and widget.property("action_key") == action_key:
                 continue
@@ -1537,10 +1529,15 @@ class TransferInterface(QWidget):
         )
         selected = self._selected_task_ids(direction)
         task_ids = {
-            record.task_id for record in visible
-            if record.task_id in selected and (
-                (direction == "upload" and record.upload_retryable
-                 and record.status in ACTIVE_UPLOAD_STATUSES)
+            record.task_id
+            for record in visible
+            if record.task_id in selected
+            and (
+                (
+                    direction == "upload"
+                    and record.upload_retryable
+                    and record.status in ACTIVE_UPLOAD_STATUSES
+                )
                 or (direction == "download" and record.status in ACTIVE_DOWNLOAD_STATUSES)
             )
         }
@@ -1559,12 +1556,16 @@ class TransferInterface(QWidget):
         )
         selected = self._selected_task_ids(direction)
         task_ids = {
-            record.task_id for record in visible
-            if record.task_id in selected and (
-                (direction == "upload" and record.upload_retryable
-                 and record.status == "已暂停")
-                or (direction == "download" and record.can_resume
-                    and record.status in {"已暂停", "失败"})
+            record.task_id
+            for record in visible
+            if record.task_id in selected
+            and (
+                (direction == "upload" and record.upload_retryable and record.status == "已暂停")
+                or (
+                    direction == "download"
+                    and record.can_resume
+                    and record.status in {"已暂停", "失败"}
+                )
             )
         }
         if not task_ids:
@@ -1605,8 +1606,7 @@ class TransferInterface(QWidget):
             index = table.model().index(row, 0)
             selection_model.select(
                 index,
-                QItemSelectionModel.SelectionFlag.Select
-                | QItemSelectionModel.SelectionFlag.Rows,
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
             )
         table.blockSignals(False)
         table.itemSelectionChanged.emit()
@@ -1654,8 +1654,7 @@ class TransferInterface(QWidget):
         rows = {index.row() for index in table.selectionModel().selectedRows()}
         buttons["pause"].setEnabled(
             any(
-                0 <= row < len(visible)
-                and visible[row].status in ACTIVE_DOWNLOAD_STATUSES
+                0 <= row < len(visible) and visible[row].status in ACTIVE_DOWNLOAD_STATUSES
                 for row in rows
             )
         )
@@ -1671,9 +1670,7 @@ class TransferInterface(QWidget):
     def _update_total_speed(self, direction: str) -> None:
         records = self.upload_records if direction == "upload" else self.download_records
         buttons = (
-            self.upload_batch_buttons
-            if direction == "upload"
-            else self.download_batch_buttons
+            self.upload_batch_buttons if direction == "upload" else self.download_batch_buttons
         )
         total_speed = sum(record.speed_bps for record in records if record.speed_bps > 0)
         speed_label = buttons["speed"]
@@ -2013,9 +2010,7 @@ class SettingsInterface(ScrollArea):
         )
         self.concurrent_uploads_spin_box.valueChanged.connect(self._on_concurrent_uploads_changed)
         self.retry_attempts_combo_box.currentIndexChanged.connect(self._on_retry_attempts_changed)
-        self.download_part_size_spin_box.valueChanged.connect(
-            self._on_download_part_size_changed
-        )
+        self.download_part_size_spin_box.valueChanged.connect(self._on_download_part_size_changed)
         self.download_part_mode_combo_box.currentIndexChanged.connect(
             self._on_download_part_mode_changed
         )
@@ -2131,9 +2126,8 @@ class FileInterface(QWidget):
         items: tuple[WopanItem, ...],
         breadcrumb: tuple[BreadcrumbEntry, ...],
     ) -> None:
-        """Render file rows, tree, and breadcrumb from current window state."""
+        """Render file rows and breadcrumb from current window state."""
         self._render_breadcrumb(breadcrumb)
-        self._render_tree(items)
         self._render_table(items)
 
     def set_storage_usage(self, usage: WopanCloudUsage | None) -> None:
@@ -2332,20 +2326,67 @@ class FileInterface(QWidget):
             return
         self._window.open_breadcrumb_index(int(key))
 
-    def _render_tree(self, items: tuple[WopanItem, ...]) -> None:
+    def render_folder_tree(
+        self,
+        breadcrumb: tuple[BreadcrumbEntry, ...],
+        levels: tuple[tuple[WopanItem, ...], ...],
+    ) -> None:
+        """Render the navigation tree expanded along the current path.
+
+        ``levels[i]`` holds the folder entries of ``breadcrumb[i]``. Every
+        level lists its folders (skipping the next path entry, which is
+        attached with its own children instead); nodes along the path are
+        expanded and the current folder is highlighted. Each node stores its
+        full id/name path so deep nodes can navigate directly.
+        """
         self.folder_tree.clear()
-        root_item = QTreeWidgetItem([ROOT_DISPLAY_NAME])
-        root_item.setIcon(0, FIF.FOLDER.icon())
-        root_item.setData(0, Qt.ItemDataRole.UserRole, ROOT_DIRECTORY_ID)
-        self.folder_tree.addTopLevelItem(root_item)
-        for item in items:
-            if item.kind is not WopanItemKind.FOLDER:
-                continue
-            tree_item = QTreeWidgetItem([item.name])
-            tree_item.setIcon(0, FIF.FOLDER.icon())
-            tree_item.setData(0, Qt.ItemDataRole.UserRole, item.item_id)
-            root_item.addChild(tree_item)
-        root_item.setExpanded(True)
+        if not breadcrumb:
+            return
+
+        def make_node(
+            name: str,
+            ids: tuple[str, ...],
+            names: tuple[str, ...],
+            folders: tuple[WopanItem, ...],
+        ) -> QTreeWidgetItem:
+            node = QTreeWidgetItem([name])
+            node.setIcon(0, FIF.FOLDER.icon())
+            node.setData(0, Qt.ItemDataRole.UserRole, ids)
+            node.setData(0, Qt.ItemDataRole.UserRole + 1, names)
+            for folder in folders:
+                node.addChild(
+                    make_node(folder.name, (*ids, folder.item_id), (*names, folder.name), ())
+                )
+            return node
+
+        ids_chain: tuple[str, ...] = (breadcrumb[0].item_id,)
+        names_chain: tuple[str, ...] = (breadcrumb[0].name,)
+        current = make_node(breadcrumb[0].name, ids_chain, names_chain, ())
+        self.folder_tree.addTopLevelItem(current)
+        current.setExpanded(True)
+        for depth in range(len(breadcrumb)):
+            next_entry = breadcrumb[depth + 1] if depth + 1 < len(breadcrumb) else None
+            folders = levels[depth] if depth < len(levels) else ()
+            for folder in folders:
+                if next_entry is not None and folder.item_id == next_entry.item_id:
+                    continue
+                current.addChild(
+                    make_node(
+                        folder.name,
+                        (*ids_chain, folder.item_id),
+                        (*names_chain, folder.name),
+                        (),
+                    )
+                )
+            if next_entry is None:
+                break
+            ids_chain = (*ids_chain, next_entry.item_id)
+            names_chain = (*names_chain, next_entry.name)
+            child = make_node(next_entry.name, ids_chain, names_chain, ())
+            current.addChild(child)
+            current.setExpanded(True)
+            current = child
+        self.folder_tree.setCurrentItem(current)
 
     def _render_table(self, items: tuple[WopanItem, ...]) -> None:
         self.file_table.setRowCount(len(items))
@@ -2375,14 +2416,11 @@ class FileInterface(QWidget):
             self._window.prompt_download_item(rows[0])
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem) -> None:
-        item_id = item.data(0, Qt.ItemDataRole.UserRole)
-        if item_id == ROOT_DIRECTORY_ID:
-            self._window.refresh_root()
+        ids = item.data(0, Qt.ItemDataRole.UserRole)
+        names = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(ids, tuple) or not isinstance(names, tuple):
             return
-        for row, displayed_item in enumerate(self._window.displayed_items()):
-            if displayed_item.item_id == item_id:
-                self._window.enter_displayed_folder(row)
-                return
+        self._window.open_tree_path(ids, names)
 
 
 class MainWindow(_MainWindowBase):
@@ -2431,6 +2469,8 @@ class MainWindow(_MainWindowBase):
         self._search_has_more = False
         self._search_thread: QThread | None = None
         self._search_worker: BrowserOperationWorker | None = None
+        self._tree_sync_thread: QThread | None = None
+        self._tree_sync_worker: BrowserOperationWorker | None = None
         self._copy_thread: QThread | None = None
         self._copy_worker: BrowserOperationWorker | None = None
         self._target_dialog: TargetFolderDialog | None = None
@@ -2597,9 +2637,7 @@ class MainWindow(_MainWindowBase):
                 "upload", self._folder_upload_record_id, status="已取消"
             )
         for pending in self._upload_pending:
-            self.transfer_interface.update_record(
-                "upload", pending.task_id, status="已取消"
-            )
+            self.transfer_interface.update_record("upload", pending.task_id, status="已取消")
         self._upload_pending.clear()
         thread_entries: list[tuple[QThread | None, str, str | None]] = [
             (self._directory_thread, "directory", None),
@@ -2608,6 +2646,7 @@ class MainWindow(_MainWindowBase):
             (self._delete_thread, "delete", None),
             (self._move_thread, "move", None),
             (self._search_thread, "search", None),
+            (self._tree_sync_thread, "tree_sync", None),
             (self._copy_thread, "copy", None),
             (self._target_load_thread, "target_load", None),
             (self._transfer_check_thread, "transfer_check", None),
@@ -2664,9 +2703,7 @@ class MainWindow(_MainWindowBase):
         super().closeEvent(event)
 
     @staticmethod
-    def _abandon_thread_after_timeout(
-        thread: QThread, direction: str, task_id: str | None
-    ) -> None:
+    def _abandon_thread_after_timeout(thread: QThread, direction: str, task_id: str | None) -> None:
         # Detach so window destruction cannot delete a running QThread (qFatal),
         # and keep a reference so Python GC cannot either. No terminate(): it
         # can kill the thread mid-bytecode holding the GIL and deadlock.
@@ -2674,8 +2711,7 @@ class MainWindow(_MainWindowBase):
         _THREAD_KEEP_ALIVE.add(thread)
         thread.finished.connect(lambda kept=thread: _THREAD_KEEP_ALIVE.discard(kept))
         LOGGER.warning(
-            "main_window.close.thread_abandoned direction=%s task_id=%s "
-            "join_timeout_ms=%s",
+            "main_window.close.thread_abandoned direction=%s task_id=%s join_timeout_ms=%s",
             direction,
             task_id,
             THREAD_JOIN_TIMEOUT_MS,
@@ -2834,26 +2870,20 @@ class MainWindow(_MainWindowBase):
         for record in result:
             if not isinstance(record, TransferRecord):
                 continue
-            if (
-                self.transfer_interface._find_record(record.direction, record.task_id)
-                is not None
-            ):
+            if self.transfer_interface._find_record(record.direction, record.task_id) is not None:
                 # Same id is already alive this session (user-created race): the
                 # restored row is dropped and its database row deleted; the live
                 # record re-upserts its own row right away so its history is not
                 # lost (design.md 4).
                 if self._transfer_history is not None:
-                    self._transfer_history.delete_records(
-                        record.direction, [record.task_id]
-                    )
+                    self._transfer_history.delete_records(record.direction, [record.task_id])
                     live_record = self.transfer_interface._find_record(
                         record.direction, record.task_id
                     )
                     if live_record is not None:
                         self.transfer_interface._save_record(live_record)
                 LOGGER.warning(
-                    "main_window.transfer_history.conflict_dropped "
-                    "direction=%s task_id=%s",
+                    "main_window.transfer_history.conflict_dropped direction=%s task_id=%s",
                     record.direction,
                     record.task_id,
                 )
@@ -3058,6 +3088,84 @@ class MainWindow(_MainWindowBase):
         if entry is not None:
             requested_parent_id, after = entry
             after(self._items, self.current_directory_id() == requested_parent_id)
+        self._sync_folder_tree()
+
+    def _sync_folder_tree(self) -> None:
+        """Rebuild the navigation tree expanded along the current path."""
+        file_browser = self._file_browser
+        if file_browser is None:
+            return
+        if self._tree_sync_thread is not None:
+            LOGGER.debug("main_window.tree_sync.skipped_busy")
+            return
+        breadcrumb = tuple(self._breadcrumb)
+        current_folders = tuple(item for item in self._items if item.kind is WopanItemKind.FOLDER)
+        LOGGER.info("main_window.tree_sync.start depth=%s", len(breadcrumb))
+
+        def operation() -> list[tuple[WopanItem, ...]]:
+            levels: list[tuple[WopanItem, ...]] = []
+            for entry in breadcrumb:
+                if entry.item_id == breadcrumb[-1].item_id:
+                    levels.append(current_folders)
+                    continue
+                listing = file_browser.list_directory(entry.item_id)
+                levels.append(tuple(item for item in listing if item.kind is WopanItemKind.FOLDER))
+            return levels
+
+        thread = QThread(self)
+        worker = BrowserOperationWorker(operation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_tree_sync_succeeded)
+        worker.failed.connect(self._on_tree_sync_failed)
+        worker.login_required.connect(self._on_tree_sync_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(self._clear_tree_sync)
+        self._tree_sync_thread = thread
+        self._tree_sync_worker = worker
+        thread.start()
+
+    def _on_tree_sync_succeeded(self, result: object) -> None:
+        if self._closing:
+            return
+        if not isinstance(result, list) or not all(
+            isinstance(level, (list, tuple)) for level in result
+        ):
+            LOGGER.debug("main_window.tree_sync.invalid_result")
+            return
+        self.file_interface.render_folder_tree(
+            tuple(self._breadcrumb), tuple(tuple(level) for level in result)
+        )
+
+    def _on_tree_sync_failed(self, message: str) -> None:
+        # The tree is auxiliary navigation; the breadcrumb stays correct, so
+        # a failed sync only degrades the pane and must not alarm the user.
+        LOGGER.debug("main_window.tree_sync.failed error_length=%s", len(message))
+
+    def _on_tree_sync_login_required(self, message: str) -> None:
+        LOGGER.debug("main_window.tree_sync.login_required")
+
+    def _clear_tree_sync(self) -> None:
+        self._delete_finished_thread()
+        self._tree_sync_thread = None
+        self._tree_sync_worker = None
+
+    def open_tree_path(self, path_ids: tuple[str, ...], path_names: tuple[str, ...]) -> None:
+        """Navigate to the folder identified by a folder-tree node path."""
+        if not path_ids or not path_names:
+            return
+        if [entry.item_id for entry in self._breadcrumb] == list(path_ids):
+            return
+        if self._search_keyword is not None:
+            self._search_keyword = None
+            self._search_has_more = False
+        self._breadcrumb = [
+            BreadcrumbEntry(item_id=item_id, name=name)
+            for item_id, name in zip(path_ids, path_names, strict=True)
+        ]
+        self.refresh_current_directory()
 
     def _on_directory_refresh_failed(self, message: str) -> None:
         self._items = []
@@ -3241,9 +3349,7 @@ class MainWindow(_MainWindowBase):
         )
         file_browser = self._file_browser
         thread = QThread(self)
-        worker = BrowserOperationWorker(
-            lambda: file_browser.create_folder(parent_id, folder_name)
-        )
+        worker = BrowserOperationWorker(lambda: file_browser.create_folder(parent_id, folder_name))
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._on_create_folder_succeeded)
@@ -3272,9 +3378,7 @@ class MainWindow(_MainWindowBase):
     def _report_create_visibility(
         self, created_item: WopanItem, folder_name: str, still_current: bool
     ) -> None:
-        if still_current and not any(
-            item.item_id == created_item.item_id for item in self._items
-        ):
+        if still_current and not any(item.item_id == created_item.item_id for item in self._items):
             LOGGER.warning(
                 "main_window.create_folder.not_visible_after_refresh item_id=%s parent_id=%s",
                 created_item.item_id,
@@ -3353,11 +3457,7 @@ class MainWindow(_MainWindowBase):
 
     def delete_displayed_items(self, rows: Sequence[int]) -> None:
         """Delete one or more displayed rows in a single batch request."""
-        items = [
-            item
-            for row in rows
-            if (item := self._item_at_row(row)) is not None
-        ]
+        items = [item for row in rows if (item := self._item_at_row(row)) is not None]
         if not items:
             return
         if self._file_browser is None:
@@ -3405,11 +3505,7 @@ class MainWindow(_MainWindowBase):
 
     def move_displayed_items(self, rows: Sequence[int], target_parent_id: str) -> None:
         """Move one or more displayed rows in a single batch request."""
-        items = [
-            item
-            for row in rows
-            if (item := self._item_at_row(row)) is not None
-        ]
+        items = [item for row in rows if (item := self._item_at_row(row)) is not None]
         if not items:
             return
         target_id = target_parent_id.strip()
@@ -3421,11 +3517,7 @@ class MainWindow(_MainWindowBase):
 
     def copy_displayed_items(self, rows: Sequence[int], target_parent_id: str) -> None:
         """Copy one or more displayed rows in a single batch request."""
-        items = [
-            item
-            for row in rows
-            if (item := self._item_at_row(row)) is not None
-        ]
+        items = [item for row in rows if (item := self._item_at_row(row)) is not None]
         if not items:
             return
         target_id = target_parent_id.strip()
@@ -3526,7 +3618,10 @@ class MainWindow(_MainWindowBase):
         self._submit_download_items([(item, local_path)], run_in_background=run_in_background)
 
     def _submit_download_items(
-        self, items: list[tuple[WopanItem, Path]], *, run_in_background: bool = True,
+        self,
+        items: list[tuple[WopanItem, Path]],
+        *,
+        run_in_background: bool = True,
         automatic: bool = False,
     ) -> None:
         if self._file_browser is None:
@@ -3558,7 +3653,8 @@ class MainWindow(_MainWindowBase):
 
     @staticmethod
     def _scan_download_target_names(
-        items: list[tuple[WopanItem, Path]], automatic: bool,
+        items: list[tuple[WopanItem, Path]],
+        automatic: bool,
     ) -> dict[Path, set[str]]:
         names: dict[Path, set[str]] = {}
         for _item, path in items:
@@ -3573,12 +3669,17 @@ class MainWindow(_MainWindowBase):
         return names
 
     def _start_download_target_scan(
-        self, items: list[tuple[WopanItem, Path]], automatic: bool, run_in_background: bool,
+        self,
+        items: list[tuple[WopanItem, Path]],
+        automatic: bool,
+        run_in_background: bool,
     ) -> None:
         thread = QThread(self)
         worker = BrowserOperationWorker(
             lambda: (
-                items, automatic, run_in_background,
+                items,
+                automatic,
+                run_in_background,
                 self._scan_download_target_names(items, automatic),
             )
         )
@@ -3628,7 +3729,10 @@ class MainWindow(_MainWindowBase):
         self._submit_resolved_download_items(resolved, run_in_background=run_in_background)
 
     def _submit_resolved_download_items(
-        self, valid: list[tuple[WopanItem, Path]], *, run_in_background: bool,
+        self,
+        valid: list[tuple[WopanItem, Path]],
+        *,
+        run_in_background: bool,
     ) -> None:
         submit = getattr(self._file_browser, "submit_download", None)
         if not callable(submit):
@@ -3801,9 +3905,7 @@ class MainWindow(_MainWindowBase):
             else None
         )
         max_connections = (
-            event.max_connections
-            if event.max_connections != record.max_connections
-            else None
+            event.max_connections if event.max_connections != record.max_connections else None
         )
         can_resume = event.status in {"已暂停", "失败"}
         can_resume_value = can_resume if can_resume != record.can_resume else None
@@ -4026,9 +4128,7 @@ class MainWindow(_MainWindowBase):
         targets = resolve_upload_targets(paths, existing_names, resolution)
         skipped_count = len(paths) - len(targets)
         if skipped_count:
-            self._set_status(
-                f"已跳过 {skipped_count} 个冲突项目，已添加 {len(targets)} 个上传任务"
-            )
+            self._set_status(f"已跳过 {skipped_count} 个冲突项目，已添加 {len(targets)} 个上传任务")
         else:
             self._set_status(f"已添加 {len(targets)} 个上传任务")
         for target in targets:
@@ -4095,9 +4195,7 @@ class MainWindow(_MainWindowBase):
             self._submit_upload_paths((local_path,), run_in_background=run_in_background)
             return
 
-        parent_id = (
-            _parent_id if _parent_id is not None else self.current_directory_id()
-        )
+        parent_id = _parent_id if _parent_id is not None else self.current_directory_id()
         LOGGER.info(
             "main_window.upload.start parent_id=%s file_name_length=%s",
             parent_id,
@@ -4163,19 +4261,13 @@ class MainWindow(_MainWindowBase):
             record_id = self._create_upload_record(
                 local_root,
                 name=root_name if root_name is not None else local_root.name,
-                parent_id=(
-                    _parent_id
-                    if _parent_id is not None
-                    else self.current_directory_id()
-                ),
+                parent_id=(_parent_id if _parent_id is not None else self.current_directory_id()),
             )
             self._folder_prepare_pending.append(
                 PendingFolderUpload(
                     local_path=local_root,
                     parent_id=(
-                        _parent_id
-                        if _parent_id is not None
-                        else self.current_directory_id()
+                        _parent_id if _parent_id is not None else self.current_directory_id()
                     ),
                     root_name=root_name,
                     record_id=record_id,
@@ -4184,9 +4276,7 @@ class MainWindow(_MainWindowBase):
             self._set_status(f"已添加「{local_root.name}」上传任务")
             return
 
-        parent_id = (
-            _parent_id if _parent_id is not None else self.current_directory_id()
-        )
+        parent_id = _parent_id if _parent_id is not None else self.current_directory_id()
         LOGGER.info(
             "main_window.folder_upload.prepare.start parent_id=%s root_name_length=%s",
             parent_id,
@@ -4206,6 +4296,7 @@ class MainWindow(_MainWindowBase):
         thread = QThread(self)
         prepare_cancel = threading.Event()
         if root_name is None:
+
             def operation() -> FolderUploadJob:
                 return file_browser.prepare_folder_upload(
                     parent_id, local_root, cancel_requested=prepare_cancel.is_set
@@ -4215,9 +4306,12 @@ class MainWindow(_MainWindowBase):
 
             def operation() -> FolderUploadJob:
                 return file_browser.prepare_folder_upload(
-                    parent_id, local_root, root_name=resolved_root_name,
+                    parent_id,
+                    local_root,
+                    root_name=resolved_root_name,
                     cancel_requested=prepare_cancel.is_set,
                 )
+
         worker = BrowserOperationWorker(operation)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -4281,9 +4375,7 @@ class MainWindow(_MainWindowBase):
         if self._folder_upload_record_id in self._upload_removal_requested:
             self._finish_folder_upload()
             return
-        LOGGER.warning(
-            "main_window.folder_upload.prepare.failed error_length=%s", len(message)
-        )
+        LOGGER.warning("main_window.folder_upload.prepare.failed error_length=%s", len(message))
         self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
         self._set_status(f"上传文件夹失败：{message}")
         InfoBar.error(title="上传文件夹失败", content=message, parent=self)
@@ -4463,11 +4555,7 @@ class MainWindow(_MainWindowBase):
 
     def prompt_delete_items(self, rows: Sequence[int]) -> None:
         """Confirm and delete one or more displayed rows."""
-        items = [
-            item
-            for row in rows
-            if (item := self._item_at_row(row)) is not None
-        ]
+        items = [item for row in rows if (item := self._item_at_row(row)) is not None]
         if not items:
             return
         if len(items) == 1:
@@ -4499,11 +4587,7 @@ class MainWindow(_MainWindowBase):
         rows = self.selected_rows()
         if row not in rows:
             rows = [row]
-        items = [
-            item
-            for moved_row in rows
-            if (item := self._item_at_row(moved_row)) is not None
-        ]
+        items = [item for moved_row in rows if (item := self._item_at_row(moved_row)) is not None]
         if not items:
             return
 
@@ -4605,9 +4689,7 @@ class MainWindow(_MainWindowBase):
         thread.finished.connect(self._clear_transfer_check)
         self._transfer_check_thread = thread
         self._transfer_check_worker = worker
-        LOGGER.info(
-            "main_window.transfer_check.start count=%s mode=%s", len(items), mode
-        )
+        LOGGER.info("main_window.transfer_check.start count=%s mode=%s", len(items), mode)
         thread.start()
 
     def _on_transfer_check_succeeded(self, result: object) -> None:
@@ -4703,10 +4785,7 @@ class MainWindow(_MainWindowBase):
             folder = Path(folder_text)
         else:
             folder = self._settings.default_download_path
-        paths = [
-            (item, folder / _safe_local_file_name(item.name))
-            for _, item in files
-        ]
+        paths = [(item, folder / _safe_local_file_name(item.name)) for _, item in files]
         self._submit_download_items(paths, automatic=not self._settings.ask_download_location)
 
     def _resolve_automatic_download_path(self, remote_name: str) -> Path | None:
@@ -4849,10 +4928,7 @@ class MainWindow(_MainWindowBase):
 
     def update_operation_controls(self) -> None:
         """Update selection-sensitive operation controls."""
-        can_download = (
-            self._file_browser is not None
-            and bool(self.selected_download_rows())
-        )
+        can_download = self._file_browser is not None and bool(self.selected_download_rows())
         self.file_interface.download_button.setEnabled(can_download)
         can_delete = (
             self._file_browser is not None
@@ -5163,8 +5239,7 @@ class MainWindow(_MainWindowBase):
 
     def _on_upload_cancelled(self, task_id: str) -> None:
         folder_child = task_id in self._folder_upload_child_ids or (
-            self._folder_upload_active is not None
-            and self._folder_upload_active.task_id == task_id
+            self._folder_upload_active is not None and self._folder_upload_active.task_id == task_id
         )
         if folder_child:
             self._folder_upload_cancel_count += 1
@@ -5215,9 +5290,7 @@ class MainWindow(_MainWindowBase):
             self._folder_upload_success_count += 1
             return
         self.refresh_current_directory(
-            after=lambda items, still_current: self._report_upload_visibility(
-                item, still_current
-            )
+            after=lambda items, still_current: self._report_upload_visibility(item, still_current)
         )
 
     def _report_upload_visibility(self, item: WopanItem, still_current: bool) -> None:
@@ -5276,9 +5349,7 @@ class MainWindow(_MainWindowBase):
         )
         for pending_task_id in folder_task_ids:
             if pending_task_id != failed_task_id:
-                self._mark_transfer_failed(
-                    "upload", pending_task_id, "登录已过期，请重新登录"
-                )
+                self._mark_transfer_failed("upload", pending_task_id, "登录已过期，请重新登录")
         self._folder_upload_active = None
         self._folder_upload_queue = []
         self._folder_upload_success_count = 0
@@ -5289,8 +5360,11 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         thread = self.sender()
         task_id = next(
-            (candidate for candidate, candidate_thread in self._upload_threads.items()
-             if candidate_thread is thread),
+            (
+                candidate
+                for candidate, candidate_thread in self._upload_threads.items()
+                if candidate_thread is thread
+            ),
             self._upload_task_id,
         )
         if task_id is not None:
@@ -5318,8 +5392,13 @@ class MainWindow(_MainWindowBase):
         self._start_next_pending_folder()
 
     def _create_download_record(
-        self, item: WopanItem, local_path: Path, *, task_id: str | None = None,
-        status: str = "等待中", error: str = ""
+        self,
+        item: WopanItem,
+        local_path: Path,
+        *,
+        task_id: str | None = None,
+        status: str = "等待中",
+        error: str = "",
     ) -> str:
         task_id = task_id or self._next_transfer_task_id("download")
         record = TransferRecord(
@@ -5348,9 +5427,7 @@ class MainWindow(_MainWindowBase):
         task_id = self._next_transfer_task_id("upload")
         if size is None:
             size = (
-                local_path.stat().st_size
-                if local_path.exists() and local_path.is_file()
-                else None
+                local_path.stat().st_size if local_path.exists() and local_path.is_file() else None
             )
         record = TransferRecord(
             task_id=task_id,
@@ -5451,9 +5528,7 @@ class MainWindow(_MainWindowBase):
         if task_id in self._paused_uploads or record.status not in ACTIVE_UPLOAD_STATUSES:
             return
         self._paused_uploads[task_id] = pending
-        self.transfer_interface.update_record(
-            "upload", task_id, status="已暂停", can_resume=True
-        )
+        self.transfer_interface.update_record("upload", task_id, status="已暂停", can_resume=True)
         self._continue_folder_upload_queue()
         self._start_next_upload_task()
 
@@ -5479,9 +5554,7 @@ class MainWindow(_MainWindowBase):
             if self._folder_upload_active is None:
                 self._start_next_folder_upload_file()
             return
-        self.transfer_interface.update_record(
-            "upload", task_id, status="等待中", can_resume=False
-        )
+        self.transfer_interface.update_record("upload", task_id, status="等待中", can_resume=False)
         self._start_upload_task(
             pending.parent_id,
             pending.local_path,
@@ -5651,13 +5724,13 @@ class MainWindow(_MainWindowBase):
             elif paused is not None:
                 pending_ids.add(child_id)
             pending_ids.update(
-                pending.task_id for pending in self._upload_pending
-                if pending.task_id == child_id
+                pending.task_id for pending in self._upload_pending if pending.task_id == child_id
             )
         active = self._folder_upload_active
         if active is not None:
             pending_ids.update(
-                pending.task_id for pending in self._upload_pending
+                pending.task_id
+                for pending in self._upload_pending
                 if pending.task_id == active.task_id
             )
         self._upload_pending = [
@@ -5943,9 +6016,7 @@ class MainWindow(_MainWindowBase):
         if self._search_keyword is not None:
             breadcrumb = (
                 *breadcrumb,
-                BreadcrumbEntry(
-                    item_id="", name=f"搜索：「{self._search_keyword}」"
-                ),
+                BreadcrumbEntry(item_id="", name=f"搜索：「{self._search_keyword}」"),
             )
         self.file_interface.render_state(tuple(self._items), breadcrumb)
         self.update_operation_controls()

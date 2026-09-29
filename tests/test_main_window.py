@@ -382,7 +382,8 @@ def test_main_window_loads_root_and_enters_child_folder(qapp: QApplication) -> N
 
     window.enter_displayed_folder(0)
 
-    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, "folder-1"]
+    # 进入 folder-1 后树同步会补一次根目录列表（面包屑上一层级）
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, "folder-1", ROOT_DIRECTORY_ID]
     assert window.current_directory_id() == "folder-1"
     assert window.breadcrumb_names() == (ROOT_DISPLAY_NAME, "Folder")
     assert [item.name for item in window.displayed_items()] == ["child.txt"]
