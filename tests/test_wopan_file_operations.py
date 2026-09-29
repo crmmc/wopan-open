@@ -291,6 +291,30 @@ def test_move_many_sends_one_request_with_dir_and_file_lists() -> None:
     ]
 
 
+def test_copy_many_sends_one_request_with_dir_and_file_lists() -> None:
+    client, captured = _client_and_captured_params([_success_response("")])
+
+    client.copy_many(
+        [("file-1", WopanItemKind.FILE), ("folder-1", WopanItemKind.FOLDER)],
+        "folder-2",
+    )
+
+    assert captured == [
+        (
+            "CopyFile",
+            {
+                "targetDirId": "folder-2",
+                "sourceType": "0",
+                "targetType": "0",
+                "dirList": ["folder-1"],
+                "fileList": ["file-1"],
+                "secret": False,
+                "clientId": "1001000021",
+            },
+        )
+    ]
+
+
 def test_upload_file_gets_zone_and_posts_single_part(tmp_path: Path) -> None:
     local_file = tmp_path / "report.txt"
     local_file.write_bytes(b"upload-content")
@@ -710,6 +734,17 @@ def test_get_download_info_rejects_malformed_response(data: object, match: str) 
         ),
         (
             lambda client: client.move_many([("", WopanItemKind.FILE)], "0"),
+            "item_id",
+        ),
+        (lambda client: client.copy("", WopanItemKind.FILE, "0"), "item_id"),
+        (lambda client: client.copy("item-1", WopanItemKind.FILE, ""), "target_parent_id"),
+        (lambda client: client.copy_many([], "0"), "items"),
+        (
+            lambda client: client.copy_many([("item-1", WopanItemKind.FILE)], ""),
+            "target_parent_id",
+        ),
+        (
+            lambda client: client.copy_many([("", WopanItemKind.FILE)], "0"),
             "item_id",
         ),
         (lambda client: client.upload_file("", Path("report.txt")), "parent_id"),

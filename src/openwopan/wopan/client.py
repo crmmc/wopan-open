@@ -476,6 +476,50 @@ class WopanClient:
             target_parent_id,
         )
 
+    def copy(self, item_id: str, kind: WopanItemKind, target_parent_id: str) -> None:
+        """Copy a file or folder to another parent directory."""
+        self.copy_many([(item_id, kind)], target_parent_id)
+
+    def copy_many(
+        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
+    ) -> None:
+        """Copy one or more files and folders in a single request."""
+        if not target_parent_id:
+            raise ValueError("target_parent_id must not be empty")
+        if not items:
+            raise ValueError("items must not be empty")
+        for item_id, _kind in items:
+            if not item_id:
+                raise ValueError("item_id must not be empty")
+
+        dir_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FOLDER]
+        file_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FILE]
+
+        LOGGER.info(
+            "wopan.copy_many.start folders=%s files=%s target_parent_id=%s",
+            len(dir_ids),
+            len(file_ids),
+            target_parent_id,
+        )
+        self._dispatch_wohome(
+            "CopyFile",
+            {
+                "targetDirId": target_parent_id,
+                "sourceType": PERSONAL_SPACE_TYPE,
+                "targetType": PERSONAL_SPACE_TYPE,
+                "dirList": dir_ids,
+                "fileList": file_ids,
+                "secret": False,
+                "clientId": CLIENT_ID,
+            },
+        )
+        LOGGER.info(
+            "wopan.copy_many.success folders=%s files=%s target_parent_id=%s",
+            len(dir_ids),
+            len(file_ids),
+            target_parent_id,
+        )
+
     def upload_file(
         self,
         parent_id: str,

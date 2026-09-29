@@ -82,6 +82,7 @@ from openwopan.app.file_browser import (
     FileBrowserError,
     FileBrowserLoginRequiredError,
     FileBrowserUploadCancelledError,
+    plan_transfer_batch,
 )
 from openwopan.app.logging_config import app_log_path, set_logging_level
 from openwopan.auth.session import AuthSession
@@ -99,6 +100,13 @@ from openwopan.tasks.upload import (
     format_upload_summary,
     resolve_upload_targets,
     scan_upload_inputs,
+)
+from openwopan.ui.target_folder_dialog import (
+    TargetEntry,
+    TargetFolderDialog,
+    TransferConflictDialog,
+    TransferMode,
+    mode_label,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
@@ -231,69 +239,6 @@ class NameInputDialog(QDialog):
     def _accept_if_valid(self) -> None:
         if self.name_text():
             self.accept()
-
-
-class MoveTargetDialog(QDialog):
-    """Fluent-style dialog for choosing a known move target."""
-
-    def __init__(
-        self,
-        entries: list[BreadcrumbEntry],
-        *,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._entries = entries
-        self._selected_index: int | None = None
-        self.setWindowTitle("移动到")
-        self.resize(420, 420)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(12)
-
-        title_label = BodyLabel("移动到", self)
-        layout.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignCenter)
-        hint_label = BodyLabel("选择目标文件夹", self)
-        layout.addWidget(hint_label, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        self._target_tree = TreeWidget(self)
-        self._target_tree.setHeaderHidden(True)
-        for index, entry in enumerate(entries):
-            tree_item = QTreeWidgetItem([entry.name])
-            tree_item.setIcon(0, FIF.FOLDER.icon())
-            tree_item.setData(0, Qt.ItemDataRole.UserRole, index)
-            self._target_tree.addTopLevelItem(tree_item)
-        self._target_tree.itemClicked.connect(self._on_item_clicked)
-        layout.addWidget(self._target_tree, 1)
-
-        button_layout = QHBoxLayout()
-        button_layout.addStretch(1)
-        cancel_button = PushButton("取消", self)
-        cancel_button.setMinimumWidth(96)
-        cancel_button.clicked.connect(self.reject)
-        self._ok_button = PrimaryPushButton("移动到此", self)
-        self._ok_button.setMinimumWidth(96)
-        self._ok_button.setEnabled(False)
-        self._ok_button.clicked.connect(self.accept)
-        button_layout.addWidget(cancel_button)
-        button_layout.addWidget(self._ok_button)
-        layout.addLayout(button_layout)
-
-    def selected_entry(self) -> BreadcrumbEntry | None:
-        """Return the selected target entry."""
-        if self._selected_index is None:
-            return None
-        return self._entries[self._selected_index]
-
-    def _on_item_clicked(self, item: QTreeWidgetItem) -> None:
-        index = item.data(0, Qt.ItemDataRole.UserRole)
-        if not isinstance(index, int):
-            return
-        self._selected_index = index
-        self._ok_button.setEnabled(True)
-        self._ok_button.setText(f"移动到「{self._entries[index].name}」")
 
 
 class BrowserOperationWorker(QObject):
@@ -2477,6 +2422,14 @@ class MainWindow(_MainWindowBase):
         self._delete_worker: BrowserOperationWorker | None = None
         self._move_thread: QThread | None = None
         self._move_worker: BrowserOperationWorker | None = None
+        self._copy_thread: QThread | None = None
+        self._copy_worker: BrowserOperationWorker | None = None
+        self._target_dialog: TargetFolderDialog | None = None
+        self._target_load_thread: QThread | None = None
+        self._target_load_worker: BrowserOperationWorker | None = None
+        self._transfer_check_thread: QThread | None = None
+        self._transfer_check_worker: BrowserOperationWorker | None = None
+        self._transfer_pending: tuple[tuple[WopanItem, ...], str, TransferMode] | None = None
         self._usage_thread: QThread | None = None
         self._usage_worker: BrowserOperationWorker | None = None
         self._download_thread: QThread | None = None
@@ -2645,6 +2598,9 @@ class MainWindow(_MainWindowBase):
             (self._rename_thread, "rename", None),
             (self._delete_thread, "delete", None),
             (self._move_thread, "move", None),
+            (self._copy_thread, "copy", None),
+            (self._target_load_thread, "target_load", None),
+            (self._transfer_check_thread, "transfer_check", None),
             (self._usage_thread, "usage", None),
             (self._download_thread, "download", None),
             (self._download_target_thread, "download_target", None),
@@ -3325,17 +3281,36 @@ class MainWindow(_MainWindowBase):
             self._set_status("目标文件夹不能为空")
             InfoBar.warning(title="移动", content="目标文件夹不能为空", parent=self)
             return
-        if self._file_browser is None:
+        self._start_move_batch(tuple(items), target_id)
+
+    def copy_displayed_items(self, rows: Sequence[int], target_parent_id: str) -> None:
+        """Copy one or more displayed rows in a single batch request."""
+        items = [
+            item
+            for row in rows
+            if (item := self._item_at_row(row)) is not None
+        ]
+        if not items:
+            return
+        target_id = target_parent_id.strip()
+        if not target_id:
+            self._set_status("目标文件夹不能为空")
+            InfoBar.warning(title="复制", content="目标文件夹不能为空", parent=self)
+            return
+        self._start_copy_batch(tuple(items), target_id)
+
+    def _start_move_batch(self, items: tuple[WopanItem, ...], target_id: str) -> None:
+        file_browser = self._file_browser
+        if file_browser is None:
             self._set_status("请先登录")
             return
 
         if self._move_thread is not None:
             LOGGER.debug("main_window.move.skipped_busy")
             return
-        file_browser = self._file_browser
-        batch = tuple(items)
+        self._set_status(f"正在移动 {len(items)} 个项目…")
         thread = QThread(self)
-        worker = BrowserOperationWorker(lambda: file_browser.move_items(batch, target_id))
+        worker = BrowserOperationWorker(lambda: file_browser.move_items(items, target_id))
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._on_move_succeeded)
@@ -3347,6 +3322,31 @@ class MainWindow(_MainWindowBase):
         thread.finished.connect(self._clear_move)
         self._move_thread = thread
         self._move_worker = worker
+        thread.start()
+
+    def _start_copy_batch(self, items: tuple[WopanItem, ...], target_id: str) -> None:
+        file_browser = self._file_browser
+        if file_browser is None:
+            self._set_status("请先登录")
+            return
+
+        if self._copy_thread is not None:
+            LOGGER.debug("main_window.copy.skipped_busy")
+            return
+        self._set_status(f"正在复制 {len(items)} 个项目…")
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.copy_items(items, target_id))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_copy_succeeded)
+        worker.failed.connect(self._on_copy_failed)
+        worker.login_required.connect(self._on_copy_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(self._clear_copy)
+        self._copy_thread = thread
+        self._copy_worker = worker
         thread.start()
 
     def _on_move_succeeded(self, result: object) -> None:
@@ -3363,6 +3363,22 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._move_thread = None
         self._move_worker = None
+
+    def _on_copy_succeeded(self, result: object) -> None:
+        self.refresh_current_directory()
+        InfoBar.success(title="复制", content="复制完成", parent=self)
+
+    def _on_copy_failed(self, message: str) -> None:
+        self._set_status(f"复制失败：{message}")
+        InfoBar.error(title="复制失败", content=message, parent=self)
+
+    def _on_copy_login_required(self, message: str) -> None:
+        self._show_login_required_error(message)
+
+    def _clear_copy(self) -> None:
+        self._delete_finished_thread()
+        self._copy_thread = None
+        self._copy_worker = None
 
     def download_displayed_item(
         self, row: int, local_path: Path, *, run_in_background: bool = True
@@ -4333,6 +4349,17 @@ class MainWindow(_MainWindowBase):
 
     def prompt_move_item(self, row: int) -> None:
         """Prompt for a target directory and move a row (or the full selection)."""
+        self._prompt_transfer_target(row, "move")
+
+    def prompt_copy_item(self, row: int) -> None:
+        """Prompt for a target directory and copy a row (or the full selection)."""
+        self._prompt_transfer_target(row, "copy")
+
+    def _prompt_transfer_target(self, row: int, mode: TransferMode) -> None:
+        """Open the browsing target dialog for a move/copy batch."""
+        if self._file_browser is None:
+            self._set_status("请先登录")
+            return
         rows = self.selected_rows()
         if row not in rows:
             rows = [row]
@@ -4344,24 +4371,166 @@ class MainWindow(_MainWindowBase):
         if not items:
             return
 
-        selected_ids = {item.item_id for item in items}
-        target_entries = [*self._breadcrumb[:-1]]
-        target_entries.extend(
-            BreadcrumbEntry(item_id=folder.item_id, name=folder.name)
-            for folder in self._items
-            if folder.kind is WopanItemKind.FOLDER and folder.item_id not in selected_ids
+        selected_ids = frozenset(item.item_id for item in items)
+        root_entry = self._breadcrumb[0]
+        dialog = TargetFolderDialog(
+            mode,
+            TargetEntry(item_id=root_entry.item_id, name=root_entry.name),
+            [],
+            excluded_ids=selected_ids,
+            parent=self,
         )
-        if not target_entries:
-            self._set_status("没有可用的目标文件夹")
-            InfoBar.warning(title="移动", content="没有可用的目标文件夹", parent=self)
-            return
-
-        dialog = MoveTargetDialog(target_entries, parent=self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            selected_entry = dialog.selected_entry()
-            if selected_entry is not None:
-                self.move_displayed_items(rows, selected_entry.item_id)
+        dialog.directory_requested.connect(self._on_target_directory_requested)
+        self._target_dialog = dialog
+        dialog.start_browse()
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        target = dialog.current_target() if accepted else None
         dialog.deleteLater()
+        self._target_dialog = None
+        if target is None:
+            return
+        self._check_transfer_conflicts(tuple(items), target.item_id, mode)
+
+    def _on_target_directory_requested(self, parent_id: str) -> None:
+        """Fetch one directory level for the open target dialog."""
+        if self._target_dialog is None or self._target_load_thread is not None:
+            LOGGER.debug("main_window.target_load.skipped")
+            return
+        file_browser = self._file_browser
+        if file_browser is None:
+            return
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.list_directory(parent_id))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_target_directory_loaded)
+        worker.failed.connect(self._on_target_directory_load_failed)
+        worker.login_required.connect(self._on_target_directory_load_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(self._clear_target_directory_load)
+        self._target_load_thread = thread
+        self._target_load_worker = worker
+        thread.start()
+
+    def _on_target_directory_loaded(self, result: object) -> None:
+        if self._closing:
+            return
+        dialog = self._target_dialog
+        if dialog is None or not isinstance(result, list):
+            return
+        entries = [
+            TargetEntry(item_id=item.item_id, name=item.name)
+            for item in result
+            if isinstance(item, WopanItem) and item.kind is WopanItemKind.FOLDER
+        ]
+        dialog.show_entries(entries)
+
+    def _on_target_directory_load_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        if self._target_dialog is not None:
+            self._target_dialog.show_load_error(message)
+
+    def _on_target_directory_load_login_required(self, message: str) -> None:
+        if self._target_dialog is not None:
+            self._target_dialog.reject()
+        self._show_login_required_error(message)
+
+    def _clear_target_directory_load(self) -> None:
+        self._delete_finished_thread()
+        self._target_load_thread = None
+        self._target_load_worker = None
+
+    def _check_transfer_conflicts(
+        self, items: tuple[WopanItem, ...], target_id: str, mode: TransferMode
+    ) -> None:
+        """List the target directory once, then resolve or execute the batch."""
+        if self._transfer_check_thread is not None:
+            LOGGER.debug("main_window.transfer_check.skipped_busy")
+            return
+        file_browser = self._file_browser
+        if file_browser is None:
+            self._set_status("请先登录")
+            return
+        self._transfer_pending = (items, target_id, mode)
+        self._set_status("正在检查目标文件夹…")
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.list_directory(target_id))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_transfer_check_succeeded)
+        worker.failed.connect(self._on_transfer_check_failed)
+        worker.login_required.connect(self._on_transfer_check_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(self._clear_transfer_check)
+        self._transfer_check_thread = thread
+        self._transfer_check_worker = worker
+        LOGGER.info(
+            "main_window.transfer_check.start count=%s mode=%s", len(items), mode
+        )
+        thread.start()
+
+    def _on_transfer_check_succeeded(self, result: object) -> None:
+        if self._closing:
+            return
+        request = self._transfer_pending
+        self._transfer_pending = None
+        if request is None or not isinstance(result, list):
+            self._on_transfer_check_failed("目标文件夹检查结果无效")
+            return
+        if not all(isinstance(item, WopanItem) for item in result):
+            self._on_transfer_check_failed("目标文件夹检查结果无效")
+            return
+        items, target_id, mode = request
+        verb = mode_label(mode)
+        plan = plan_transfer_batch(items, result)
+        LOGGER.info(
+            "main_window.transfer_check.success transferable=%s conflicts=%s noops=%s",
+            len(plan.transfer_items),
+            len(plan.conflict_names),
+            len(plan.noop_ids),
+        )
+        if plan.conflict_names:
+            dialog = TransferConflictDialog(plan.conflict_names, mode, parent=self)
+            dialog.exec()
+            resolution = dialog.resolution()
+            dialog.deleteLater()
+            if resolution != "skip":
+                self._set_status(f"已取消{verb}")
+                return
+        if not plan.transfer_items:
+            self._set_status(f"没有可{verb}的项目")
+            InfoBar.info(title=verb, content="没有可执行的项目", parent=self)
+            return
+        self._execute_transfer(plan.transfer_items, target_id, mode)
+
+    def _on_transfer_check_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        LOGGER.warning("main_window.transfer_check.failed error_length=%s", len(message))
+        self._set_status(f"检查目标文件夹失败：{message}")
+        InfoBar.error(title="检查目标文件夹失败", content=message, parent=self)
+
+    def _on_transfer_check_login_required(self, message: str) -> None:
+        self._show_login_required_error(message)
+
+    def _clear_transfer_check(self) -> None:
+        self._delete_finished_thread()
+        self._transfer_check_thread = None
+        self._transfer_check_worker = None
+        self._transfer_pending = None
+
+    def _execute_transfer(
+        self, items: tuple[WopanItem, ...], target_id: str, mode: TransferMode
+    ) -> None:
+        if mode == "move":
+            self._start_move_batch(items, target_id)
+        else:
+            self._start_copy_batch(items, target_id)
 
     def prompt_download_item(self, row: int) -> None:
         """Prompt for one save path or a directory for the selected files."""
@@ -4488,6 +4657,7 @@ class MainWindow(_MainWindowBase):
                 menu.addAction(download_action)
             menu.addAction("重命名", lambda: self.prompt_rename_item(row))
             menu.addAction("移动", lambda: self.prompt_move_item(row))
+            menu.addAction("复制", lambda: self.prompt_copy_item(row))
             menu.addAction("删除", lambda: self.prompt_delete_item(row))
         viewport = table.viewport()
         if viewport is None:  # pragma: no cover - docs/testing-exemptions.md
