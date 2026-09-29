@@ -4,7 +4,12 @@ from importlib.metadata import PackageNotFoundError, version
 import pytest
 
 from openwopan import __version__
-from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import (
+    WopanCloudUsage,
+    WopanItem,
+    WopanItemKind,
+    WopanRecycleItem,
+)
 
 
 def test_package_version_is_available() -> None:
@@ -75,3 +80,42 @@ def test_wopan_cloud_usage_validates_byte_counts() -> None:
 
     with pytest.raises(ValueError, match="total_bytes"):
         WopanCloudUsage(used_bytes=0, total_bytes=0)
+
+
+def test_wopan_recycle_item_uses_openwopan_fields() -> None:
+    item = WopanRecycleItem(
+        delete_no="d-1",
+        item_id="item-1",
+        name="report.txt",
+        kind=WopanItemKind.FILE,
+        size=2048,
+        keep_days=30,
+        file_type="4",
+    )
+
+    assert item.delete_no == "d-1"
+    assert item.item_id == "item-1"
+    assert item.kind is WopanItemKind.FILE
+    assert item.size == 2048
+    assert item.keep_days == 30
+    assert item.file_type == "4"
+
+
+def test_wopan_recycle_item_requires_delete_no_and_name() -> None:
+    with pytest.raises(ValueError, match="delete_no"):
+        WopanRecycleItem(delete_no="", item_id="i", name="n", kind=WopanItemKind.FILE)
+
+    with pytest.raises(ValueError, match="name"):
+        WopanRecycleItem(delete_no="d", item_id="i", name="", kind=WopanItemKind.FILE)
+
+
+def test_wopan_recycle_item_rejects_negative_size_and_keep_days() -> None:
+    with pytest.raises(ValueError, match="size"):
+        WopanRecycleItem(
+            delete_no="d", item_id="i", name="n", kind=WopanItemKind.FILE, size=-1
+        )
+
+    with pytest.raises(ValueError, match="keep_days"):
+        WopanRecycleItem(
+            delete_no="d", item_id="i", name="n", kind=WopanItemKind.FILE, keep_days=-1
+        )

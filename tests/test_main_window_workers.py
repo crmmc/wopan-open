@@ -58,7 +58,7 @@ from openwopan.ui.main_window import (
     UploadWorker,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
-from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, WopanRecycleItem
 
 
 def _static_exec_result(result: object) -> Callable[..., object]:
@@ -160,6 +160,11 @@ class WorkerFileBrowser:
         self.directory_paths: dict[str, list[tuple[str, str]]] = {}
         self.removed_download_records: list[str] = []
         self.update_settings_calls: list[AppSettings] = []
+        self.listed_recycle_bin = False
+        self.recycle_items: list[WopanRecycleItem] = []
+        self.restored_delete_nos: list[tuple[str, ...]] = []
+        self.purged_delete_nos: list[tuple[str, ...]] = []
+        self.emptied_recycle_bin = False
         self.items_by_parent = {
             ROOT_DIRECTORY_ID: _root_items(),
             "folder-1": [
@@ -233,6 +238,19 @@ class WorkerFileBrowser:
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         return WopanCloudUsage(used_bytes=1, total_bytes=2)
+
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        self.listed_recycle_bin = True
+        return list(self.recycle_items)
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        self.restored_delete_nos.append(tuple(delete_nos))
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        self.purged_delete_nos.append(tuple(delete_nos))
+
+    def empty_recycle_bin(self) -> None:
+        self.emptied_recycle_bin = True
 
     def upload_file(
         self,
@@ -1272,6 +1290,8 @@ def test_finished_thread_is_deleted_by_gui_cleanup(
         "move",
         "usage",
         "folder_upload",
+        "recycle_list",
+        "recycle_action",
     ],
 )
 def test_close_window_logs_timeout_and_accepts_close(
@@ -2216,7 +2236,7 @@ def test_prompt_delete_items_batches_all_selected_rows(
     assert stub_message_box.instances[0].title == "确认删除"
     assert (
         stub_message_box.instances[0].content
-        == "确定要删除 2 个对象（Folder、report.txt）吗？此操作不可恢复。"
+        == "确定要删除 2 个对象（Folder、report.txt）吗？删除后将移入回收站，可在回收站中恢复。"
     )
     assert window.displayed_items() == ()
 
@@ -2248,7 +2268,7 @@ def test_prompt_delete_item_outside_selection_deletes_only_clicked_row(
     window.prompt_delete_item(1)
 
     assert stub_message_box.instances[0].content == (
-        "确定要删除「report.txt」吗？此操作不可恢复。"
+        "确定要删除「report.txt」吗？删除后将移入回收站，可在回收站中恢复。"
     )
     assert [item.name for item in window.displayed_items()] == ["Folder"]
 
@@ -2371,7 +2391,8 @@ def test_prompt_delete_items_previews_first_three_names(
     window.prompt_delete_item(0)
 
     assert stub_message_box.instances[0].content == (
-        "确定要删除 5 个对象（Folder、report.txt、notes-2.txt 等）吗？此操作不可恢复。"
+        "确定要删除 5 个对象（Folder、report.txt、notes-2.txt 等）吗？"
+        "删除后将移入回收站，可在回收站中恢复。"
     )
     assert window.displayed_items() == ()
 

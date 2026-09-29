@@ -37,7 +37,13 @@ from openwopan.wopan.errors import (
     WopanBusinessError,
     WopanUploadCancelledError,
 )
-from openwopan.wopan.models import DownloadInfo, WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import (
+    DownloadInfo,
+    WopanCloudUsage,
+    WopanItem,
+    WopanItemKind,
+    WopanRecycleItem,
+)
 
 
 class FakeClient:
@@ -57,6 +63,10 @@ class FakeClient:
         self.uploaded_files: list[tuple[str, Path]] = []
         self.upload_kwargs: list[dict[str, object]] = []
         self.usage_account_ids: list[str] = []
+        self.listed_recycle_bin = False
+        self.restored_delete_nos: list[tuple[str, ...]] = []
+        self.purged_delete_nos: list[tuple[str, ...]] = []
+        self.emptied_recycle_bin = False
 
     def list_files(self, parent_id: str) -> list[WopanItem]:
         self.requested_parent_ids.append(parent_id)
@@ -162,6 +172,35 @@ class FakeClient:
         if self.error is not None:
             raise self.error
         return WopanCloudUsage(used_bytes=1024, total_bytes=2048)
+
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        self.listed_recycle_bin = True
+        if self.error is not None:
+            raise self.error
+        return [
+            WopanRecycleItem(
+                delete_no="d-1",
+                item_id="item-1",
+                name="report.txt",
+                kind=WopanItemKind.FILE,
+                keep_days=30,
+            )
+        ]
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        self.restored_delete_nos.append(tuple(delete_nos))
+        if self.error is not None:
+            raise self.error
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        self.purged_delete_nos.append(tuple(delete_nos))
+        if self.error is not None:
+            raise self.error
+
+    def empty_recycle_bin(self) -> None:
+        self.emptied_recycle_bin = True
+        if self.error is not None:
+            raise self.error
 
 
 def test_file_browser_service_returns_openwopan_items() -> None:
@@ -691,6 +730,46 @@ def test_file_browser_service_returns_cloud_usage() -> None:
     assert client.usage_account_ids == ["13800138000"]
     assert usage.used_bytes == 1024
     assert usage.total_bytes == 2048
+
+
+def test_file_browser_service_lists_recycle_items() -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    items = service.list_recycle_items()
+
+    assert client.listed_recycle_bin is True
+    assert [item.delete_no for item in items] == ["d-1"]
+    assert items[0].keep_days == 30
+
+
+def test_file_browser_service_forwards_recycle_mutations() -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    service.restore_recycle_items(["d-1", "d-2"])
+    service.purge_recycle_items(["d-3"])
+    service.empty_recycle_bin()
+
+    assert client.restored_delete_nos == [("d-1", "d-2")]
+    assert client.purged_delete_nos == [("d-3",)]
+    assert client.emptied_recycle_bin is True
+
+
+def test_file_browser_service_maps_recycle_login_expiry() -> None:
+    client = FakeClient(WopanAuthenticationError("expired"))
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserLoginRequiredError, match="重新登录"):
+        service.list_recycle_items()
+
+
+def test_file_browser_service_maps_recycle_protocol_errors() -> None:
+    client = FakeClient(WopanBusinessError("9999", "failed"))
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserError, match="failed"):
+        service.purge_recycle_items(["d-1"])
 
 
 @pytest.mark.parametrize(

@@ -59,6 +59,7 @@ from openwopan.wopan.models import (
     WopanCloudUsage,
     WopanItem,
     WopanItemKind,
+    WopanRecycleItem,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -213,6 +214,18 @@ class FileBrowserBackend(Protocol):
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""
+
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        """Return recycle-bin entries."""
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        """Restore recycle-bin entries to their original locations."""
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        """Permanently delete recycle-bin entries."""
+
+    def empty_recycle_bin(self) -> None:
+        """Permanently delete every recycle-bin entry."""
 
 
 class FileBrowserService:
@@ -929,6 +942,31 @@ class FileBrowserService:
             usage.total_bytes,
         )
         return usage
+
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        """List recycle-bin entries and map authentication failures to UI state."""
+        LOGGER.info("file_browser.list_recycle_items.start")
+        items = self._call(lambda: self._client.list_recycle_items())
+        LOGGER.info("file_browser.list_recycle_items.success item_count=%s", len(items))
+        return items
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        """Restore one or more recycle-bin entries to their original locations."""
+        LOGGER.info("file_browser.restore_recycle_items.start count=%s", len(delete_nos))
+        self._call(lambda: self._client.restore_recycle_items(delete_nos))
+        LOGGER.info("file_browser.restore_recycle_items.success count=%s", len(delete_nos))
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        """Permanently delete one or more recycle-bin entries."""
+        LOGGER.info("file_browser.purge_recycle_items.start count=%s", len(delete_nos))
+        self._call(lambda: self._client.purge_recycle_items(delete_nos))
+        LOGGER.info("file_browser.purge_recycle_items.success count=%s", len(delete_nos))
+
+    def empty_recycle_bin(self) -> None:
+        """Permanently delete every recycle-bin entry."""
+        LOGGER.info("file_browser.empty_recycle_bin.start")
+        self._call(lambda: self._client.empty_recycle_bin())
+        LOGGER.info("file_browser.empty_recycle_bin.success")
 
     def _call[T](self, action: Callable[[], T]) -> T:
         """Map protocol errors to UI-facing file browser errors."""

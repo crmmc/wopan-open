@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 from conftest import SyncQThread
 from PySide6.QtWidgets import QApplication
@@ -16,7 +18,7 @@ from openwopan.ui.search_window import (
     SearchResultsWindow,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
-from openwopan.wopan.models import WopanItem, WopanItemKind
+from openwopan.wopan.models import WopanItem, WopanItemKind, WopanRecycleItem
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +77,18 @@ class _MainBrowser:
     def resolve_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
         self.resolved_directory_ids.append(directory_id)
         return list(self.directory_paths.get(directory_id, []))
+
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        return []
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        pass
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        pass
+
+    def empty_recycle_bin(self) -> None:
+        pass
 
 
 class _FakeSearchBackend:

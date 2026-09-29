@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from openwopan.wopan.models import WopanItemKind
 
 
@@ -33,3 +35,24 @@ def format_bytes(size: int) -> str:
     if unit == "B":
         return f"{int(value)} {unit}"
     return f"{value:.1f} {unit}"
+
+
+def format_kind(kind: WopanItemKind) -> str:
+    """Format an item kind for display."""
+    if kind is WopanItemKind.FOLDER:
+        return "文件夹"
+    return "文件"
+
+
+def format_items_summary(names: Sequence[str]) -> str:
+    """Summarize item names for a confirmation prompt.
+
+    Single item renders as 「name」; multiple items render as
+    `` N 个对象（preview）`` with at most three previewed names.
+    """
+    if len(names) == 1:
+        return f"「{names[0]}」"
+    preview = "、".join(names[:3])
+    if len(names) > 3:
+        preview += " 等"
+    return f" {len(names)} 个对象（{preview}）"

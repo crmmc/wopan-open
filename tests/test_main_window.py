@@ -20,7 +20,7 @@ from openwopan.ui.main_window import (
     MainWindow,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
-from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, WopanRecycleItem
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +39,11 @@ class FakeFileBrowser:
         self.downloaded_items: list[tuple[str, Path]] = []
         self.uploaded_files: list[tuple[str, Path]] = []
         self.usage_account_ids: list[str] = []
+        self.listed_recycle_bin = False
+        self.recycle_items: list[WopanRecycleItem] = []
+        self.restored_delete_nos: list[tuple[str, ...]] = []
+        self.purged_delete_nos: list[tuple[str, ...]] = []
+        self.emptied_recycle_bin = False
         self.items_by_parent = {
             ROOT_DIRECTORY_ID: [
                 WopanItem(
@@ -161,6 +166,19 @@ class FakeFileBrowser:
         self.usage_account_ids.append(account_id)
         return WopanCloudUsage(used_bytes=1024, total_bytes=2048)
 
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        self.listed_recycle_bin = True
+        return list(self.recycle_items)
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        self.restored_delete_nos.append(tuple(delete_nos))
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        self.purged_delete_nos.append(tuple(delete_nos))
+
+    def empty_recycle_bin(self) -> None:
+        self.emptied_recycle_bin = True
+
 
 class LoginExpiredFileBrowser:
     def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
@@ -208,6 +226,18 @@ class LoginExpiredFileBrowser:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def empty_recycle_bin(self) -> None:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
 

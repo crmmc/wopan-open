@@ -102,8 +102,11 @@ from openwopan.tasks.upload import (
     scan_upload_inputs,
 )
 from openwopan.ui.formatting import format_bytes as _format_bytes
+from openwopan.ui.formatting import format_items_summary as _format_items_summary
+from openwopan.ui.formatting import format_kind as _format_kind
 from openwopan.ui.formatting import format_optional_bytes as _format_optional_bytes
 from openwopan.ui.formatting import format_size as _format_size
+from openwopan.ui.recycle_interface import RecycleInterface
 from openwopan.ui.search_window import SearchResultsWindow
 from openwopan.ui.target_folder_dialog import (
     TargetEntry,
@@ -113,7 +116,7 @@ from openwopan.ui.target_folder_dialog import (
     mode_label,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
-from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, WopanRecycleItem
 
 MAIN_WINDOW_DEFAULT_SIZE = (900, 600)
 MAIN_WINDOW_MINIMUM_SIZE = (800, 600)
@@ -2470,6 +2473,10 @@ class MainWindow(_MainWindowBase):
         self._tree_sync_worker: BrowserOperationWorker | None = None
         self._copy_thread: QThread | None = None
         self._copy_worker: BrowserOperationWorker | None = None
+        self._recycle_list_thread: QThread | None = None
+        self._recycle_list_worker: BrowserOperationWorker | None = None
+        self._recycle_action_thread: QThread | None = None
+        self._recycle_action_worker: BrowserOperationWorker | None = None
         self._target_dialog: TargetFolderDialog | None = None
         self._target_load_thread: QThread | None = None
         self._target_load_worker: BrowserOperationWorker | None = None
@@ -2581,6 +2588,11 @@ class MainWindow(_MainWindowBase):
         self.transfer_interface.pause_downloads_requested.connect(self._pause_selected_downloads)
         self.transfer_interface.resume_downloads_requested.connect(self._resume_selected_downloads)
         self.transfer_interface.retry_upload_requested.connect(self._retry_selected_uploads)
+        self.recycle_interface = RecycleInterface(self)
+        self.recycle_interface.refresh_requested.connect(self.refresh_recycle_items)
+        self.recycle_interface.restore_requested.connect(self._restore_recycle_items)
+        self.recycle_interface.purge_requested.connect(self._purge_recycle_items)
+        self.recycle_interface.empty_requested.connect(self._empty_recycle_bin)
         self._download_event_signal.connect(self._on_download_event)
 
         self._stacked_widget: QStackedWidget | None = None
@@ -2644,6 +2656,8 @@ class MainWindow(_MainWindowBase):
             (self._move_thread, "move", None),
             (self._tree_sync_thread, "tree_sync", None),
             (self._copy_thread, "copy", None),
+            (self._recycle_list_thread, "recycle_list", None),
+            (self._recycle_action_thread, "recycle_action", None),
             (self._target_load_thread, "target_load", None),
             (self._transfer_check_thread, "transfer_check", None),
             (self._usage_thread, "usage", None),
@@ -2747,6 +2761,7 @@ class MainWindow(_MainWindowBase):
             nav.setMenuButtonVisible(False)
             self._add_sub_interface(self.file_interface, "files", FIF.FOLDER, "文件")
             self._add_sub_interface(self.transfer_interface, "transfers", FIF.SYNC, "传输")
+            self._add_sub_interface(self.recycle_interface, "recycle", FIF.DELETE, "回收站")
             self._add_sub_interface(
                 self.account_interface,
                 "account",
@@ -2763,6 +2778,7 @@ class MainWindow(_MainWindowBase):
             )
             self.stackedWidget.setCurrentWidget(self.file_interface)
             self.navigationInterface.setCurrentItem("files")
+            self.stackedWidget.currentChanged.connect(self._on_navigation_page_changed)
             return
 
         self._stacked_widget = QStackedWidget(self)
@@ -2776,6 +2792,7 @@ class MainWindow(_MainWindowBase):
         self._navigation_interface.setMinimumExpandWidth(0)
         self._add_sub_interface(self.file_interface, "files", FIF.FOLDER, "文件")
         self._add_sub_interface(self.transfer_interface, "transfers", FIF.SYNC, "传输")
+        self._add_sub_interface(self.recycle_interface, "recycle", FIF.DELETE, "回收站")
         self._add_sub_interface(
             self.account_interface,
             "account",
@@ -2800,6 +2817,12 @@ class MainWindow(_MainWindowBase):
         self.setCentralWidget(central)
         self._navigation_interface.setCurrentItem("files")
         self._stacked_widget.setCurrentWidget(self.file_interface)
+        self._stacked_widget.currentChanged.connect(self._on_navigation_page_changed)
+
+    def _on_navigation_page_changed(self, _index: int) -> None:
+        """Reload the recycle bin when its page becomes the visible page."""
+        if not self.recycle_interface.isHidden():
+            self.refresh_recycle_items()
 
     def _switch_to_interface(self, widget: QWidget, route_key: str) -> None:
         if self._stacked_widget is None or self._navigation_interface is None:
@@ -3575,6 +3598,143 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._copy_thread = None
         self._copy_worker = None
+
+    def refresh_recycle_items(self) -> None:
+        """Load recycle-bin entries on a worker thread."""
+        if self._file_browser is None:
+            self._set_status("请先登录")
+            return
+        if self._recycle_list_thread is not None:
+            LOGGER.debug("main_window.recycle_list.skipped_busy")
+            return
+        file_browser = self._file_browser
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.list_recycle_items())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_recycle_list_succeeded)
+        worker.failed.connect(self._on_recycle_list_failed)
+        worker.login_required.connect(self._on_recycle_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(self._clear_recycle_list)
+        self._recycle_list_thread = thread
+        self._recycle_list_worker = worker
+        thread.start()
+
+    def _on_recycle_list_succeeded(self, result: object) -> None:
+        items = cast("list[WopanRecycleItem]", result)
+        LOGGER.info("main_window.recycle_list.success item_count=%s", len(items))
+        self.recycle_interface.render_items(items)
+
+    def _on_recycle_list_failed(self, message: str) -> None:
+        self._set_status(f"回收站加载失败：{message}")
+        InfoBar.error(title="回收站加载失败", content=message, parent=self)
+
+    def _on_recycle_login_required(self, message: str) -> None:
+        self._show_login_required_error(message)
+
+    def _clear_recycle_list(self) -> None:
+        self._delete_finished_thread()
+        self._recycle_list_thread = None
+        self._recycle_list_worker = None
+
+    def _restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        """Restore recycle-bin entries back to their original folders."""
+        file_browser = self._file_browser
+        if file_browser is None:
+            self._set_status("请先登录")
+            return
+        batch = tuple(delete_nos)
+        if not batch:
+            return
+        self._start_recycle_action(
+            lambda: file_browser.restore_recycle_items(batch),
+            self._on_recycle_restore_succeeded,
+            self._on_recycle_restore_failed,
+        )
+
+    def _purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        """Permanently delete recycle-bin entries after UI confirmation."""
+        file_browser = self._file_browser
+        if file_browser is None:
+            self._set_status("请先登录")
+            return
+        batch = tuple(delete_nos)
+        if not batch:
+            return
+        self._start_recycle_action(
+            lambda: file_browser.purge_recycle_items(batch),
+            self._on_recycle_purge_succeeded,
+            self._on_recycle_purge_failed,
+        )
+
+    def _empty_recycle_bin(self) -> None:
+        """Permanently delete every recycle-bin entry after UI confirmation."""
+        file_browser = self._file_browser
+        if file_browser is None:
+            self._set_status("请先登录")
+            return
+        self._start_recycle_action(
+            file_browser.empty_recycle_bin,
+            self._on_recycle_empty_succeeded,
+            self._on_recycle_empty_failed,
+        )
+
+    def _start_recycle_action(
+        self,
+        operation: Callable[[], object],
+        on_succeeded: Callable[[object], None],
+        on_failed: Callable[[str], None],
+    ) -> None:
+        """Run one recycle-bin mutation on a worker thread."""
+        if self._recycle_action_thread is not None:
+            LOGGER.debug("main_window.recycle_action.skipped_busy")
+            return
+        thread = QThread(self)
+        worker = BrowserOperationWorker(operation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(on_succeeded)
+        worker.failed.connect(on_failed)
+        worker.login_required.connect(self._on_recycle_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(self._clear_recycle_action)
+        self._recycle_action_thread = thread
+        self._recycle_action_worker = worker
+        thread.start()
+
+    def _on_recycle_restore_succeeded(self, result: object) -> None:
+        self._set_status("恢复成功，已回到原位置")
+        self.refresh_recycle_items()
+
+    def _on_recycle_restore_failed(self, message: str) -> None:
+        self._set_status(f"恢复失败：{message}")
+        InfoBar.error(title="恢复失败", content=message, parent=self)
+
+    def _on_recycle_purge_succeeded(self, result: object) -> None:
+        self._set_status("已彻底删除，无法恢复")
+        self.refresh_recycle_items()
+
+    def _on_recycle_purge_failed(self, message: str) -> None:
+        self._set_status(f"彻底删除失败：{message}")
+        InfoBar.error(title="彻底删除失败", content=message, parent=self)
+
+    def _on_recycle_empty_succeeded(self, result: object) -> None:
+        self._set_status("回收站已清空")
+        self.refresh_recycle_items()
+
+    def _on_recycle_empty_failed(self, message: str) -> None:
+        self._set_status(f"清空回收站失败：{message}")
+        InfoBar.error(title="清空回收站失败", content=message, parent=self)
+
+    def _clear_recycle_action(self) -> None:
+        self._delete_finished_thread()
+        self._recycle_action_thread = None
+        self._recycle_action_worker = None
 
     def download_displayed_item(
         self, row: int, local_path: Path, *, run_in_background: bool = True
@@ -4526,14 +4686,12 @@ class MainWindow(_MainWindowBase):
         items = [item for row in rows if (item := self._item_at_row(row)) is not None]
         if not items:
             return
-        if len(items) == 1:
-            summary = f"「{items[0].name}」"
-        else:
-            preview = "、".join(item.name for item in items[:3])
-            if len(items) > 3:
-                preview += " 等"
-            summary = f" {len(items)} 个对象（{preview}）"
-        message = MessageBox("确认删除", f"确定要删除{summary}吗？此操作不可恢复。", self)
+        summary = _format_items_summary([item.name for item in items])
+        message = MessageBox(
+            "确认删除",
+            f"确定要删除{summary}吗？删除后将移入回收站，可在回收站中恢复。",
+            self,
+        )
         accepted = message.exec()
         message.deleteLater()
         if accepted:
@@ -5971,12 +6129,6 @@ class MainWindow(_MainWindowBase):
             self._set_status("请先登录")
         elif self._status_message == "正在加载...":
             self._set_status("当前文件夹为空")
-
-
-def _format_kind(kind: WopanItemKind) -> str:
-    if kind is WopanItemKind.FOLDER:
-        return "文件夹"
-    return "文件"
 
 
 def _format_speed(speed_bps: float) -> str:

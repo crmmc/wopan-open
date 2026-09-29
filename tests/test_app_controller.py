@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +19,12 @@ from openwopan.auth.web_login import RestoredWebLogin
 from openwopan.storage.credentials import CredentialStore
 from openwopan.storage.settings import AppSettings
 from openwopan.ui.main_window import MainWindow
-from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import (
+    WopanCloudUsage,
+    WopanItem,
+    WopanItemKind,
+    WopanRecycleItem,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -114,6 +119,18 @@ class FakeFileBrowser:
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         return WopanCloudUsage(used_bytes=1024, total_bytes=2048)
+
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        return []
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        pass
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        pass
+
+    def empty_recycle_bin(self) -> None:
+        pass
 
 
 @dataclass
