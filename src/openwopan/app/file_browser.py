@@ -125,6 +125,12 @@ class FileBrowserBackend(Protocol):
     def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
         """Return file items for a directory."""
 
+    def search_files(self, keyword: str, page_no: int = 1, page_size: int = 50) -> list[WopanItem]:
+        """Search personal-space files by keyword across directories."""
+
+    def resolve_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
+        """Resolve a directory id to its root-relative id/name path."""
+
     def create_folder(self, parent_id: str, name: str) -> WopanItem:
         """Create a folder and return the created item."""
 
@@ -191,6 +197,7 @@ class FileBrowserBackend(Protocol):
         cancel_requested: Callable[[], bool] | None = None,
     ) -> WopanItem:
         """Upload one local file to a directory."""
+
     def recover_uploads(self) -> tuple[UploadTaskRecord, ...]:
         """Normalize persisted upload states and surface resumable rows."""
 
@@ -236,6 +243,34 @@ class FileBrowserService:
             follow_redirects=True,
             timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
         )
+        # Session-wide id -> path chain cache for search-result location
+        # resolution; GetDirectoryPath returns the full chain in one call and
+        # the cache keeps repeated jumps into the same folder free. The root
+        # entry mirrors the server naming ("个人云") observed in live chains.
+        self._directory_path_cache: dict[str, list[tuple[str, str]]] = {
+            ROOT_DIRECTORY_ID: [(ROOT_DIRECTORY_ID, "个人云")]
+        }
+
+    def resolve_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
+        """Resolve a directory id to its root-relative id/name path.
+
+        Uses the single-request GetDirectoryPath endpoint and caches results
+        per directory id.
+        """
+        if not directory_id:
+            raise ValueError("directory_id must not be empty")
+        cached = self._directory_path_cache.get(directory_id)
+        if cached is not None:
+            return list(cached)
+        LOGGER.info("file_browser.resolve_directory_path.start directory_id=%s", directory_id)
+        chain = self._call(lambda: self._client.get_directory_path(directory_id))
+        self._directory_path_cache[directory_id] = chain
+        LOGGER.info(
+            "file_browser.resolve_directory_path.success directory_id=%s depth=%s",
+            directory_id,
+            len(chain),
+        )
+        return list(chain)
 
     def set_download_event_callback(self, callback: DownloadEventCallback | None) -> None:
         """Attach the UI observer without exposing scheduler internals."""
@@ -361,6 +396,22 @@ class FileBrowserService:
         LOGGER.info(
             "file_browser.list_directory.success parent_id=%s item_count=%s",
             parent_id,
+            len(items),
+        )
+        return items
+
+    def search_files(self, keyword: str, page_no: int = 1, page_size: int = 50) -> list[WopanItem]:
+        """Search personal-space files and map authentication failures to UI state."""
+        LOGGER.info(
+            "file_browser.search_files.start keyword_length=%s page_no=%s page_size=%s",
+            len(keyword),
+            page_no,
+            page_size,
+        )
+        items = self._call(lambda: self._client.search_files(keyword, page_no, page_size))
+        LOGGER.info(
+            "file_browser.search_files.success keyword_length=%s item_count=%s",
+            len(keyword),
             len(items),
         )
         return items
@@ -658,9 +709,7 @@ class FileBrowserService:
                         raise
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
-            LOGGER.warning(
-                "file_browser.upload_file.http_status_error status=%s", status_code
-            )
+            LOGGER.warning("file_browser.upload_file.http_status_error status=%s", status_code)
             raise FileBrowserError(f"HTTP {status_code}") from exc
         except httpx.HTTPError as exc:
             LOGGER.warning(
@@ -896,9 +945,7 @@ class FileBrowserService:
 
     def update_settings(self, settings: AppSettings) -> None:
         """Apply updated transfer settings to future operations."""
-        self._download_scheduler.set_max_concurrent_downloads(
-            settings.max_concurrent_downloads
-        )
+        self._download_scheduler.set_max_concurrent_downloads(settings.max_concurrent_downloads)
         self._settings = settings
 
     def download_records(self) -> tuple[DownloadTaskRecord, ...]:

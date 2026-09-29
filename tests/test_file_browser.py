@@ -31,7 +31,7 @@ from openwopan.tasks.upload import (
     UploadTaskStore,
     make_upload_task_id,
 )
-from openwopan.wopan.client import UploadResumeContext
+from openwopan.wopan.client import ROOT_DIRECTORY_ID, UploadResumeContext
 from openwopan.wopan.errors import (
     WopanAuthenticationError,
     WopanBusinessError,
@@ -44,6 +44,10 @@ class FakeClient:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.requested_parent_ids: list[str] = []
+        self.searched_keywords: list[tuple[str, int, int]] = []
+        self.listings: dict[str, list[WopanItem]] = {}
+        self.resolved_directory_ids: list[str] = []
+        self.directory_paths: dict[str, list[tuple[str, str]]] = {}
         self.created_folders: list[tuple[str, str]] = []
         self.renamed_items: list[tuple[str, str, WopanItemKind, str | None]] = []
         self.deleted_items: list[tuple[str, WopanItemKind]] = []
@@ -58,7 +62,24 @@ class FakeClient:
         self.requested_parent_ids.append(parent_id)
         if self.error is not None:
             raise self.error
-        return [WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)]
+        default = [WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)]
+        return list(self.listings.get(parent_id, default))
+
+    def search_files(
+        self, keyword: str, page_no: int = 1, page_size: int = 50
+    ) -> list[WopanItem]:
+        self.searched_keywords.append((keyword, page_no, page_size))
+        if self.error is not None:
+            raise self.error
+        return [
+            WopanItem(item_id="file-9", name=f"{keyword}.txt", kind=WopanItemKind.FILE)
+        ]
+
+    def get_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
+        self.resolved_directory_ids.append(directory_id)
+        if self.error is not None:
+            raise self.error
+        return list(self.directory_paths.get(directory_id, []))
 
     def create_folder(self, parent_id: str, name: str) -> WopanItem:
         self.created_folders.append((parent_id, name))
@@ -252,6 +273,57 @@ def test_plan_transfer_batch_without_conflicts_transfers_everything() -> None:
     assert plan.transfer_items == items
     assert plan.conflict_names == ()
     assert plan.noop_ids == frozenset()
+
+
+def test_file_browser_service_searches_files() -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    items = service.search_files("report", page_no=2, page_size=25)
+
+    assert client.searched_keywords == [("report", 2, 25)]
+    assert [item.name for item in items] == ["report.txt"]
+
+
+def test_resolve_directory_path_uses_endpoint_and_caches() -> None:
+    client = FakeClient()
+    # client.get_directory_path 已归一化为根 -> 目标序
+    client.directory_paths["folder-2"] = [
+        (ROOT_DIRECTORY_ID, "个人云"),
+        ("folder-1", "Folder"),
+        ("folder-2", "2"),
+    ]
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    path = service.resolve_directory_path("folder-2")
+
+    assert path == [
+        (ROOT_DIRECTORY_ID, "个人云"),
+        ("folder-1", "Folder"),
+        ("folder-2", "2"),
+    ]
+    assert client.resolved_directory_ids == ["folder-2"]
+
+    # 二次解析命中缓存，零网络调用
+    assert service.resolve_directory_path("folder-2") == path
+    assert client.resolved_directory_ids == ["folder-2"]
+
+
+def test_resolve_directory_path_shortcuts_root() -> None:
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    assert service.resolve_directory_path(ROOT_DIRECTORY_ID) == [
+        (ROOT_DIRECTORY_ID, "个人云")
+    ]
+    assert client.resolved_directory_ids == []
+
+
+def test_resolve_directory_path_rejects_empty_id() -> None:
+    service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="directory_id"):
+        service.resolve_directory_path("")
 
 
 def test_file_browser_service_downloads_file_to_local_path(tmp_path: Path) -> None:

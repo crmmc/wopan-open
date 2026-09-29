@@ -70,6 +70,8 @@ DEFAULT_UPLOAD_ZONE_URL = "https://tjupload.pan.wo.cn"
 BYTES_PER_MB = 1024 * 1024
 TOKEN_COOKIE_NAME = "WoCloud-Web-Token"
 PERSONAL_SPACE_TYPE = "0"
+PERSONAL_SEARCH_TYPE = "2"
+SEARCH_DEFAULT_PAGE_SIZE = 50
 PERSONAL_FAMILY_ID = "0"
 DEFAULT_VIP_LEVEL = "0"
 STANDARD_BROWSER_USER_AGENT = (
@@ -338,6 +340,76 @@ class WopanClient:
         )
         return items
 
+    def search_files(
+        self, keyword: str, page_no: int = 1, page_size: int = SEARCH_DEFAULT_PAGE_SIZE
+    ) -> list[WopanItem]:
+        """Search personal-space files by keyword across all directories."""
+        if not keyword.strip():
+            raise ValueError("keyword must not be empty")
+        if page_no < 1:
+            raise ValueError("page_no must be at least 1")
+        if page_size < 1:
+            raise ValueError("page_size must be at least 1")
+
+        LOGGER.info(
+            "wopan.search_files.start keyword_length=%s page_no=%s page_size=%s",
+            len(keyword),
+            page_no,
+            page_size,
+        )
+        data = self._dispatch_wohome(
+            "SearchFile",
+            {
+                "searchType": PERSONAL_SEARCH_TYPE,
+                "keyWord": keyword,
+                "pageNo": page_no,
+                "pageSize": page_size,
+                "clientId": CLIENT_ID,
+            },
+        )
+        raw_items = data.get("personalResult") or []
+        if not isinstance(raw_items, list):
+            raise WopanResponseError("SearchFile personalResult is not a list")
+        items: list[WopanItem] = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                raise WopanResponseError("SearchFile item is not an object")
+            items.append(_read_search_item(raw_item))
+        LOGGER.info(
+            "wopan.search_files.success keyword_length=%s item_count=%s",
+            len(keyword),
+            len(items),
+        )
+        return items
+
+    def get_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
+        """Resolve a directory id to its root-relative id/name path in one call."""
+        if not directory_id:
+            raise ValueError("directory_id must not be empty")
+
+        LOGGER.info("wopan.get_directory_path.start directory_id=%s", directory_id)
+        data = self._dispatch_wohome_payload(
+            "GetDirectoryPath",
+            {"directoryId": directory_id, "clientId": CLIENT_ID},
+        )
+        if not isinstance(data, list):
+            raise WopanResponseError("GetDirectoryPath DATA is not a list")
+        chain: list[tuple[str, str]] = []
+        for raw_item in reversed(data):
+            if not isinstance(raw_item, dict):
+                raise WopanResponseError("GetDirectoryPath item is not an object")
+            item_id = str(raw_item.get("id") or "")
+            name = str(raw_item.get("directoryName") or "")
+            if not item_id or not name:
+                raise WopanResponseError("GetDirectoryPath item missing id or name")
+            chain.append((item_id, name))
+        LOGGER.info(
+            "wopan.get_directory_path.success directory_id=%s depth=%s",
+            directory_id,
+            len(chain),
+        )
+        return chain
+
     def create_folder(self, parent_id: str, name: str) -> WopanItem:
         """Create a folder under a parent directory."""
         if not parent_id:
@@ -415,9 +487,7 @@ class WopanClient:
         dir_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FOLDER]
         file_ids = [item_id for item_id, kind in items if kind is WopanItemKind.FILE]
 
-        LOGGER.info(
-            "wopan.delete_many.start folders=%s files=%s", len(dir_ids), len(file_ids)
-        )
+        LOGGER.info("wopan.delete_many.start folders=%s files=%s", len(dir_ids), len(file_ids))
         self._dispatch_wohome(
             "DeleteFile",
             {
@@ -428,17 +498,13 @@ class WopanClient:
                 "clientId": CLIENT_ID,
             },
         )
-        LOGGER.info(
-            "wopan.delete_many.success folders=%s files=%s", len(dir_ids), len(file_ids)
-        )
+        LOGGER.info("wopan.delete_many.success folders=%s files=%s", len(dir_ids), len(file_ids))
 
     def move(self, item_id: str, kind: WopanItemKind, target_parent_id: str) -> None:
         """Move a file or folder to another parent directory."""
         self.move_many([(item_id, kind)], target_parent_id)
 
-    def move_many(
-        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
-    ) -> None:
+    def move_many(self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str) -> None:
         """Move one or more files and folders in a single request."""
         if not target_parent_id:
             raise ValueError("target_parent_id must not be empty")
@@ -480,9 +546,7 @@ class WopanClient:
         """Copy a file or folder to another parent directory."""
         self.copy_many([(item_id, kind)], target_parent_id)
 
-    def copy_many(
-        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
-    ) -> None:
+    def copy_many(self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str) -> None:
         """Copy one or more files and folders in a single request."""
         if not target_parent_id:
             raise ValueError("target_parent_id must not be empty")
@@ -557,8 +621,10 @@ class WopanClient:
         completed_indexes = _valid_completed_indexes(resume, total_parts)
         upload_file_type = guess_upload_file_type(file_name)
 
-        if resume is not None and resume.known_fid and completed_indexes == set(
-            range(1, total_parts + 1)
+        if (
+            resume is not None
+            and resume.known_fid
+            and completed_indexes == set(range(1, total_parts + 1))
         ):
             # Defensive: the service layer short-circuits earlier; never resend
             # a fully uploaded file just to re-derive a known fid.
@@ -602,12 +668,8 @@ class WopanClient:
             )
         _check_upload_cancelled(cancel_requested)
         upload_url = f"{zone_url.rstrip('/')}/openapi/client/upload2C"
-        unique_id = (
-            resume.unique_id if resume is not None else str(int(time.time() * 1000))
-        )
-        batch_no = (
-            resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
-        )
+        unique_id = resume.unique_id if resume is not None else str(int(time.time() * 1000))
+        batch_no = resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
         token_key = _wohome_crypto_key(self._access_token)
         file_info = {
             "spaceType": PERSONAL_SPACE_TYPE,
@@ -774,8 +836,7 @@ class WopanClient:
             return None
         if recovered is not None:
             LOGGER.info(
-                "wopan.upload_file.recovered_from_listing parent_id=%s "
-                "original_error_type=%s",
+                "wopan.upload_file.recovered_from_listing parent_id=%s original_error_type=%s",
                 parent_id,
                 type(original_error).__name__,
             )
@@ -1015,23 +1076,17 @@ def resolve_upload_part_plan(file_size: int, upload_part_size_mb: int) -> tuple[
     return part_size, total_parts
 
 
-def pending_upload_indexes(
-    total_parts: int, completed_indexes: Iterable[int] | None
-) -> list[int]:
+def pending_upload_indexes(total_parts: int, completed_indexes: Iterable[int] | None) -> list[int]:
     """Return 1-based part indexes that still need an upload request."""
     completed = set(completed_indexes or ())
     return [index for index in range(1, total_parts + 1) if index not in completed]
 
 
-def _valid_completed_indexes(
-    resume: UploadResumeContext | None, total_parts: int
-) -> set[int]:
+def _valid_completed_indexes(resume: UploadResumeContext | None, total_parts: int) -> set[int]:
     """Filter resume part indexes down to the valid 1..total_parts range."""
     if resume is None:
         return set()
-    return {
-        index for index in resume.completed_indexes if 1 <= index <= total_parts
-    }
+    return {index for index in resume.completed_indexes if 1 <= index <= total_parts}
 
 
 def _extract_part_fid(raw: dict[str, Any]) -> str:
@@ -1159,6 +1214,37 @@ def _read_wopan_item(raw: dict[str, Any], fallback_parent_id: str) -> WopanItem:
         file_type=_read_optional_text(raw.get("fileType")),
         download_id=_read_optional_text(raw.get("fid")),
         size=_read_optional_int(raw.get("size")),
+        updated_at=_read_wopan_timestamp(raw),
+    )
+
+
+def _read_search_item(raw: dict[str, Any]) -> WopanItem:
+    item_id = str(raw.get("id") or "")
+    name = str(raw.get("fileName") or raw.get("name") or "")
+    if not item_id:
+        raise WopanResponseError("SearchFile item missing id")
+    if not name:
+        raise WopanResponseError("SearchFile item missing fileName")
+    # Live-verified (2026-09-29): SearchFile results carry an EMPTY `type` and
+    # only ever match files, so empty/absent type maps to FILE; "0" stays a
+    # folder for forward compatibility.
+    raw_type = _read_wopan_item_type(raw)
+    if raw_type == "0":
+        kind = WopanItemKind.FOLDER
+    else:
+        kind = WopanItemKind.FILE
+    size = _read_optional_int(raw.get("fileSize"))
+    if size is None:
+        size = _read_optional_int(raw.get("size"))
+    parent_id_value = raw.get("directoryId")
+    return WopanItem(
+        item_id=item_id,
+        name=name,
+        kind=kind,
+        parent_id=str(parent_id_value) if parent_id_value not in (None, "") else "",
+        file_type=_read_optional_text(raw.get("fileType")),
+        download_id=_read_optional_text(raw.get("fid")),
+        size=size,
         updated_at=_read_wopan_timestamp(raw),
     )
 
