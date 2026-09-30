@@ -5176,6 +5176,31 @@ def test_second_deep_navigation_makes_zero_list_requests_and_rerenders(
     assert tree.currentItem() is deep_node
 
 
+def test_force_refresh_at_depth_fetches_only_current_directory(
+    qapp: QApplication,
+) -> None:
+    """B24：显式刷新是最小请求语义——只重拉当前目录，祖先层仍吃缓存。"""
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    window.enter_displayed_folder(0)  # 当前位于 /root/Folder/2，各级缓存已暖
+    warm = list(browser.requested_parent_ids)
+    assert warm == [ROOT_DIRECTORY_ID, "folder-1", "folder-2"]
+
+    window.refresh_all_information()  # 顶栏刷新按钮路径（force）
+
+    # 强制刷新 = 最小请求：仅当前目录 folder-2 重拉一次，两个祖先层零请求
+    assert browser.requested_parent_ids == warm + ["folder-2"]
+    assert window.current_directory_id() == "folder-2"
+    assert [item.name for item in window.displayed_items()] == ["deep.txt"]
+    tree = window.file_interface.folder_tree
+    deep_node = tree.topLevelItem(0).child(0).child(0)
+    assert deep_node.text(0) == "2"
+    assert tree.currentItem() is deep_node
+
+
 def test_tree_sync_partial_cache_hit_fetches_only_missing_ancestors(
     qapp: QApplication,
 ) -> None:
