@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 import openwopan.ui.recycle_interface as recycle_module
@@ -22,6 +23,7 @@ from openwopan.ui.recycle_interface import (
     UNKNOWN_VALUE,
     RecycleInterface,
 )
+from openwopan.ui.table_view import NO_MATCH_TEXT
 from openwopan.wopan.models import WopanItemKind, WopanRecycleItem
 
 RESTORE_STATUS = "恢复成功，已回到原位置"
@@ -507,3 +509,266 @@ def test_recycle_action_skips_while_busy(qapp: QApplication) -> None:
 
     assert browser.restored_delete_nos == []
     window._recycle_action_thread = None
+
+
+# ---------------------------------------------------------------------------
+# Header-click sorting and name filtering (10-01-table-sort-filter)
+# ---------------------------------------------------------------------------
+
+
+def _row_texts(interface: RecycleInterface, column: int) -> list[str]:
+    return [
+        interface.item_table.item(row, column).text()
+        for row in range(interface.item_table.rowCount())
+    ]
+
+
+def test_header_click_cycles_sort_indicator_and_order(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items([_recycle_item("d-1", "b.txt"), _recycle_item("d-2", "a.txt")])
+    header = interface.item_table.horizontalHeader()
+
+    interface._on_header_section_clicked(COL_NAME)
+    assert _row_texts(interface, COL_NAME) == ["a.txt", "b.txt"]
+    assert header.sortIndicatorSection() == COL_NAME
+    assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+
+    interface._on_header_section_clicked(COL_NAME)
+    assert _row_texts(interface, COL_NAME) == ["b.txt", "a.txt"]
+    assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+
+    # Third click returns to the source order and clears the indicator.
+    interface._on_header_section_clicked(COL_NAME)
+    assert _row_texts(interface, COL_NAME) == ["b.txt", "a.txt"]
+    assert header.sortIndicatorSection() == -1
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [
+        (Qt.SortOrder.AscendingOrder, ["A.txt", "apple.txt", "b.txt", "报告.txt"]),
+        (Qt.SortOrder.DescendingOrder, ["报告.txt", "b.txt", "apple.txt", "A.txt"]),
+    ],
+)
+def test_sort_by_name_casefold_with_chinese(
+    qapp: QApplication, order: Qt.SortOrder, expected: list[str]
+) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "b.txt"),
+            _recycle_item("d-2", "A.txt"),
+            _recycle_item("d-3", "报告.txt"),
+            _recycle_item("d-4", "apple.txt"),
+        ]
+    )
+
+    interface._on_header_section_clicked(COL_NAME)
+    if order is Qt.SortOrder.DescendingOrder:
+        interface._on_header_section_clicked(COL_NAME)
+
+    assert _row_texts(interface, COL_NAME) == expected
+
+
+def test_sort_by_size_is_numeric_not_lexicographic(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "mb.txt", size=1_000_000),
+            _recycle_item("d-2", "kb.txt", size=2048),
+            _recycle_item("d-3", "bytes.txt", size=999),
+        ]
+    )
+
+    interface._on_header_section_clicked(COL_SIZE)
+
+    # Formatted text would sort "1.0 MB" < "2.0 KB" < "999 B"; the data-level
+    # key must order by the numeric value instead.
+    assert _row_texts(interface, COL_NAME) == ["bytes.txt", "kb.txt", "mb.txt"]
+
+
+def test_sort_by_kind_puts_folders_first(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "a.txt"),
+            _recycle_item("d-2", "Zed", kind=WopanItemKind.FOLDER),
+        ]
+    )
+
+    interface._on_header_section_clicked(COL_KIND)
+
+    assert _row_texts(interface, COL_NAME) == ["Zed", "a.txt"]
+
+
+def test_sort_by_deleted_at_orders_timestamps_with_none_as_min(
+    qapp: QApplication,
+) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "known-late.txt", deleted_at=datetime(2026, 9, 30, 8, 0, 0)),
+            _recycle_item("d-2", "unknown.txt", deleted_at=None),
+            _recycle_item("d-3", "known-early.txt", deleted_at=datetime(2026, 9, 1, 8, 0, 0)),
+        ]
+    )
+
+    interface._on_header_section_clicked(COL_DELETED_AT)
+
+    assert _row_texts(interface, COL_NAME) == ["unknown.txt", "known-early.txt", "known-late.txt"]
+
+
+def test_sort_by_keep_days_treats_none_as_zero(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "five.txt", keep_days=5),
+            _recycle_item("d-2", "unknown.txt", keep_days=None),
+            _recycle_item("d-3", "one.txt", keep_days=1),
+        ]
+    )
+
+    interface._on_header_section_clicked(COL_KEEP_DAYS)
+
+    assert _row_texts(interface, COL_NAME) == ["unknown.txt", "one.txt", "five.txt"]
+
+
+def test_sort_keeps_backing_list_order_untouched(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items([_recycle_item("d-1", "b.txt"), _recycle_item("d-2", "a.txt")])
+
+    interface._on_header_section_clicked(COL_NAME)
+
+    assert [item.name for item in interface._items] == ["b.txt", "a.txt"]
+
+
+def test_sort_state_survives_re_render_with_new_data(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items([_recycle_item("d-1", "b.txt"), _recycle_item("d-2", "a.txt")])
+    interface._on_header_section_clicked(COL_NAME)
+
+    interface.render_items([_recycle_item("d-3", "c.txt"), _recycle_item("d-4", "A.txt")])
+
+    assert _row_texts(interface, COL_NAME) == ["A.txt", "c.txt"]
+
+
+def test_name_filter_is_casefold_substring(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "Report.TXT"),
+            _recycle_item("d-2", "照片.jpg"),
+            _recycle_item("d-3", "notes.txt"),
+        ]
+    )
+
+    interface.name_filter_bar.setText("TXT")
+
+    assert _row_texts(interface, COL_NAME) == ["Report.TXT", "notes.txt"]
+
+
+def test_name_filter_with_chinese_substring(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items([_recycle_item("d-1", "旅行照片.jpg"), _recycle_item("d-2", "报告.pdf")])
+
+    interface.name_filter_bar.setText("照片")
+
+    assert _row_texts(interface, COL_NAME) == ["旅行照片.jpg"]
+
+
+def test_name_filter_empty_string_is_noop(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items([_recycle_item("d-1", "a.txt"), _recycle_item("d-2", "b.txt")])
+    interface.name_filter_bar.setText("zzz")
+
+    interface.name_filter_bar.setText("")
+
+    assert _row_texts(interface, COL_NAME) == ["a.txt", "b.txt"]
+
+
+def test_name_filter_no_match_shows_no_match_state(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items([_recycle_item("d-1", "a.txt")])
+
+    interface.name_filter_bar.setText("zzz")
+
+    assert interface.item_table.isHidden()
+    assert not interface.empty_label.isHidden()
+    assert interface.empty_label.text() == NO_MATCH_TEXT
+    # The bin itself is not empty: clearing stays available, row actions are not.
+    assert interface.empty_button.isEnabled()
+    assert not interface.restore_button.isEnabled()
+    assert not interface.purge_button.isEnabled()
+
+
+def test_filter_and_sort_stacked(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "big.txt", size=4096),
+            _recycle_item("d-2", "tiny.txt", size=10),
+            _recycle_item("d-3", "big-report.pdf", size=2048),
+        ]
+    )
+    interface._on_header_section_clicked(COL_SIZE)
+
+    interface.name_filter_bar.setText("big")
+
+    # Filter first, then the active size sort applies to the filtered subset.
+    assert _row_texts(interface, COL_NAME) == ["big-report.pdf", "big.txt"]
+
+
+def test_restore_and_purge_use_displayed_delete_nos_with_filter_and_sort(
+    qapp: QApplication, stub_message_box
+) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "a.txt"),
+            _recycle_item("d-2", "B.txt"),
+            _recycle_item("d-3", "ba.txt"),
+        ]
+    )
+    interface._on_header_section_clicked(COL_NAME)
+    interface._on_header_section_clicked(COL_NAME)  # descending
+    interface.name_filter_bar.setText("b")
+    restored: list[object] = []
+    purged: list[object] = []
+    interface.restore_requested.connect(lambda value: restored.append(value))
+    interface.purge_requested.connect(lambda value: purged.append(value))
+    # Descending casefold order over the "b" subset: ba.txt, B.txt.
+    assert _row_texts(interface, COL_NAME) == ["ba.txt", "B.txt"]
+    assert [
+        interface.item_table.item(row, COL_NAME).data(Qt.ItemDataRole.UserRole)
+        for row in range(interface.item_table.rowCount())
+    ] == ["d-3", "d-2"]
+
+    interface.item_table.selectAll()
+    interface.restore_button.click()
+    interface.purge_button.click()
+
+    # Operations ride the UserRole delete_no, never the backing row number.
+    assert restored == [("d-3", "d-2")]
+    assert purged == [("d-3", "d-2")]
+
+
+def test_selection_maps_through_visible_rows_under_sort(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items([_recycle_item("d-1", "b.txt"), _recycle_item("d-2", "a.txt")])
+    interface._on_header_section_clicked(COL_NAME)
+
+    interface.item_table.selectRow(0)
+
+    assert [item.delete_no for item in interface.selected_items()] == ["d-2"]
+
+
+def test_unknown_column_click_is_ignored(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items([_recycle_item("d-1", "b.txt"), _recycle_item("d-2", "a.txt")])
+
+    # Defensive guard: a column without a sort key (future columns) never
+    # activates sorting or crashes the click handler.
+    interface._on_header_section_clicked(99)
+
+    assert interface._sort_state.column is None
+    assert _row_texts(interface, COL_NAME) == ["b.txt", "a.txt"]
