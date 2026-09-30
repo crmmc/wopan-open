@@ -4970,6 +4970,165 @@ def test_tree_click_deep_node_navigates_with_full_path(qapp: QApplication) -> No
     assert window.current_directory_id() == "folder-2"
 
 
+def test_tree_sync_busy_request_sets_pending_and_replays_on_clear(
+    qapp: QApplication,
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent["folder-1"] = [
+        WopanItem(
+            item_id="folder-2",
+            name="2",
+            kind=WopanItemKind.FOLDER,
+            parent_id="folder-1",
+        )
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    assert window.breadcrumb_names() == ("/", "Folder")
+    assert window._tree_sync_pending is False
+
+    # A tree sync is still in flight when the next request arrives — the
+    # navigation-vs-sync race from backlog B22.
+    window._tree_sync_thread = SimpleNamespace()
+    calls_before = len(browser.requested_parent_ids)
+
+    window._sync_folder_tree()
+
+    assert window._tree_sync_pending is True
+    assert len(browser.requested_parent_ids) == calls_before  # skipped, not run
+
+    window._clear_tree_sync()  # the in-flight sync finishes and clears
+
+    # The pending request must be replayed, not dropped silently: a fresh sync
+    # ran and issued its own listing for the current breadcrumb.
+    assert window._tree_sync_pending is False
+    assert len(browser.requested_parent_ids) == calls_before + 1
+
+
+def test_navigation_during_tree_sync_rebuilds_tree_from_new_breadcrumb(
+    qapp: QApplication,
+) -> None:
+    browser = WorkerFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = [
+        WopanItem(
+            item_id="folder-1",
+            name="Folder",
+            kind=WopanItemKind.FOLDER,
+            parent_id=ROOT_DIRECTORY_ID,
+        ),
+        _file_item(),
+    ]
+    browser.items_by_parent["folder-1"] = [
+        WopanItem(
+            item_id="folder-2",
+            name="2",
+            kind=WopanItemKind.FOLDER,
+            parent_id="folder-1",
+        )
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    # The user clicks into "Folder" while a tree sync is still in flight.
+    window._tree_sync_thread = SimpleNamespace()
+    window.open_tree_path((ROOT_DIRECTORY_ID, "folder-1"), ("/", "Folder"))
+
+    # The refresh's tree sync hit the busy guard and must be remembered.
+    assert window._tree_sync_pending is True
+
+    window._clear_tree_sync()  # the in-flight sync completes
+
+    # The replayed sync rendered the NEW breadcrumb: the clicked folder is the
+    # current node, expanded and carrying its own child folder.
+    tree = window.file_interface.folder_tree
+    root_node = tree.topLevelItem(0)
+    folder_node = root_node.child(0)
+    assert folder_node.text(0) == "Folder"
+    assert [folder_node.child(i).text(0) for i in range(folder_node.childCount())] == ["2"]
+    assert folder_node.isExpanded() is True
+    assert tree.currentItem() is folder_node
+
+
+def test_render_folder_tree_sorts_siblings_casefold_and_keeps_path_order(
+    qapp: QApplication,
+) -> None:
+    window = MainWindow()
+    tree = window.file_interface.folder_tree
+    root = main_window_module.BreadcrumbEntry(item_id=ROOT_DIRECTORY_ID, name="/")
+    entry_a = main_window_module.BreadcrumbEntry(item_id="folder-A", name="A")
+
+    def folders(names: tuple[str, ...]) -> tuple[WopanItem, ...]:
+        return tuple(
+            WopanItem(
+                item_id=f"folder-{name}",
+                name=name,
+                kind=WopanItemKind.FOLDER,
+                parent_id=ROOT_DIRECTORY_ID,
+            )
+            for name in names
+        )
+
+    # Deliberately out of server order, mixed case to prove casefold sorting.
+    root_siblings = folders(("b", "A", "c", "B"))
+    a_children = folders(("Zeta", "alpha"))
+    window.file_interface.render_folder_tree((root, entry_a), (root_siblings, a_children))
+
+    root_node = tree.topLevelItem(0)
+    # Siblings sort ascending by name.casefold(); the breadcrumb path node "A"
+    # is NOT merged into the sibling sort — it stays appended in path position.
+    assert [root_node.child(i).text(0) for i in range(root_node.childCount())] == [
+        "b",
+        "B",
+        "c",
+        "A",
+    ]
+    folder_node = root_node.child(3)
+    assert folder_node.text(0) == "A"
+    assert [folder_node.child(i).text(0) for i in range(folder_node.childCount())] == [
+        "alpha",
+        "Zeta",
+    ]
+    assert tree.currentItem() is folder_node
+
+
+def test_render_folder_tree_sibling_order_consistent_across_listings(
+    qapp: QApplication,
+) -> None:
+    window = MainWindow()
+    tree = window.file_interface.folder_tree
+    root = main_window_module.BreadcrumbEntry(item_id=ROOT_DIRECTORY_ID, name="/")
+
+    def folders(names: tuple[str, ...]) -> tuple[WopanItem, ...]:
+        return tuple(
+            WopanItem(
+                item_id=f"folder-{name}",
+                name=name,
+                kind=WopanItemKind.FOLDER,
+                parent_id=ROOT_DIRECTORY_ID,
+            )
+            for name in names
+        )
+
+    def sibling_texts() -> list[str]:
+        node = tree.topLevelItem(0)
+        return [node.child(i).text(0) for i in range(node.childCount())]
+
+    # Server order is unstable across listings: same folder set, different
+    # permutations — the rendered tree order must stay identical.
+    window.file_interface.render_folder_tree(
+        (root,), (folders(("delta", "Alpha", "charlie", "Bravo")),)
+    )
+    first = sibling_texts()
+    window.file_interface.render_folder_tree(
+        (root,), (folders(("Bravo", "charlie", "Alpha", "delta")),)
+    )
+    second = sibling_texts()
+
+    assert first == ["Alpha", "Bravo", "charlie", "delta"]
+    assert second == first
+
+
 def test_switch_to_interface_activates_widget_and_navigation(qapp: QApplication) -> None:
     window = MainWindow(WorkerFileBrowser())
     assert window._stacked_widget is not None

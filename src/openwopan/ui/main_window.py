@@ -2408,7 +2408,12 @@ class FileInterface(QWidget):
         for depth in range(len(breadcrumb)):
             next_entry = breadcrumb[depth + 1] if depth + 1 < len(breadcrumb) else None
             folders = levels[depth] if depth < len(levels) else ()
-            for folder in folders:
+            # Server listing order is unstable across calls; each sibling level
+            # is sorted locally by name (case-insensitive, stable) so the tree
+            # does not drift when directories are revisited. The breadcrumb
+            # path node appended below is NOT part of this sort — path nodes
+            # must stay in path order.
+            for folder in sorted(folders, key=lambda entry: entry.name.casefold()):
                 if next_entry is not None and folder.item_id == next_entry.item_id:
                     continue
                 current.addChild(
@@ -2427,6 +2432,10 @@ class FileInterface(QWidget):
             current.addChild(child)
             current.setExpanded(True)
             current = child
+        # The loop above only expands intermediate path nodes; the current
+        # (last) node must be expanded too so its own subfolders are visible
+        # right after a click navigates here (backlog B22).
+        current.setExpanded(True)
         self.folder_tree.setCurrentItem(current)
 
     def _render_table(self, items: tuple[WopanItem, ...]) -> None:
@@ -2512,6 +2521,7 @@ class MainWindow(_MainWindowBase):
         self._search_window: SearchResultsWindow | None = None
         self._tree_sync_thread: QThread | None = None
         self._tree_sync_worker: BrowserOperationWorker | None = None
+        self._tree_sync_pending = False
         self._copy_thread: QThread | None = None
         self._copy_worker: BrowserOperationWorker | None = None
         self._recycle_list_thread: QThread | None = None
@@ -3168,6 +3178,10 @@ class MainWindow(_MainWindowBase):
         if file_browser is None:
             return
         if self._tree_sync_thread is not None:
+            # A tree sync is in flight; remember the latest intent so the
+            # pending request is replayed once it clears instead of being
+            # dropped (trailing semantics, mirroring the directory refresh).
+            self._tree_sync_pending = True
             LOGGER.debug("main_window.tree_sync.skipped_busy")
             return
         breadcrumb = tuple(self._breadcrumb)
@@ -3223,6 +3237,9 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._tree_sync_thread = None
         self._tree_sync_worker = None
+        if self._tree_sync_pending:
+            self._tree_sync_pending = False
+            self._sync_folder_tree()
 
     def _on_search_jump_requested(
         self,
