@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
@@ -133,6 +134,8 @@ TRANSFER_COL_ACTION = 5
 TRANSFER_ACTION_COLUMN_WIDTH = 156
 TRANSFER_ACTION_BUTTON_SIZE = (32, 24)
 THREAD_JOIN_TIMEOUT_MS = 3000
+# B24：已访问目录 LRU 缓存上限（目录数）；写操作成功后整体失效。
+DIRECTORY_CACHE_MAX_ENTRIES = 128
 UPLOAD_STATUS_FILTERS = (
     "全部",
     "等待中",
@@ -2511,6 +2514,9 @@ class MainWindow(_MainWindowBase):
         self._directory_worker: BrowserOperationWorker | None = None
         self._directory_parent_id: str | None = None
         self._directory_refresh_pending = False
+        # B24：已访问目录缓存（LRU）。键为目录 item_id，值为该目录的文件夹+文件
+        # 完整列表（服务端原始顺序）。仅 GUI 线程读写；写操作成功后整体失效。
+        self._directory_cache: OrderedDict[str, tuple[WopanItem, ...]] = OrderedDict()
         self._after_refresh: tuple[str, Callable[[list[WopanItem], bool], None]] | None = None
         self._create_thread: QThread | None = None
         self._create_worker: BrowserOperationWorker | None = None
@@ -2526,6 +2532,8 @@ class MainWindow(_MainWindowBase):
         self._tree_sync_thread: QThread | None = None
         self._tree_sync_worker: BrowserOperationWorker | None = None
         self._tree_sync_pending = False
+        # 当前树同步缺失层的 (levels 下标, 目录 item_id) 列表；成功落地时据此写缓存。
+        self._tree_sync_missing: tuple[tuple[int, str], ...] = ()
         self._copy_thread: QThread | None = None
         self._copy_worker: BrowserOperationWorker | None = None
         self._recycle_list_thread: QThread | None = None
@@ -2922,6 +2930,7 @@ class MainWindow(_MainWindowBase):
             self._load_transfer_history()
             self._load_persisted_download_records()
         self._recover_uploads()
+        self._invalidate_directory_cache()
         self.refresh_root()
         self.refresh_cloud_usage()
 
@@ -3095,7 +3104,7 @@ class MainWindow(_MainWindowBase):
         """Reload account-side information and the currently opened directory."""
         LOGGER.info("main_window.refresh_all.start")
         self.refresh_cloud_usage()
-        self.refresh_current_directory()
+        self.refresh_current_directory(force=True)
         LOGGER.info("main_window.refresh_all.complete")
 
     def prompt_logout(self) -> None:
@@ -3112,7 +3121,10 @@ class MainWindow(_MainWindowBase):
         self.logout_requested.emit()
 
     def refresh_current_directory(
-        self, after: Callable[[list[WopanItem], bool], None] | None = None
+        self,
+        after: Callable[[list[WopanItem], bool], None] | None = None,
+        *,
+        force: bool = False,
     ) -> None:
         """Load the current directory from the application file browser service.
 
@@ -3123,6 +3135,10 @@ class MainWindow(_MainWindowBase):
         refresh was requested, so directory-dependent checks must be skipped.
         Use this instead of reading ``_items`` right after this call — the
         refresh is asynchronous.
+
+        Pure navigation calls may be served from the visited-directory cache
+        (B24); ``force=True`` or an ``after`` callback always fetches fresh
+        data from the network.
         """
         if self._file_browser is None:
             self._items = []
@@ -3139,6 +3155,18 @@ class MainWindow(_MainWindowBase):
             return
 
         parent_id = self.current_directory_id()
+        cached = self._directory_cache.get(parent_id)
+        if cached is not None and not force and after is None and self._after_refresh is None:
+            # Cache hit (B24): serve the listing synchronously on the GUI
+            # thread — no worker thread, no network request, no loading status.
+            self._directory_cache.move_to_end(parent_id)
+            LOGGER.debug("main_window.refresh.cache_hit parent_id=%s", parent_id)
+            self._items = list(cached)
+            self._render_items()
+            self._consume_after_refresh()
+            self._sync_folder_tree()
+            return
+
         LOGGER.info("main_window.refresh.start parent_id=%s", parent_id)
         self._set_status("正在加载...")
 
@@ -3161,6 +3189,30 @@ class MainWindow(_MainWindowBase):
         self._directory_parent_id = parent_id
         thread.start()
 
+    def _cache_directory(self, item_id: str, items: Iterable[WopanItem]) -> None:
+        """Store a directory listing in the LRU cache (GUI thread only)."""
+        self._directory_cache[item_id] = tuple(items)
+        self._directory_cache.move_to_end(item_id)
+        while len(self._directory_cache) > DIRECTORY_CACHE_MAX_ENTRIES:
+            self._directory_cache.popitem(last=False)
+
+    def _invalidate_directory_cache(self) -> None:
+        """Drop every cached listing (after a server-side mutation)."""
+        if not self._directory_cache:
+            return
+        LOGGER.debug(
+            "main_window.directory_cache.invalidated size=%s", len(self._directory_cache)
+        )
+        self._directory_cache.clear()
+
+    def _consume_after_refresh(self) -> None:
+        """Deliver a stored ``after`` callback now that ``_items`` is fresh."""
+        entry = self._after_refresh
+        self._after_refresh = None
+        if entry is not None:
+            requested_parent_id, after = entry
+            after(self._items, self.current_directory_id() == requested_parent_id)
+
     def _on_directory_refresh_succeeded(self, result: object) -> None:
         self._items = cast(list[WopanItem], result)
         LOGGER.info(
@@ -3168,12 +3220,10 @@ class MainWindow(_MainWindowBase):
             self._directory_parent_id,
             len(self._items),
         )
+        if isinstance(self._directory_parent_id, str):
+            self._cache_directory(self._directory_parent_id, self._items)
         self._render_items()
-        entry = self._after_refresh
-        self._after_refresh = None
-        if entry is not None:
-            requested_parent_id, after = entry
-            after(self._items, self.current_directory_id() == requested_parent_id)
+        self._consume_after_refresh()
         self._sync_folder_tree()
 
     def _sync_folder_tree(self) -> None:
@@ -3190,16 +3240,40 @@ class MainWindow(_MainWindowBase):
             return
         breadcrumb = tuple(self._breadcrumb)
         current_folders = tuple(item for item in self._items if item.kind is WopanItemKind.FOLDER)
-        LOGGER.info("main_window.tree_sync.start depth=%s", len(breadcrumb))
+        # Split the ancestor levels into cached vs missing on the GUI thread
+        # (B24); the worker closure below only ever touches immutable data
+        # captured here (qt-threading contract: no cache access in workers).
+        cached_levels: list[tuple[WopanItem, ...] | None] = []
+        missing: list[tuple[int, str]] = []
+        for index, entry in enumerate(breadcrumb[:-1]):
+            cached = self._directory_cache.get(entry.item_id)
+            if cached is None:
+                missing.append((index, entry.item_id))
+                cached_levels.append(None)
+            else:
+                self._directory_cache.move_to_end(entry.item_id)
+                cached_levels.append(cached)
+        if not missing:
+            # Every ancestor level is cached: render directly on the GUI
+            # thread without spawning a worker or issuing any request.
+            LOGGER.debug("main_window.tree_sync.cache_hit depth=%s", len(breadcrumb))
+            self._on_tree_sync_succeeded([*cached_levels, current_folders])
+            return
+        LOGGER.info(
+            "main_window.tree_sync.start depth=%s missing=%s", len(breadcrumb), len(missing)
+        )
+        missing_levels = tuple(missing)
+        captured_cached = tuple(cached_levels)
 
         def operation() -> list[tuple[WopanItem, ...]]:
-            levels: list[tuple[WopanItem, ...]] = []
-            for entry in breadcrumb:
-                if entry.item_id == breadcrumb[-1].item_id:
-                    levels.append(current_folders)
-                    continue
-                listing = file_browser.list_directory(entry.item_id)
-                levels.append(tuple(item for item in listing if item.kind is WopanItemKind.FOLDER))
+            fetched: dict[int, tuple[WopanItem, ...]] = {}
+            for index, item_id in missing_levels:
+                fetched[index] = tuple(file_browser.list_directory(item_id))
+            levels = [
+                fetched[index] if cached is None else cached
+                for index, cached in enumerate(captured_cached)
+            ]
+            levels.append(current_folders)
             return levels
 
         thread = QThread(self)
@@ -3213,6 +3287,7 @@ class MainWindow(_MainWindowBase):
         worker.failed.connect(thread.quit)
         worker.login_required.connect(thread.quit)
         thread.finished.connect(self._clear_tree_sync)
+        self._tree_sync_missing = missing_levels
         self._tree_sync_thread = thread
         self._tree_sync_worker = worker
         thread.start()
@@ -3225,8 +3300,17 @@ class MainWindow(_MainWindowBase):
         ):
             LOGGER.debug("main_window.tree_sync.invalid_result")
             return
+        # The worker returns FULL listings (folders + files, server order) so
+        # the freshly fetched ancestor levels can be cached (B24); the tree
+        # render consumes the folder subset of each level.
+        for index, item_id in self._tree_sync_missing:
+            self._cache_directory(item_id, cast(Sequence[WopanItem], result[index]))
         self.file_interface.render_folder_tree(
-            tuple(self._breadcrumb), tuple(tuple(level) for level in result)
+            tuple(self._breadcrumb),
+            tuple(
+                tuple(item for item in level if item.kind is WopanItemKind.FOLDER)
+                for level in result
+            ),
         )
 
     def _on_tree_sync_failed(self, message: str) -> None:
@@ -3241,6 +3325,7 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._tree_sync_thread = None
         self._tree_sync_worker = None
+        self._tree_sync_missing = ()
         if self._tree_sync_pending:
             self._tree_sync_pending = False
             self._sync_folder_tree()
@@ -3437,6 +3522,7 @@ class MainWindow(_MainWindowBase):
         created_item = cast(WopanItem, result)
         folder_name = self._create_folder_name or created_item.name
         LOGGER.info("main_window.create_folder.success item_id=%s", created_item.item_id)
+        self._invalidate_directory_cache()
         self.refresh_current_directory(
             after=lambda items, still_current: self._report_create_visibility(
                 created_item, folder_name, still_current
@@ -3505,6 +3591,7 @@ class MainWindow(_MainWindowBase):
         thread.start()
 
     def _on_rename_succeeded(self, result: object) -> None:
+        self._invalidate_directory_cache()
         self.refresh_current_directory()
 
     def _on_rename_failed(self, message: str) -> None:
@@ -3555,6 +3642,7 @@ class MainWindow(_MainWindowBase):
         thread.start()
 
     def _on_delete_succeeded(self, result: object) -> None:
+        self._invalidate_directory_cache()
         self.refresh_current_directory()
 
     def _on_delete_failed(self, message: str) -> None:
@@ -3653,6 +3741,7 @@ class MainWindow(_MainWindowBase):
         thread.start()
 
     def _on_move_succeeded(self, result: object) -> None:
+        self._invalidate_directory_cache()
         self.refresh_current_directory()
 
     def _on_move_failed(self, message: str) -> None:
@@ -3669,6 +3758,7 @@ class MainWindow(_MainWindowBase):
         self._move_worker = None
 
     def _on_copy_succeeded(self, result: object) -> None:
+        self._invalidate_directory_cache()
         self.refresh_current_directory()
         InfoBar.success(title="复制", content="复制完成", parent=self)
 
@@ -3794,6 +3884,9 @@ class MainWindow(_MainWindowBase):
         thread.start()
 
     def _on_recycle_restore_succeeded(self, result: object) -> None:
+        # 恢复的目标目录不一定是当前目录；脏标记消费只强制刷新当前目录，
+        # 其他目录的缓存必须整体失效，否则导航过去会看到缺少恢复文件的旧列表。
+        self._invalidate_directory_cache()
         self._recycle_dirty = True
         self._set_status("恢复成功，已回到原位置")
         self.refresh_recycle_items()
@@ -4705,6 +4798,9 @@ class MainWindow(_MainWindowBase):
         self._folder_upload_cancel_count = 0
         self._folder_upload_target_dir_id = None
         self._folder_upload_record_id = None
+        # The batch is final: files (or partial uploads, for cancels) may have
+        # landed on the server, so every cached listing is stale (B24).
+        self._invalidate_directory_cache()
         if root_id in self._upload_removal_requested:
             self._upload_removal_requested.discard(root_id)
             self.transfer_interface.remove_records("upload", {root_id})
@@ -5133,7 +5229,8 @@ class MainWindow(_MainWindowBase):
         item = self._item_at_row(row)
         menu = QMenu(self)
         if item is None:
-            menu.addAction("刷新", self.refresh_current_directory)
+            # B24：显式刷新入口一律强制拉取（与顶栏刷新按钮一致），不能吃缓存。
+            menu.addAction("刷新", lambda: self.refresh_current_directory(force=True))
             menu.addAction("新建文件夹", self.prompt_create_folder)
             menu.addAction("上传文件", self.prompt_upload_file)
             menu.addAction("上传文件夹", self.prompt_upload_folder)
@@ -5504,6 +5601,9 @@ class MainWindow(_MainWindowBase):
             self._upload_removal_requested.discard(task_id)
             self.transfer_interface.remove_records("upload", {task_id})
         if not self._closing and not folder_child:
+            # A cancelled upload may have landed partially on the server; the
+            # refresh below must see fresh data (B24).
+            self._invalidate_directory_cache()
             self.refresh_current_directory()
 
     def _on_upload_succeeded(self, item: object, task_id: str | None = None) -> None:
@@ -5545,6 +5645,7 @@ class MainWindow(_MainWindowBase):
                 self._folder_upload_failure_count -= 1
             self._folder_upload_success_count += 1
             return
+        self._invalidate_directory_cache()
         self.refresh_current_directory(
             after=lambda items, still_current: self._report_upload_visibility(item, still_current)
         )

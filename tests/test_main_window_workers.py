@@ -1319,9 +1319,14 @@ def test_finished_thread_is_deleted_by_gui_cleanup(
     window = MainWindow(WorkerFileBrowser())
 
     window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    # B24 后祖先层命中缓存的树同步不再建线程；丢弃根目录缓存后手动触发一次
+    # 树同步，确保树同步线程路径同样被 GUI 清理回收。
+    window._directory_cache.pop(ROOT_DIRECTORY_ID, None)
+    window._sync_folder_tree()
 
-    # 目录刷新会连带触发一次树同步线程，两个线程结束后都被 GUI 清理回收
-    assert delete_later_calls == [True, True]
+    # 两次目录刷新 + 一次树同步，三个线程结束后都被 GUI 清理回收
+    assert delete_later_calls == [True, True, True]
     assert worker_delete_later_calls == []
 
 
@@ -3166,6 +3171,9 @@ class FakeMenu:
         else:
             action = SimpleNamespace()
             action.text = (lambda text: (lambda: text))(args[0])
+            if len(args) > 1 and callable(args[1]):
+                # 捕获菜单项绑定的回调，测试可用 action.trigger() 模拟点击。
+                action.trigger = args[1]
             self._actions.append(action)
 
     def actions(self) -> list[object]:
@@ -3208,6 +3216,36 @@ def test_open_file_context_menu_builds_menu_per_row_type(
         "上传文件",
         "上传文件夹",
     ]
+
+
+def test_context_menu_refresh_forces_refetch_despite_cache(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B24：右键菜单「刷新」是显式刷新意图，命中缓存也必须重新拉取。
+
+    回归对象是菜单绑定本身：借 FakeMenu（记录实例并捕获 addAction 的回调为
+    action.trigger）拿到「刷新」菜单项绑定的可调用对象并触发它，而非直接调用
+    refresh_current_directory(force=True)。
+    """
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()  # 预热根目录缓存
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID]
+    # 控制组：纯导航命中缓存，不发请求
+    window.open_breadcrumb_index(0)
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID]
+
+    monkeypatch.setattr(main_window_module, "QMenu", FakeMenu)
+    monkeypatch.setattr(window.file_interface.file_table, "rowAt", lambda y: -1)
+    window.open_file_context_menu(QPoint(1, 1))
+    empty_menu = FakeMenu.instances[-1]
+    refresh_actions = [action for action in empty_menu.actions() if action.text() == "刷新"]
+    assert len(refresh_actions) == 1
+
+    refresh_actions[0].trigger()  # 模拟点击「刷新」
+
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, ROOT_DIRECTORY_ID]
+    assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
 def test_name_input_dialog_accepts_non_empty_text_only(qapp: QApplication) -> None:
@@ -4998,6 +5036,8 @@ def test_tree_sync_busy_request_sets_pending_and_replays_on_clear(
     assert window._tree_sync_pending is True
     assert len(browser.requested_parent_ids) == calls_before  # skipped, not run
 
+    # B24：祖先层（根目录）已进缓存；先丢弃它，重放的树同步必须重新发列表请求。
+    window._directory_cache.pop(ROOT_DIRECTORY_ID, None)
     window._clear_tree_sync()  # the in-flight sync finishes and clears
 
     # The pending request must be replayed, not dropped silently: a fresh sync
@@ -5048,6 +5088,250 @@ def test_navigation_during_tree_sync_rebuilds_tree_from_new_breadcrumb(
     assert [folder_node.child(i).text(0) for i in range(folder_node.childCount())] == ["2"]
     assert folder_node.isExpanded() is True
     assert tree.currentItem() is folder_node
+
+
+# ---------------------------------------------------------------------------
+# B24：已访问目录缓存。回归基准：修复前每次导航都对目标目录与每层祖先重发
+# list_directory；修复后纯导航命中缓存，表格与树仍正确渲染。
+# ---------------------------------------------------------------------------
+
+
+def _deep_tree_browser() -> WorkerFileBrowser:
+    """Root → folder-1 → folder-2 三级目录，每层一个条目。"""
+    browser = WorkerFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = [
+        WopanItem(
+            item_id="folder-1",
+            name="Folder",
+            kind=WopanItemKind.FOLDER,
+            parent_id=ROOT_DIRECTORY_ID,
+        ),
+    ]
+    browser.items_by_parent["folder-1"] = [
+        WopanItem(
+            item_id="folder-2",
+            name="2",
+            kind=WopanItemKind.FOLDER,
+            parent_id="folder-1",
+        ),
+    ]
+    browser.items_by_parent["folder-2"] = [
+        WopanItem(
+            item_id="deep-file",
+            name="deep.txt",
+            kind=WopanItemKind.FILE,
+            parent_id="folder-2",
+        )
+    ]
+    return browser
+
+
+def test_reentering_directory_serves_cache_without_second_listing(
+    qapp: QApplication,
+) -> None:
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    window.open_breadcrumb_index(0)  # 返回根目录（命中缓存）
+    window.enter_displayed_folder(0)  # 再次进入 folder-1（命中缓存）
+
+    # 第二次进入不再对 folder-1 发列表请求
+    assert browser.requested_parent_ids.count("folder-1") == 1
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, "folder-1"]
+    assert window.current_directory_id() == "folder-1"
+    # 表格与树仍然渲染正确
+    assert [item.name for item in window.displayed_items()] == ["2"]
+    tree = window.file_interface.folder_tree
+    folder_node = tree.topLevelItem(0).child(0)
+    assert folder_node.text(0) == "Folder"
+    assert tree.currentItem() is folder_node
+
+
+def test_second_deep_navigation_makes_zero_list_requests_and_rerenders(
+    qapp: QApplication,
+) -> None:
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    window.enter_displayed_folder(0)
+    first_round = list(browser.requested_parent_ids)
+    # 第一轮只发目标目录请求；祖先层要么来自缓存，要么随首轮导航入库
+    assert first_round == [ROOT_DIRECTORY_ID, "folder-1", "folder-2"]
+
+    window.open_breadcrumb_index(0)
+    window.enter_displayed_folder(0)
+    window.enter_displayed_folder(0)
+
+    # 第二轮（含树同步）零请求
+    assert browser.requested_parent_ids == first_round
+    assert window.current_directory_id() == "folder-2"
+    assert [item.name for item in window.displayed_items()] == ["deep.txt"]
+    tree = window.file_interface.folder_tree
+    deep_node = tree.topLevelItem(0).child(0).child(0)
+    assert deep_node.text(0) == "2"
+    assert tree.currentItem() is deep_node
+
+
+def test_force_refresh_at_depth_fetches_only_current_directory(
+    qapp: QApplication,
+) -> None:
+    """B24：显式刷新是最小请求语义——只重拉当前目录，祖先层仍吃缓存。"""
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    window.enter_displayed_folder(0)  # 当前位于 /root/Folder/2，各级缓存已暖
+    warm = list(browser.requested_parent_ids)
+    assert warm == [ROOT_DIRECTORY_ID, "folder-1", "folder-2"]
+
+    window.refresh_all_information()  # 顶栏刷新按钮路径（force）
+
+    # 强制刷新 = 最小请求：仅当前目录 folder-2 重拉一次，两个祖先层零请求
+    assert browser.requested_parent_ids == warm + ["folder-2"]
+    assert window.current_directory_id() == "folder-2"
+    assert [item.name for item in window.displayed_items()] == ["deep.txt"]
+    tree = window.file_interface.folder_tree
+    deep_node = tree.topLevelItem(0).child(0).child(0)
+    assert deep_node.text(0) == "2"
+    assert tree.currentItem() is deep_node
+
+
+def test_tree_sync_partial_cache_hit_fetches_only_missing_ancestors(
+    qapp: QApplication,
+) -> None:
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()  # 只预热根目录缓存
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID]
+
+    # 一次跳两层：目标目录 folder-2 由刷新拉取；祖先层中根目录已缓存、
+    # folder-1 缺失——树同步只应对缺失层补发请求
+    window.open_tree_path(
+        (ROOT_DIRECTORY_ID, "folder-1", "folder-2"), ("/", "Folder", "2")
+    )
+
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, "folder-2", "folder-1"]
+
+    # 树同步补拉的层落地缓存：随后两次纯导航零请求
+    window.open_breadcrumb_index(1)
+    window.enter_displayed_folder(0)
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, "folder-2", "folder-1"]
+    assert window.current_directory_id() == "folder-2"
+    assert [item.name for item in window.displayed_items()] == ["deep.txt"]
+
+
+def test_after_callback_forces_network_fetch_even_when_cached(
+    qapp: QApplication,
+) -> None:
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    calls_after_warm = len(browser.requested_parent_ids)
+
+    seen: list[tuple[list[str], bool]] = []
+    window.refresh_current_directory(
+        after=lambda items, still_current: seen.append(
+            ([item.name for item in items], still_current)
+        )
+    )
+
+    # 带 after 的调用一律强制拉取，不能被缓存路径吞掉
+    assert len(browser.requested_parent_ids) == calls_after_warm + 1
+    assert seen == [(["Folder"], True)]
+    assert window._after_refresh is None
+
+
+def test_refresh_all_information_refetches_when_directory_cached(
+    qapp: QApplication,
+) -> None:
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    calls_after_warm = len(browser.requested_parent_ids)
+
+    window.refresh_all_information()
+
+    assert len(browser.requested_parent_ids) == calls_after_warm + 1
+    assert [item.name for item in window.displayed_items()] == ["Folder"]
+
+
+@pytest.mark.parametrize(
+    "succeed_handler",
+    [
+        pytest.param(
+            lambda window: window._on_create_folder_succeeded(
+                WopanItem(item_id="new-folder", name="new", kind=WopanItemKind.FOLDER)
+            ),
+            id="create",
+        ),
+        pytest.param(lambda window: window._on_rename_succeeded(None), id="rename"),
+        pytest.param(lambda window: window._on_delete_succeeded(None), id="delete"),
+        pytest.param(lambda window: window._on_move_succeeded(None), id="move"),
+        pytest.param(lambda window: window._on_copy_succeeded(None), id="copy"),
+    ],
+)
+def test_write_success_invalidates_cache_so_later_navigation_refetches(
+    qapp: QApplication, succeed_handler: Callable[[MainWindow], None]
+) -> None:
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    window.open_breadcrumb_index(0)
+    assert set(window._directory_cache) == {ROOT_DIRECTORY_ID, "folder-1"}
+    assert browser.requested_parent_ids.count("folder-1") == 1
+
+    succeed_handler(window)
+
+    # 写成功清空缓存：重新进入 folder-1 必须重新拉取，且渲染真实列表
+    window.enter_displayed_folder(0)
+    assert browser.requested_parent_ids.count("folder-1") == 2
+    assert [item.name for item in window.displayed_items()] == ["2"]
+
+
+def test_directory_cache_lru_cap_evicts_oldest_and_hit_refreshes_recency(
+    qapp: QApplication,
+) -> None:
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+    items = browser.items_by_parent[ROOT_DIRECTORY_ID]
+    cap = main_window_module.DIRECTORY_CACHE_MAX_ENTRIES
+
+    for index in range(cap):
+        window._cache_directory(f"dir-{index:03}", items)
+    assert len(window._directory_cache) == cap
+
+    # 对最旧条目的导航命中（缓存命中路径 move_to_end）刷新其新鲜度
+    window.open_tree_path(("dir-000",), ("d0",))
+    assert browser.requested_parent_ids == []  # 全程未发请求
+
+    window._cache_directory("dir-new", items)  # 第 cap+1 个目录
+
+    assert len(window._directory_cache) == cap
+    assert "dir-001" not in window._directory_cache  # 新的最旧者被淘汰
+    assert "dir-000" in window._directory_cache  # 命中救回了原最旧条目
+    assert "dir-new" in window._directory_cache
+
+
+def test_set_file_browser_clears_cached_directories_from_previous_session(
+    qapp: QApplication,
+) -> None:
+    browser = _deep_tree_browser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    assert set(window._directory_cache) == {ROOT_DIRECTORY_ID, "folder-1"}
+
+    window.set_file_browser(_deep_tree_browser())
+
+    # 旧会话的目录条目全部丢弃；新会话只回填当前刷新到的根目录
+    assert "folder-1" not in window._directory_cache
+    assert set(window._directory_cache) == {ROOT_DIRECTORY_ID}
 
 
 def test_render_folder_tree_sorts_siblings_casefold_and_keeps_path_order(
