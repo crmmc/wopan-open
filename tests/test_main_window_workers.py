@@ -7085,6 +7085,17 @@ def test_upload_drop_uses_one_summary_for_conflict_decision(
 
     assert _wait_until(qapp, lambda: window._scan_thread is None and bool(dialogs))
     assert dialogs == [(2, (conflicting,))]
+    # 上传在真实线程上异步执行；断言前必须等线程排空、记录到终态，
+    # 否则 == 求值与失败 repr 渲染之间列表仍在变（CI 慢机上稳定复现的竞态）。
+    assert _wait_until(
+        qapp,
+        lambda: not window._upload_threads
+        and len(window.transfer_interface.upload_records) == len(expected_names)
+        and all(
+            record.status in {"失败", "已完成"}
+            for record in window.transfer_interface.upload_records
+        ),
+    )
     assert browser.upload_names == expected_names
     assert [record.name for record in window.transfer_interface.upload_records] == expected_names
     assert ROOT_DIRECTORY_ID in browser.requested_parent_ids
