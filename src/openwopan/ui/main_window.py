@@ -2393,6 +2393,10 @@ class FileInterface(QWidget):
         self.folder_tree.setCurrentItem(current)
 
     def _render_table(self, items: tuple[WopanItem, ...]) -> None:
+        # A refill keeps still-in-range row selections alive, so a stale row
+        # would silently point at a different entry; the window updates
+        # ``self._items`` before rendering, so handlers read consistent state.
+        self.file_table.clearSelection()
         self.file_table.setRowCount(len(items))
         for row, item in enumerate(items):
             values = (

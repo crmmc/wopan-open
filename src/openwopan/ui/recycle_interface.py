@@ -101,6 +101,10 @@ class RecycleInterface(QWidget):
     def render_items(self, items: Sequence[WopanRecycleItem]) -> None:
         """Render recycle-bin rows and refresh the empty/action state."""
         self._items = list(items)
+        # A refill keeps still-in-range row selections alive, so a stale row
+        # would silently point at a different entry; clear it while the
+        # handler already sees the new ``self._items``.
+        self.item_table.clearSelection()
         self.item_table.setRowCount(len(self._items))
         for row, item in enumerate(self._items):
             values = (

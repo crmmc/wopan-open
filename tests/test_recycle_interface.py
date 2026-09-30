@@ -198,6 +198,25 @@ def test_selection_updates_restore_and_purge_buttons(qapp: QApplication) -> None
     assert not interface.purge_button.isEnabled()
 
 
+def test_render_items_clears_stale_row_selection(qapp: QApplication) -> None:
+    interface = RecycleInterface()
+    interface.render_items(
+        [
+            _recycle_item("d-1", "a.txt"),
+            _recycle_item("d-2", "b.txt"),
+            _recycle_item("d-3", "c.txt"),
+        ]
+    )
+    interface.item_table.selectRow(1)
+    assert interface.restore_button.isEnabled()
+
+    interface.render_items([_recycle_item("d-1", "a.txt"), _recycle_item("d-3", "c.txt")])
+
+    assert interface.selected_items() == ()
+    assert not interface.restore_button.isEnabled()
+    assert not interface.purge_button.isEnabled()
+
+
 def test_restore_button_emits_selected_delete_nos_without_prompt(
     qapp: QApplication, stub_message_box
 ) -> None:
