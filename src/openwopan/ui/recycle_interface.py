@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal
@@ -14,11 +14,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qfluentwidgets import BodyLabel, MessageBox, PushButton, TableWidget
+from qfluentwidgets import BodyLabel, MessageBox, PushButton, SearchLineEdit, TableWidget
 from qfluentwidgets import FluentIcon as FIF
 
 from openwopan.ui.formatting import format_items_summary, format_kind, format_size
-from openwopan.wopan.models import WopanRecycleItem
+from openwopan.ui.table_view import (
+    NO_MATCH_TEXT,
+    TableSortState,
+    cycle_sort_state,
+    sorted_view,
+    sync_sort_indicator,
+)
+from openwopan.wopan.models import WopanItemKind, WopanRecycleItem
 
 RECYCLE_TABLE_HEADERS = ("名称", "类型", "大小", "删除时间", "剩余天数")
 COL_NAME = 0
@@ -29,6 +36,22 @@ COL_KEEP_DAYS = 4
 EMPTY_STATE_TEXT = "回收站是空的"
 UNKNOWN_VALUE = "--"
 DELETE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+NAME_FILTER_PLACEHOLDER = "搜索回收站"
+
+
+def _kind_rank(item: WopanRecycleItem) -> int:
+    return 0 if item.kind is WopanItemKind.FOLDER else 1
+
+
+# Header-click sort keys per column (design.md: data-level sorting with
+# None-guarded numeric keys; folders sort before files on the kind column).
+RECYCLE_TABLE_SORT_KEYS: dict[int, Callable[[WopanRecycleItem], object]] = {
+    COL_NAME: lambda item: item.name.casefold(),
+    COL_KIND: _kind_rank,
+    COL_SIZE: lambda item: item.size or 0,
+    COL_DELETED_AT: lambda item: item.deleted_at or datetime.min,
+    COL_KEEP_DAYS: lambda item: item.keep_days or 0,
+}
 
 
 class RecycleInterface(QWidget):
@@ -48,6 +71,11 @@ class RecycleInterface(QWidget):
         super().__init__(parent)
         self.setObjectName("RecycleInterface")
         self._items: list[WopanRecycleItem] = []
+        # View-layer state (session-persistent, never written to disk): the
+        # rendered sequence is filter+sort applied to ``self._items``.
+        self._sort_state = TableSortState()
+        self._name_filter = ""
+        self._visible: list[WopanRecycleItem] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 24)
@@ -61,11 +89,15 @@ class RecycleInterface(QWidget):
         self.purge_button.setEnabled(False)
         self.empty_button = PushButton(FIF.BROOM.icon(), "清空回收站", self)
         self.empty_button.setEnabled(False)
+        self.name_filter_bar = SearchLineEdit(self)
+        self.name_filter_bar.setPlaceholderText(NAME_FILTER_PLACEHOLDER)
+        self.name_filter_bar.setFixedWidth(200)
         self.refresh_button = PushButton(FIF.UPDATE.icon(), "刷新", self)
         action_layout.addWidget(self.restore_button)
         action_layout.addWidget(self.purge_button)
         action_layout.addWidget(self.empty_button)
         action_layout.addStretch(1)
+        action_layout.addWidget(self.name_filter_bar)
         action_layout.addWidget(self.refresh_button)
         layout.addLayout(action_layout)
 
@@ -86,6 +118,14 @@ class RecycleInterface(QWidget):
             header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
             for column in (COL_KIND, COL_SIZE, COL_DELETED_AT, COL_KEEP_DAYS):
                 header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            # Header-click sorting is data-level; the indicator is visual only
+            # (table sorting stays disabled — formatted size text must not be
+            # sorted lexicographically by Qt).
+            header.setSortIndicatorShown(True)
+            # QHeaderView's untouched indicator section is an out-of-range
+            # sentinel; clear it to -1 so "no sort" is always observable.
+            sync_sort_indicator(header, TableSortState())
+            header.sectionClicked.connect(self._on_header_section_clicked)
         layout.addWidget(self.item_table, 1)
 
         self.empty_label = BodyLabel(EMPTY_STATE_TEXT, self)
@@ -96,17 +136,24 @@ class RecycleInterface(QWidget):
         self.purge_button.clicked.connect(self._on_purge_clicked)
         self.empty_button.clicked.connect(self._on_empty_clicked)
         self.refresh_button.clicked.connect(lambda: self.refresh_requested.emit())
+        self.name_filter_bar.textChanged.connect(self._on_name_filter_changed)
         self.item_table.itemSelectionChanged.connect(self._update_action_buttons)
 
     def render_items(self, items: Sequence[WopanRecycleItem]) -> None:
-        """Render recycle-bin rows and refresh the empty/action state."""
+        """Store the backing rows (source order) and render the current view."""
         self._items = list(items)
+        visible = sorted_view(
+            [item for item in self._items if self._name_filter_matches(item)],
+            self._sort_state,
+            RECYCLE_TABLE_SORT_KEYS,
+        )
+        self._visible = visible
         # A refill keeps still-in-range row selections alive, so a stale row
         # would silently point at a different entry; clear it while the
-        # handler already sees the new ``self._items``.
+        # handler already sees the new ``self._items``/``self._visible``.
         self.item_table.clearSelection()
-        self.item_table.setRowCount(len(self._items))
-        for row, item in enumerate(self._items):
+        self.item_table.setRowCount(len(visible))
+        for row, item in enumerate(visible):
             values = (
                 item.name,
                 format_kind(item.kind),
@@ -123,10 +170,30 @@ class RecycleInterface(QWidget):
                     )
                 self.item_table.setItem(row, column, table_item)
         has_items = bool(self._items)
-        self.item_table.setVisible(has_items)
-        self.empty_label.setVisible(not has_items)
+        has_visible = bool(visible)
+        self.item_table.setVisible(has_visible)
+        self.empty_label.setVisible(not has_visible)
+        # An empty *view* over a non-empty bin means the name filter matched
+        # nothing — distinct wording from the genuine empty-bin state.
+        self.empty_label.setText(NO_MATCH_TEXT if has_items else EMPTY_STATE_TEXT)
         self.empty_button.setEnabled(has_items)
         self._update_action_buttons()
+
+    def _name_filter_matches(self, item: WopanRecycleItem) -> bool:
+        query = self._name_filter.casefold()
+        return not query or query in item.name.casefold()
+
+    def _on_name_filter_changed(self, text: str) -> None:
+        """Re-render from the in-memory backing list (immediate, no request)."""
+        self._name_filter = text
+        self.render_items(self._items)
+
+    def _on_header_section_clicked(self, column: int) -> None:
+        if column not in RECYCLE_TABLE_SORT_KEYS:
+            return
+        self._sort_state = cycle_sort_state(self._sort_state, column)
+        sync_sort_indicator(self.item_table.horizontalHeader(), self._sort_state)
+        self.render_items(self._items)
 
     def selected_items(self) -> tuple[WopanRecycleItem, ...]:
         """Return the selected recycle entries in display order."""
@@ -134,7 +201,7 @@ class RecycleInterface(QWidget):
         if selection_model is None:  # pragma: no cover - docs/testing-exemptions.md
             return ()
         rows = sorted(index.row() for index in selection_model.selectedRows())
-        return tuple(self._items[row] for row in rows)
+        return tuple(self._visible[row] for row in rows)
 
     def _update_action_buttons(self) -> None:
         has_selection = bool(self.selected_items())

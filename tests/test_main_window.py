@@ -5,8 +5,9 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QThread
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QFrame
+from qfluentwidgets import TableWidget
 
 import openwopan.ui.main_window as main_window_module
 from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError
@@ -14,14 +15,27 @@ from openwopan.auth.session import AuthSession
 from openwopan.storage.settings import AppSettings
 from openwopan.ui.main_window import (
     DOWNLOAD_STATUS_FILTERS,
+    FILE_COL_KIND,
+    FILE_COL_NAME,
+    FILE_COL_SIZE,
     FILE_SPLITTER_STRETCH_FACTORS,
+    FILE_TYPE_FILTER_ALL,
+    FILE_TYPE_FILTER_FILES,
+    FILE_TYPE_FILTER_FOLDERS,
     ROOT_DISPLAY_NAME,
+    TRANSFER_COL_ACTION,
+    TRANSFER_COL_NAME,
     TRANSFER_COL_PROGRESS,
+    TRANSFER_COL_SIZE,
+    TRANSFER_COL_SPEED,
+    TRANSFER_COL_STATUS,
     TRANSFER_TABLE_HEADERS,
     UPLOAD_STATUS_FILTERS,
     MainWindow,
+    TransferInterface,
     TransferRecord,
 )
+from openwopan.ui.table_view import NO_MATCH_TEXT
 from openwopan.ui.target_folder_dialog import TargetEntry, TargetFolderDialog
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, WopanRecycleItem
@@ -1478,3 +1492,481 @@ def test_move_copy_delete_show_busy_indicator_until_terminal(qapp: QApplication)
 
     assert browser.busy_snapshots == {"move": True, "copy": True, "delete": True}
     assert window.file_interface.operation_busy_bar.isHidden()
+
+
+# ---------------------------------------------------------------------------
+# File-page header-click sorting and type filtering (10-01-table-sort-filter)
+# ---------------------------------------------------------------------------
+
+
+def _rich_root_items() -> list[WopanItem]:
+    return [
+        WopanItem(
+            item_id="folder-b", name="Zed", kind=WopanItemKind.FOLDER, parent_id=ROOT_DIRECTORY_ID
+        ),
+        WopanItem(
+            item_id="file-a",
+            name="b.txt",
+            kind=WopanItemKind.FILE,
+            parent_id=ROOT_DIRECTORY_ID,
+            size=999,
+        ),
+        WopanItem(
+            item_id="file-b",
+            name="A.txt",
+            kind=WopanItemKind.FILE,
+            parent_id=ROOT_DIRECTORY_ID,
+            size=1_000_000,
+        ),
+        WopanItem(
+            item_id="file-c",
+            name="报告.pdf",
+            kind=WopanItemKind.FILE,
+            parent_id=ROOT_DIRECTORY_ID,
+            size=2048,
+        ),
+        WopanItem(
+            item_id="folder-a",
+            name="alpha",
+            kind=WopanItemKind.FOLDER,
+            parent_id=ROOT_DIRECTORY_ID,
+        ),
+    ]
+
+
+def _file_row_names(window: MainWindow) -> list[str]:
+    table = window.file_interface.file_table
+    return [table.item(row, FILE_COL_NAME).text() for row in range(table.rowCount())]
+
+
+def test_file_page_sort_by_name_casefold(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)
+
+    assert _file_row_names(window) == ["A.txt", "alpha", "b.txt", "Zed", "报告.pdf"]
+    header = window.file_interface.file_table.horizontalHeader()
+    assert header.sortIndicatorSection() == FILE_COL_NAME
+    assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+
+
+def test_file_page_sort_by_name_descending(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)
+
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)
+
+    assert _file_row_names(window) == ["报告.pdf", "Zed", "b.txt", "alpha", "A.txt"]
+
+
+def test_file_page_sort_by_size_is_numeric_not_lexicographic(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.file_interface._on_table_header_clicked(FILE_COL_SIZE)
+
+    # Folders carry size None (keyed as 0) and stay ahead of the files;
+    # "1.0 MB" must not lexicographically precede "999 B".
+    assert _file_row_names(window) == ["Zed", "alpha", "b.txt", "报告.pdf", "A.txt"]
+
+
+def test_file_page_sort_by_kind_puts_folders_first(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.file_interface._on_table_header_clicked(FILE_COL_KIND)
+
+    assert _file_row_names(window)[:2] == ["Zed", "alpha"]
+    assert sorted(_file_row_names(window)[2:]) == ["A.txt", "b.txt", "报告.pdf"]
+
+
+def test_file_page_sort_cycle_returns_to_server_order(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    for _click in range(3):
+        window.file_interface._on_table_header_clicked(FILE_COL_NAME)
+
+    assert _file_row_names(window) == ["Zed", "b.txt", "A.txt", "报告.pdf", "alpha"]
+    header = window.file_interface.file_table.horizontalHeader()
+    assert header.sortIndicatorSection() == -1
+
+
+def test_file_page_sort_keeps_backing_order_untouched(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)
+
+    assert [item.name for item in window.displayed_items()] == [
+        "Zed",
+        "b.txt",
+        "A.txt",
+        "报告.pdf",
+        "alpha",
+    ]
+
+
+def test_file_page_type_filter_combo(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    combo = window.file_interface.type_filter_combo
+
+    combo.setCurrentText(FILE_TYPE_FILTER_FOLDERS)
+    assert _file_row_names(window) == ["Zed", "alpha"]
+    assert window.status_message().startswith("2 项")
+
+    combo.setCurrentText(FILE_TYPE_FILTER_FILES)
+    assert _file_row_names(window) == ["b.txt", "A.txt", "报告.pdf"]
+
+    combo.setCurrentText(FILE_TYPE_FILTER_ALL)
+    assert len(_file_row_names(window)) == 5
+
+
+def test_file_page_type_filter_no_match_shows_no_match_status(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    assert [item.name for item in window.displayed_items()] == ["child.txt"]
+
+    window.file_interface.type_filter_combo.setCurrentText(FILE_TYPE_FILTER_FOLDERS)
+
+    assert _file_row_names(window) == []
+    assert window.status_message() == NO_MATCH_TEXT
+
+    window.file_interface.type_filter_combo.setCurrentText(FILE_TYPE_FILTER_ALL)
+    assert _file_row_names(window) == ["child.txt"]
+    assert window.status_message().startswith("1 项")
+
+
+def test_file_page_type_filter_combo_follows_operations_enabled(qapp: QApplication) -> None:
+    logged_out = MainWindow()
+    assert not logged_out.file_interface.type_filter_combo.isEnabled()
+
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    assert window.file_interface.type_filter_combo.isEnabled()
+
+
+def test_file_page_enter_folder_from_filtered_view(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface.type_filter_combo.setCurrentText(FILE_TYPE_FILTER_FOLDERS)
+    assert _file_row_names(window) == ["Folder"]
+
+    # Row 0 of the filtered view is the folder itself; entering it must work
+    # even though the backing list also holds report.txt at row 0.
+    window.enter_displayed_folder(0)
+
+    assert window.current_directory_id() == "folder-1"
+    assert [item.name for item in window.displayed_items()] == ["child.txt"]
+
+
+def test_file_page_delete_targets_visible_rows_under_sort(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)  # descending
+    assert _file_row_names(window)[0] == "报告.pdf"
+
+    # Row 0 of the sorted view is file-c (报告.pdf), not the backing list's
+    # own row 0 — the deletion must remove exactly the displayed entry.
+    window.delete_displayed_items([0])
+
+    assert browser.deleted_items == ["file-c"]
+
+
+def test_file_page_select_item_row_uses_visible_order(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)  # descending
+    # Descending rows: Zed, 报告.pdf, b.txt, alpha, A.txt → file-a lands at row 2.
+
+    window._select_item_row("file-a")
+
+    assert window.selected_rows() == [2]
+
+
+def test_file_page_sort_persists_across_navigation(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = _rich_root_items()
+    browser.items_by_parent["folder-a"] = [
+        WopanItem(
+            item_id="nested-file",
+            name="nested.txt",
+            kind=WopanItemKind.FILE,
+            parent_id="folder-a",
+            size=1,
+        )
+    ]
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    window.file_interface._on_table_header_clicked(FILE_COL_NAME)
+    # Ascending rows: A.txt, alpha, b.txt, Zed, 报告.pdf → alpha is row 1.
+    assert _file_row_names(window)[1] == "alpha"
+
+    window.enter_displayed_folder(1)
+    assert _file_row_names(window) == ["nested.txt"]
+    window.go_up_one_level()
+
+    assert _file_row_names(window) == ["A.txt", "alpha", "b.txt", "Zed", "报告.pdf"]
+    assert window.current_directory_id() == ROOT_DIRECTORY_ID
+
+
+def test_file_page_b24_cache_hit_applies_active_filter(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    window.enter_displayed_folder(0)
+    window.file_interface.type_filter_combo.setCurrentText(FILE_TYPE_FILTER_FILES)
+    assert _file_row_names(window) == ["child.txt"]
+    listing_calls_after_enter = len(browser.requested_parent_ids)
+
+    window.go_up_one_level()
+
+    # Returning to the cached root issues no extra listing (B24) and the
+    # filter still shapes the rendered rows.
+    assert len(browser.requested_parent_ids) == listing_calls_after_enter
+    assert _file_row_names(window) == ["report.txt"]
+
+
+# ---------------------------------------------------------------------------
+# Transfer-page header-click sorting (10-01-table-sort-filter)
+# ---------------------------------------------------------------------------
+
+
+def _upload_record(task_id: str, name: str, **overrides: object) -> TransferRecord:
+    values: dict[str, object] = {
+        "task_id": task_id,
+        "direction": "upload",
+        "name": name,
+        "size": 100,
+        "status": "已完成",
+    }
+    values.update(overrides)
+    return TransferRecord(**values)  # type: ignore[arg-type]
+
+
+def _transfer_row_names(transfer: TransferInterface, table: TableWidget) -> list[str]:
+    return [table.item(row, TRANSFER_COL_NAME).text() for row in range(table.rowCount())]
+
+
+def test_transfer_sort_by_name_casefold(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-1", "c.txt"))
+    transfer.add_upload_record(_upload_record("t-2", "B.txt"))
+    transfer.add_upload_record(_upload_record("t-3", "报告.txt"))
+
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_NAME)
+
+    assert _transfer_row_names(transfer, transfer.upload_table) == ["B.txt", "c.txt", "报告.txt"]
+    header = transfer.upload_table.horizontalHeader()
+    assert header.sortIndicatorSection() == TRANSFER_COL_NAME
+    assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+    # The backing list keeps insertion order.
+    assert [record.name for record in transfer.upload_records] == ["c.txt", "B.txt", "报告.txt"]
+
+
+def test_transfer_sort_by_size_numeric_with_none(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-1", "mb.txt", size=1_000_000))
+    transfer.add_upload_record(_upload_record("t-2", "unknown.txt", size=None))
+    transfer.add_upload_record(_upload_record("t-3", "kb.txt", size=2048))
+
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_SIZE)
+
+    assert _transfer_row_names(transfer, transfer.upload_table) == [
+        "unknown.txt",
+        "kb.txt",
+        "mb.txt",
+    ]
+
+
+def test_transfer_sort_by_status_rank_unknown_last(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-1", "done.txt", status="已完成"))
+    transfer.add_upload_record(_upload_record("t-2", "active.txt", status="上传中"))
+    transfer.add_upload_record(_upload_record("t-3", "mystery.txt", status="神秘状态"))
+    transfer.add_upload_record(_upload_record("t-4", "cancelled.txt", status="已取消"))
+    transfer.add_upload_record(_upload_record("t-5", "failed.txt", status="失败"))
+    transfer.add_upload_record(_upload_record("t-6", "waiting.txt", status="等待中"))
+
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_STATUS)
+
+    assert _transfer_row_names(transfer, transfer.upload_table) == [
+        "active.txt",
+        "waiting.txt",
+        "failed.txt",
+        "done.txt",
+        "cancelled.txt",
+        "mystery.txt",
+    ]
+
+
+@pytest.mark.parametrize("column", [TRANSFER_COL_PROGRESS, TRANSFER_COL_SPEED, TRANSFER_COL_ACTION])
+def test_transfer_dynamic_columns_ignore_header_clicks(qapp: QApplication, column: int) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-2", "b.txt"))
+    transfer.add_upload_record(_upload_record("t-1", "a.txt"))
+
+    transfer._on_table_header_clicked("upload", column)
+
+    assert transfer._upload_sort_state.column is None
+    assert _transfer_row_names(transfer, transfer.upload_table) == ["b.txt", "a.txt"]
+    assert transfer.upload_table.horizontalHeader().sortIndicatorSection() == -1
+
+
+def test_file_page_unknown_column_click_is_ignored(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    # Defensive guard: a column without a sort key (future columns) never
+    # activates sorting or crashes the click handler.
+    window.file_interface._on_table_header_clicked(99)
+
+    assert window.file_interface._sort_state.column is None
+    assert _file_row_names(window) == ["Folder", "report.txt"]
+
+
+def test_transfer_sort_reorder_clears_stale_selection(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-2", "b.txt"))
+    transfer.add_upload_record(_upload_record("t-1", "a.txt"))
+    transfer.add_upload_record(_upload_record("t-3", "c.txt"))
+    transfer.upload_table.selectRow(0)
+    assert transfer.upload_batch_buttons["count"].text() == "已选 1 项"
+
+    # Sorting reorders the task-id sequence, which contract 16 treats like
+    # any other row shift: the stale row selection must be cleared.
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_NAME)
+
+    assert _transfer_row_names(transfer, transfer.upload_table) == ["a.txt", "b.txt", "c.txt"]
+    assert transfer.upload_table.selectionModel().selectedRows() == []
+    assert transfer.upload_batch_buttons["count"].text() == "已选 0 项"
+
+
+def test_transfer_progress_render_keeps_sorted_order_and_selection(
+    qapp: QApplication,
+) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-2", "b.txt", status="上传中"))
+    transfer.add_upload_record(_upload_record("t-1", "a.txt", status="上传中"))
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_NAME)
+    transfer.upload_table.selectRow(0)
+
+    # Progress-only updates never touch the sort keys, so the coalesced
+    # render must neither reshuffle rows nor wipe the selection.
+    transfer.update_record("upload", "t-2", bytes_done=50)
+    transfer.flush_progress_render()
+
+    assert _transfer_row_names(transfer, transfer.upload_table) == ["a.txt", "b.txt"]
+    assert [index.row() for index in transfer.upload_table.selectionModel().selectedRows()] == [0]
+    assert transfer.upload_table.item(1, TRANSFER_COL_PROGRESS).text().startswith("50%")
+
+
+def test_transfer_status_filter_and_sort_stacked(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(
+        _upload_record("t-1", "small-done.txt", size=10, status="已完成")
+    )
+    transfer.add_upload_record(_upload_record("t-2", "active.txt", size=5000, status="上传中"))
+    transfer.add_upload_record(
+        _upload_record("t-3", "big-done.txt", size=1_000_000, status="已完成")
+    )
+
+    transfer.upload_filter_combo.setCurrentText("已完成")
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_SIZE)
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_SIZE)  # descending
+
+    assert _transfer_row_names(transfer, transfer.upload_table) == [
+        "big-done.txt",
+        "small-done.txt",
+    ]
+
+
+def test_transfer_batch_delete_targets_visible_rows_under_sort(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-2", "b.txt", status="失败"))
+    transfer.add_upload_record(_upload_record("t-1", "a.txt", status="已完成"))
+    emitted: list[tuple[str, set[str]]] = []
+    transfer.remove_records_requested.connect(
+        lambda direction, task_ids: emitted.append((direction, set(task_ids)))
+    )
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_NAME)
+
+    # Ascending order puts a.txt at row 0; the batch delete must hit the
+    # displayed row, not the backing list's row 0 (b.txt).
+    transfer.upload_table.selectRow(0)
+    transfer._request_delete_selected("upload")
+
+    assert emitted == [("upload", {"t-1"})]
+
+
+def test_transfer_download_header_click_is_independent(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-2", "b.txt"))
+    transfer.add_upload_record(_upload_record("t-1", "a.txt"))
+    transfer.add_download_record(
+        TransferRecord(
+            task_id="d-2",
+            direction="download",
+            name="y.txt",
+            size=10,
+            status="下载中",
+        )
+    )
+    transfer.add_download_record(
+        TransferRecord(
+            task_id="d-1",
+            direction="download",
+            name="x.txt",
+            size=10,
+            status="下载中",
+        )
+    )
+
+    transfer._on_table_header_clicked("download", TRANSFER_COL_NAME)
+
+    assert _transfer_row_names(transfer, transfer.download_table) == ["x.txt", "y.txt"]
+    assert transfer._upload_sort_state.column is None
+    assert _transfer_row_names(transfer, transfer.upload_table) == ["b.txt", "a.txt"]
+
+
+def test_transfer_sort_persists_across_segment_switch(qapp: QApplication) -> None:
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-2", "b.txt"))
+    transfer.add_upload_record(_upload_record("t-1", "a.txt"))
+    transfer._on_table_header_clicked("upload", TRANSFER_COL_NAME)
+
+    transfer._on_segment_changed("download")
+    transfer._on_segment_changed("upload")
+
+    assert _transfer_row_names(transfer, transfer.upload_table) == ["a.txt", "b.txt"]
+    assert transfer.upload_table.horizontalHeader().sortIndicatorSection() == TRANSFER_COL_NAME

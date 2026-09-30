@@ -110,6 +110,13 @@ from openwopan.ui.formatting import format_optional_bytes as _format_optional_by
 from openwopan.ui.formatting import format_size as _format_size
 from openwopan.ui.recycle_interface import RecycleInterface
 from openwopan.ui.search_window import SearchResultsWindow
+from openwopan.ui.table_view import (
+    NO_MATCH_TEXT,
+    TableSortState,
+    cycle_sort_state,
+    sorted_view,
+    sync_sort_indicator,
+)
 from openwopan.ui.target_folder_dialog import (
     TargetEntry,
     TargetFolderDialog,
@@ -133,6 +140,13 @@ TRANSFER_COL_STATUS = 4
 TRANSFER_COL_ACTION = 5
 TRANSFER_ACTION_COLUMN_WIDTH = 156
 TRANSFER_ACTION_BUTTON_SIZE = (32, 24)
+FILE_COL_NAME = 0
+FILE_COL_KIND = 1
+FILE_COL_SIZE = 2
+FILE_TYPE_FILTER_ALL = "全部"
+FILE_TYPE_FILTER_FOLDERS = "仅文件夹"
+FILE_TYPE_FILTER_FILES = "仅文件"
+FILE_TYPE_FILTERS = (FILE_TYPE_FILTER_ALL, FILE_TYPE_FILTER_FOLDERS, FILE_TYPE_FILTER_FILES)
 THREAD_JOIN_TIMEOUT_MS = 3000
 # B24：已访问目录 LRU 缓存上限（目录数）；写操作成功后整体失效。
 DIRECTORY_CACHE_MAX_ENTRIES = 128
@@ -784,6 +798,50 @@ class TransferRecordPersistence(Protocol):
         """Delete retention-expired terminal rows; return their (direction, task_id) keys."""
 
 
+def _file_kind_rank(item: WopanItem) -> int:
+    return 0 if item.kind is WopanItemKind.FOLDER else 1
+
+
+# File-page header-click sort keys (design.md: data-level, casefold names,
+# folders before files, numeric sizes with None folded to 0).
+FILE_TABLE_SORT_KEYS: dict[int, Callable[[WopanItem], object]] = {
+    FILE_COL_NAME: lambda item: item.name.casefold(),
+    FILE_COL_KIND: _file_kind_rank,
+    FILE_COL_SIZE: lambda item: item.size or 0,
+}
+
+# Transfer-page status sort rank: active transfers first, then waiting and
+# intermediate stages, then paused/failed, terminal statuses last. Unknown
+# statuses (future vocabulary) sort after every known one.
+TRANSFER_STATUS_SORT_RANK = {
+    "上传中": 0,
+    "下载中": 0,
+    "等待中": 1,
+    "创建目录中": 2,
+    "校验中": 2,
+    "合并中": 2,
+    "已暂停": 3,
+    "失败": 4,
+    "已完成": 5,
+    "已取消": 6,
+}
+TRANSFER_STATUS_SORT_UNKNOWN_RANK = len(TRANSFER_STATUS_SORT_RANK)
+
+
+def _transfer_record_status_rank(record: TransferRecord) -> int:
+    return TRANSFER_STATUS_SORT_RANK.get(record.status, TRANSFER_STATUS_SORT_UNKNOWN_RANK)
+
+
+# Transfer-page header-click sort keys: only static columns (name/size/status)
+# are sortable — progress/speed change every coalesced render and would
+# reshuffle rows, the action column holds widgets.
+TRANSFER_TABLE_SORT_KEYS: dict[int, Callable[[TransferRecord], object]] = {
+    TRANSFER_COL_NAME: lambda record: record.name.casefold(),
+    TRANSFER_COL_SIZE: lambda record: record.size or 0,
+    TRANSFER_COL_STATUS: _transfer_record_status_rank,
+}
+
+
 @dataclass(slots=True)
 class QueuedUploadFile:
     """One folder-upload file waiting for the single upload slot."""
@@ -838,6 +896,10 @@ class TransferInterface(QWidget):
         self.download_records: list[TransferRecord] = []
         self.upload_status_filter = "全部"
         self.download_status_filter = "全部"
+        # Header-click sort state per table (session-persistent, not on disk);
+        # the rendered sequence is status-filter + sort over the backing list.
+        self._upload_sort_state = TableSortState()
+        self._download_sort_state = TableSortState()
         self._active_direction = "download"
         self._pending_progress_directions: set[str] = set()
         self._progress_render_scheduled = False
@@ -1191,6 +1253,14 @@ class TransferInterface(QWidget):
                     header.resizeSection(column, TRANSFER_ACTION_COLUMN_WIDTH)
                 else:
                     header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            # Header-click sorting is data-level; the indicator is visual only
+            # (widget sorting stays disabled — formatted sizes and the fixed
+            # status rank must not go through Qt's text sort).
+            header.setSortIndicatorShown(True)
+            # QHeaderView's untouched indicator section is an out-of-range
+            # sentinel; clear it to -1 so "no sort" is always observable.
+            sync_sort_indicator(header, TableSortState())
+            header.sectionClicked.connect(partial(self._on_table_header_clicked, direction))
 
         layout.addWidget(batch_bar)
         layout.addWidget(table)
@@ -1495,20 +1565,44 @@ class TransferInterface(QWidget):
                 widget.deleteLater()
 
     def _filtered_upload_records(self) -> list[TransferRecord]:
+        """Upload render sequence: status filter, then the active column sort."""
         if self.upload_status_filter == "全部":
-            return list(self.upload_records)
-        return [
-            record for record in self.upload_records if record.status == self.upload_status_filter
-        ]
+            visible = list(self.upload_records)
+        else:
+            visible = [
+                record
+                for record in self.upload_records
+                if record.status == self.upload_status_filter
+            ]
+        return sorted_view(visible, self._upload_sort_state, TRANSFER_TABLE_SORT_KEYS)
 
     def _filtered_download_records(self) -> list[TransferRecord]:
+        """Download render sequence: status filter, then the active column sort."""
         if self.download_status_filter == "全部":
-            return list(self.download_records)
-        return [
-            record
-            for record in self.download_records
-            if record.status == self.download_status_filter
-        ]
+            visible = list(self.download_records)
+        else:
+            visible = [
+                record
+                for record in self.download_records
+                if record.status == self.download_status_filter
+            ]
+        return sorted_view(visible, self._download_sort_state, TRANSFER_TABLE_SORT_KEYS)
+
+    def _on_table_header_clicked(self, direction: str, column: int) -> None:
+        """Cycle one table's sort state; progress/speed/action never react."""
+        if column not in TRANSFER_TABLE_SORT_KEYS:
+            return
+        if direction == "upload":
+            self._upload_sort_state = cycle_sort_state(self._upload_sort_state, column)
+            state = self._upload_sort_state
+            header = self.upload_table.horizontalHeader()
+        else:
+            self._download_sort_state = cycle_sort_state(self._download_sort_state, column)
+            state = self._download_sort_state
+            header = self.download_table.horizontalHeader()
+        sync_sort_indicator(header, state)
+        self.flush_progress_render()
+        self._render_direction(direction)
 
     def _request_open_download_folder(self) -> None:
         self.open_download_folder_requested.emit(self.active_download_folder())
@@ -2142,6 +2236,10 @@ class FileInterface(QWidget):
         self._window = window
         self._rendering_breadcrumb = False
         self._operation_busy_count = 0
+        # View-layer state (session-persistent, never written to disk): the
+        # rendered sequence is type-filter + sort applied to the backing list.
+        self._sort_state = TableSortState()
+        self._type_filter = FILE_TYPE_FILTER_ALL
 
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(24, 20, 24, 24)
@@ -2177,6 +2275,7 @@ class FileInterface(QWidget):
             self.refresh_button,
             self.back_button,
             self.search_bar,
+            self.type_filter_combo,
             self.file_table,
             self.folder_tree,
         ):
@@ -2215,6 +2314,11 @@ class FileInterface(QWidget):
         self.download_button = PushButton(FIF.DOWNLOAD.icon(), "下载", top_bar)
         self.download_button.setEnabled(False)
         self.delete_button = PushButton(FIF.DELETE.icon(), "删除", top_bar)
+        self.type_filter_combo = ComboBox(top_bar)
+        self.type_filter_combo.addItems(list(FILE_TYPE_FILTERS))
+        self.type_filter_combo.setCurrentText(self._type_filter)
+        self.type_filter_combo.setMinimumWidth(110)
+        self.type_filter_combo.setEnabled(False)
         self.search_bar = SearchLineEdit(top_bar)
         self.search_bar.setPlaceholderText("搜索文件")
         self.search_bar.setFixedWidth(200)
@@ -2224,6 +2328,7 @@ class FileInterface(QWidget):
         action_layout.addWidget(self.upload_button_group)
         action_layout.addWidget(self.download_button)
         action_layout.addWidget(self.delete_button)
+        action_layout.addWidget(self.type_filter_combo)
         action_layout.addStretch(1)
         action_layout.addWidget(self.search_bar)
 
@@ -2333,6 +2438,14 @@ class FileInterface(QWidget):
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             for section in (1, 2):
                 header.setSectionResizeMode(section, QHeaderView.ResizeMode.ResizeToContents)
+            # Header-click sorting is data-level; the indicator is visual only
+            # (widget sorting stays disabled — formatted size text must not be
+            # sorted lexicographically by Qt).
+            header.setSortIndicatorShown(True)
+            # QHeaderView's untouched indicator section is an out-of-range
+            # sentinel; clear it to -1 so "no sort" is always observable.
+            sync_sort_indicator(header, TableSortState())
+            header.sectionClicked.connect(self._on_table_header_clicked)
         right_layout.addWidget(self.file_table)
         self.status_label = BodyLabel("", right_panel)
         self.status_label.setStyleSheet("font-size: 12px; color: gray; padding: 6px 8px;")
@@ -2362,6 +2475,32 @@ class FileInterface(QWidget):
         self.file_table.paths_dropped.connect(self._window.handle_upload_drop)
         self.file_table.customContextMenuRequested.connect(self._window.open_file_context_menu)
         self.search_bar.returnPressed.connect(self._window.request_search)
+        self.type_filter_combo.currentTextChanged.connect(self._on_type_filter_changed)
+
+    def visible_items(self, items: Sequence[WopanItem]) -> tuple[WopanItem, ...]:
+        """Apply the type filter then the column sort; the input keeps its order."""
+        visible = [item for item in items if self._type_filter_matches(item)]
+        return tuple(sorted_view(visible, self._sort_state, FILE_TABLE_SORT_KEYS))
+
+    def _type_filter_matches(self, item: WopanItem) -> bool:
+        if self._type_filter == FILE_TYPE_FILTER_FOLDERS:
+            return item.kind is WopanItemKind.FOLDER
+        if self._type_filter == FILE_TYPE_FILTER_FILES:
+            return item.kind is WopanItemKind.FILE
+        return True
+
+    def _on_type_filter_changed(self, text: str) -> None:
+        """Re-render the current directory from the in-memory backing list."""
+        self._type_filter = text
+        self._window._render_items()
+
+    def _on_table_header_clicked(self, column: int) -> None:
+        """Cycle the file table's sort state and re-render (view layer only)."""
+        if column not in FILE_TABLE_SORT_KEYS:
+            return
+        self._sort_state = cycle_sort_state(self._sort_state, column)
+        sync_sort_indicator(self.file_table.horizontalHeader(), self._sort_state)
+        self._window._render_items()
 
     def _render_breadcrumb(self, breadcrumb: tuple[BreadcrumbEntry, ...]) -> None:
         self._rendering_breadcrumb = True
@@ -3441,7 +3580,7 @@ class MainWindow(_MainWindowBase):
 
     def _select_item_row(self, item_id: str) -> None:
         """Select and scroll to the row whose item id matches."""
-        for row, item in enumerate(self._items):
+        for row, item in enumerate(self._visible_items()):
             if item.item_id == item_id:
                 table = self.file_interface.file_table
                 table.selectRow(row)
@@ -5290,10 +5429,8 @@ class MainWindow(_MainWindowBase):
 
     def enter_displayed_folder(self, row: int) -> None:
         """Enter a displayed folder row."""
-        if row < 0 or row >= len(self._items):
-            return
-        item = self._items[row]
-        if item.kind is not WopanItemKind.FOLDER:
+        item = self._item_at_row(row)
+        if item is None or item.kind is not WopanItemKind.FOLDER:
             return
         self._breadcrumb.append(BreadcrumbEntry(item_id=item.item_id, name=item.name))
         self.refresh_current_directory()
@@ -6446,10 +6583,15 @@ class MainWindow(_MainWindowBase):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
+    def _visible_items(self) -> tuple[WopanItem, ...]:
+        """Render-order rows: the file page's type filter + column sort."""
+        return self.file_interface.visible_items(self._items)
+
     def _item_at_row(self, row: int) -> WopanItem | None:
-        if row < 0 or row >= len(self._items):
+        visible = self._visible_items()
+        if row < 0 or row >= len(visible):
             return None
-        return self._items[row]
+        return visible[row]
 
     def _show_login_required_error(self, message: str) -> None:
         self._set_status(message)
@@ -6469,12 +6611,17 @@ class MainWindow(_MainWindowBase):
         self.file_interface.status_label.setText(message)
 
     def _render_items(self) -> None:
+        visible = self._visible_items()
         self.file_interface.set_operations_enabled(self._file_browser is not None)
-        self.file_interface.render_state(tuple(self._items), tuple(self._breadcrumb))
+        self.file_interface.render_state(visible, tuple(self._breadcrumb))
         self.update_operation_controls()
-        if self._items:
+        if visible:
             path = " > ".join(self.breadcrumb_names())
-            self._set_status(f"{len(self._items)} 项 | 当前路径：{path}")
+            self._set_status(f"{len(visible)} 项 | 当前路径：{path}")
+        elif self._items:
+            # Non-empty directory with an empty view: the type filter matched
+            # nothing — distinct from the genuine empty/loading/login states.
+            self._set_status(NO_MATCH_TEXT)
         elif self._file_browser is None:
             self._set_status("请先登录")
         elif self._status_message == "正在加载...":
