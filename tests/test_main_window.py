@@ -674,6 +674,36 @@ def test_main_window_enables_download_for_single_file_selection(qapp: QApplicati
     assert window.file_interface.download_button.isEnabled()
 
 
+def test_directory_refresh_clears_stale_row_selection(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = [
+        *browser.items_by_parent[ROOT_DIRECTORY_ID],
+        WopanItem(
+            item_id="file-2",
+            name="notes.txt",
+            kind=WopanItemKind.FILE,
+            parent_id=ROOT_DIRECTORY_ID,
+            download_id="fid-2",
+            size=128,
+        ),
+    ]
+    window = MainWindow(browser)
+
+    window.refresh_current_directory()
+    table = window.file_interface.file_table
+    table.selectRow(1)
+    assert window.selected_rows() == [1]
+    assert window.file_interface.delete_button.isEnabled()
+    assert window.file_interface.download_button.isEnabled()
+
+    browser.items_by_parent[ROOT_DIRECTORY_ID] = browser.items_by_parent[ROOT_DIRECTORY_ID][:2]
+    window.refresh_current_directory()
+
+    assert window.selected_rows() == []
+    assert not window.file_interface.delete_button.isEnabled()
+    assert not window.file_interface.download_button.isEnabled()
+
+
 def test_main_window_direct_download_delegates_to_browser(
     qapp: QApplication,
     tmp_path: Path,
