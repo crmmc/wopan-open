@@ -20,7 +20,7 @@ from openwopan.ui.main_window import (
     MainWindow,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
-from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, WopanRecycleItem
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +39,11 @@ class FakeFileBrowser:
         self.downloaded_items: list[tuple[str, Path]] = []
         self.uploaded_files: list[tuple[str, Path]] = []
         self.usage_account_ids: list[str] = []
+        self.listed_recycle_bin = False
+        self.recycle_items: list[WopanRecycleItem] = []
+        self.restored_delete_nos: list[tuple[str, ...]] = []
+        self.purged_delete_nos: list[tuple[str, ...]] = []
+        self.emptied_recycle_bin = False
         self.items_by_parent = {
             ROOT_DIRECTORY_ID: [
                 WopanItem(
@@ -161,6 +166,19 @@ class FakeFileBrowser:
         self.usage_account_ids.append(account_id)
         return WopanCloudUsage(used_bytes=1024, total_bytes=2048)
 
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        self.listed_recycle_bin = True
+        return list(self.recycle_items)
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        self.restored_delete_nos.append(tuple(delete_nos))
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        self.purged_delete_nos.append(tuple(delete_nos))
+
+    def empty_recycle_bin(self) -> None:
+        self.emptied_recycle_bin = True
+
 
 class LoginExpiredFileBrowser:
     def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
@@ -208,6 +226,18 @@ class LoginExpiredFileBrowser:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def list_recycle_items(self) -> list[WopanRecycleItem]:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    def empty_recycle_bin(self) -> None:
         raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
 
 
@@ -414,6 +444,77 @@ def test_main_window_refreshes_all_account_information(qapp: QApplication) -> No
     assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID]
     assert window.account_interface.usage_value_label.text() == "1.0 KB / 2.0 KB"
     assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
+
+
+def test_recycle_success_marks_dirty_flag(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+
+    for slot in (
+        window._on_recycle_restore_succeeded,
+        window._on_recycle_purge_succeeded,
+        window._on_recycle_empty_succeeded,
+    ):
+        window._recycle_dirty = False
+        slot(None)
+        assert window._recycle_dirty is True
+
+
+def test_switch_back_to_file_page_consumes_dirty_flag(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+
+    window._stacked_widget.setCurrentWidget(window.recycle_interface)
+    window._recycle_dirty = True
+    usage_calls = len(browser.usage_account_ids)
+    list_calls = len(browser.requested_parent_ids)
+
+    window._stacked_widget.setCurrentWidget(window.file_interface)
+
+    assert window._recycle_dirty is False
+    assert len(browser.usage_account_ids) == usage_calls + 1
+    assert len(browser.requested_parent_ids) == list_calls + 1
+
+
+def test_switch_back_to_file_page_without_dirty_flag_skips_refresh(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+
+    window._stacked_widget.setCurrentWidget(window.recycle_interface)
+    window._recycle_dirty = False
+    usage_calls = len(browser.usage_account_ids)
+    list_calls = len(browser.requested_parent_ids)
+
+    window._stacked_widget.setCurrentWidget(window.file_interface)
+
+    assert len(browser.usage_account_ids) == usage_calls
+    assert len(browser.requested_parent_ids) == list_calls
+
+
+def test_file_refresh_button_refreshes_cloud_usage_too(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+    usage_calls = len(browser.usage_account_ids)
+    list_calls = len(browser.requested_parent_ids)
+
+    window.file_interface.refresh_button.click()
+
+    assert len(browser.usage_account_ids) == usage_calls + 1
+    assert len(browser.requested_parent_ids) == list_calls + 1
+
+
+def test_clear_auth_session_resets_dirty_flag(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window._recycle_dirty = True
+
+    window.clear_auth_session()
+
+    assert window._recycle_dirty is False
 
 
 def test_settings_interface_persists_non_transfer_settings(

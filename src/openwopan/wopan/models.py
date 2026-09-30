@@ -37,6 +37,34 @@ class WopanItem:
 
 
 @dataclass(frozen=True, slots=True)
+class WopanRecycleItem:
+    """Recycle-bin entry model owned by OpenWoPan.
+
+    ``delete_no`` is the operation handle used by restore/purge requests;
+    ``item_id`` only carries the original object id for display and tracing.
+    """
+
+    delete_no: str
+    item_id: str
+    name: str
+    kind: WopanItemKind
+    size: int | None = None
+    deleted_at: datetime | None = None
+    keep_days: int | None = None
+    file_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.delete_no:
+            raise ValueError("delete_no must not be empty")
+        if not self.name:
+            raise ValueError("name must not be empty")
+        if self.size is not None and self.size < 0:
+            raise ValueError("size must be non-negative")
+        if self.keep_days is not None and self.keep_days < 0:
+            raise ValueError("keep_days must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
 class DownloadInfo:
     """Download metadata returned by the protocol layer."""
 

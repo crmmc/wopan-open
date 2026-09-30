@@ -26,7 +26,13 @@ from openwopan.wopan.errors import (
     WopanResponseError,
     WopanUploadCancelledError,
 )
-from openwopan.wopan.models import DownloadInfo, WopanCloudUsage, WopanItem, WopanItemKind
+from openwopan.wopan.models import (
+    DownloadInfo,
+    WopanCloudUsage,
+    WopanItem,
+    WopanItemKind,
+    WopanRecycleItem,
+)
 
 UploadProgressCallback = Callable[[int, int], None]
 UploadPartResultCallback = Callable[[int, str], None]
@@ -583,6 +589,104 @@ class WopanClient:
             len(file_ids),
             target_parent_id,
         )
+
+    def list_recycle_items(self, max_items: int = 2000) -> list[WopanRecycleItem]:
+        """List recycle-bin entries, paging until the listing is exhausted."""
+        if max_items < 1:
+            raise ValueError("max_items must be at least 1")
+
+        LOGGER.info("wopan.list_recycle_items.start max_items=%s", max_items)
+        items: list[WopanRecycleItem] = []
+        seen_delete_nos: set[str] = set()
+        page_no = 1
+        while True:
+            data = self._dispatch_wohome_payload(
+                "QueryRecycleData",
+                {
+                    "pageNo": page_no,
+                    "pageSize": DEFAULT_PAGE_SIZE,
+                    "sortRule": DEFAULT_SORT_RULE,
+                    "clientId": CLIENT_ID,
+                },
+            )
+            if not isinstance(data, list):
+                raise WopanResponseError("QueryRecycleData DATA is not a list")
+            page_items: list[WopanRecycleItem] = []
+            for raw_item in data:
+                if not isinstance(raw_item, dict):
+                    raise WopanResponseError("QueryRecycleData item is not an object")
+                page_items.append(_read_recycle_item(raw_item))
+            new_count = 0
+            for item in page_items:
+                if item.delete_no in seen_delete_nos:
+                    continue
+                seen_delete_nos.add(item.delete_no)
+                items.append(item)
+                new_count += 1
+                if len(items) >= max_items:
+                    break
+            # Stop on a short page, on a page whose deleteNos were all already
+            # collected (the server may ignore pageNo and echo the same page),
+            # or once max_items caps the listing.
+            if len(items) >= max_items:
+                break
+            if len(page_items) < DEFAULT_PAGE_SIZE:
+                break
+            if new_count == 0:
+                break
+            page_no += 1
+        LOGGER.info(
+            "wopan.list_recycle_items.success item_count=%s page_count=%s",
+            len(items),
+            page_no,
+        )
+        return items
+
+    def restore_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        """Restore one or more recycle-bin entries to their original locations."""
+        if not delete_nos:
+            raise ValueError("delete_nos must not be empty")
+        for delete_no in delete_nos:
+            if not delete_no:
+                raise ValueError("delete_no must not be empty")
+
+        LOGGER.info("wopan.restore_recycle_items.start count=%s", len(delete_nos))
+        self._dispatch_wohome(
+            "ReductionRecycleData",
+            {
+                "deleteNos": list(delete_nos),
+                "deviceNo": CLIENT_ID,
+                "clientId": CLIENT_ID,
+            },
+        )
+        LOGGER.info("wopan.restore_recycle_items.success count=%s", len(delete_nos))
+
+    def purge_recycle_items(self, delete_nos: Sequence[str]) -> None:
+        """Permanently delete one or more recycle-bin entries."""
+        if not delete_nos:
+            raise ValueError("delete_nos must not be empty")
+        for delete_no in delete_nos:
+            if not delete_no:
+                raise ValueError("delete_no must not be empty")
+
+        LOGGER.info("wopan.purge_recycle_items.start count=%s", len(delete_nos))
+        self._dispatch_wohome(
+            "DeleteRecycleData",
+            {
+                "deleteNos": list(delete_nos),
+                "clientId": CLIENT_ID,
+            },
+        )
+        LOGGER.info("wopan.purge_recycle_items.success count=%s", len(delete_nos))
+
+    def empty_recycle_bin(self) -> None:
+        """Permanently delete every recycle-bin entry."""
+        LOGGER.info("wopan.empty_recycle_bin.start")
+        self._dispatch_wohome(
+            "EmptyRecycleData",
+            {"clientId": CLIENT_ID},
+        )
+        LOGGER.info("wopan.empty_recycle_bin.success")
 
     def upload_file(
         self,
@@ -1249,6 +1353,40 @@ def _read_search_item(raw: dict[str, Any]) -> WopanItem:
     )
 
 
+def _read_recycle_item(raw: dict[str, Any]) -> WopanRecycleItem:
+    delete_no = str(raw.get("deleteNo") or "")
+    name = str(raw.get("name") or "")
+    item_id = str(raw.get("id") or raw.get("fid") or "")
+    if not delete_no:
+        raise WopanResponseError("QueryRecycleData item missing deleteNo")
+    if not item_id:
+        raise WopanResponseError("QueryRecycleData item missing id")
+    if not name:
+        raise WopanResponseError("QueryRecycleData item missing name")
+    raw_type = _read_wopan_item_type(raw)
+    if raw_type == "0":
+        kind = WopanItemKind.FOLDER
+    elif raw_type == "1":
+        kind = WopanItemKind.FILE
+    else:
+        raise WopanResponseError(f"QueryRecycleData item has unknown type: {raw_type}")
+    try:
+        deleted_at = _read_wopan_timestamp(raw, ("deleteTime",))
+    except WopanResponseError:
+        # `deleteTime` 的线上格式未经真机确认，解析失败按设计降级为 None（展示 "--"）。
+        deleted_at = None
+    return WopanRecycleItem(
+        delete_no=delete_no,
+        item_id=item_id,
+        name=name,
+        kind=kind,
+        size=_read_optional_int(raw.get("fileSize"), "QueryRecycleData item fileSize"),
+        deleted_at=deleted_at,
+        keep_days=_read_optional_int(raw.get("keepDays"), "QueryRecycleData item keepDays"),
+        file_type=_read_optional_text(raw.get("fileType")),
+    )
+
+
 def _read_wopan_item_type(raw: dict[str, Any]) -> str:
     value = raw.get("type")
     if value is None:
@@ -1275,15 +1413,15 @@ def _log_skipped_unknown_type_item(
     )
 
 
-def _read_optional_int(value: Any) -> int | None:
+def _read_optional_int(value: Any, field_name: str = "QueryAllFiles item size") -> int | None:
     if value in (None, ""):
         return None
     try:
         parsed = int(value)
     except (TypeError, ValueError) as exc:
-        raise WopanResponseError("QueryAllFiles item size is not an integer") from exc
+        raise WopanResponseError(f"{field_name} is not an integer") from exc
     if parsed < 0:
-        raise WopanResponseError("QueryAllFiles item size is negative")
+        raise WopanResponseError(f"{field_name} is negative")
     return parsed
 
 
@@ -1339,8 +1477,11 @@ def guess_upload_file_type(name: str) -> str:
 _guess_upload_file_type = guess_upload_file_type
 
 
-def _read_wopan_timestamp(raw: dict[str, Any]) -> datetime | None:
-    for field_name in ("updateTime", "modifyTime", "createTime"):
+def _read_wopan_timestamp(
+    raw: dict[str, Any],
+    field_names: Sequence[str] = ("updateTime", "modifyTime", "createTime"),
+) -> datetime | None:
+    for field_name in field_names:
         value = raw.get(field_name)
         if value in (None, ""):
             continue
