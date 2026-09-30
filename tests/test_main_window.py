@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QFrame
 
 import openwopan.ui.main_window as main_window_module
@@ -21,6 +22,7 @@ from openwopan.ui.main_window import (
     MainWindow,
     TransferRecord,
 )
+from openwopan.ui.target_folder_dialog import TargetEntry, TargetFolderDialog
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, WopanRecycleItem
 
@@ -1117,6 +1119,7 @@ def test_main_window_move_prompt_opens_dialog_without_subfolders(
             self.initial_entry = initial_entry
             self.initial_folders = initial_folders
             self.directory_requested = _DisconnectedSignal()
+            self.create_folder_requested = _DisconnectedSignal()
             instances.append(self)
 
         exec = staticmethod(lambda: QDialog.DialogCode.Rejected)
@@ -1143,6 +1146,36 @@ def test_main_window_move_prompt_opens_dialog_without_subfolders(
     assert len(instances) == 1
     assert instances[0].mode == "move"
     assert instances[0].initial_folders == []
+
+
+@pytest.mark.parametrize(
+    ("prompt_method", "expected_verb"),
+    [("prompt_move_item", "移动"), ("prompt_copy_item", "复制")],
+)
+def test_main_window_transfer_prompt_shows_readable_root_path(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_method: str,
+    expected_verb: str,
+) -> None:
+    """The dialog root segment reads 根目录, never a "/ /" double separator."""
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    opened: list[TargetFolderDialog] = []
+
+    def _capture_exec(dialog: TargetFolderDialog) -> int:
+        opened.append(dialog)
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(TargetFolderDialog, "exec", _capture_exec)
+    getattr(window, prompt_method)(1)
+
+    dialog = opened[0]
+    assert dialog._path_label.text() == "根目录"
+    assert dialog._ok_button.text() == f"{expected_verb}到此（根目录）"
+    assert "/ /" not in dialog._path_label.text()
+    dialog.deleteLater()
 
 
 class QueuedFileBrowser(FakeFileBrowser):
@@ -1195,3 +1228,235 @@ def test_main_window_submits_multiple_selected_files_to_scheduler(
         "queued-1",
         "queued-2",
     ]
+
+
+def _make_target_dialog(window: MainWindow) -> TargetFolderDialog:
+    return TargetFolderDialog(
+        "move",
+        TargetEntry(item_id=ROOT_DIRECTORY_ID, name="/"),
+        [],
+        parent=window,
+    )
+
+
+def test_target_dialog_create_folder_runs_on_worker_and_selects_new_folder(
+    qapp: QApplication,
+) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    dialog = _make_target_dialog(window)
+    dialog.directory_requested.connect(window._on_target_directory_requested)
+    window._target_dialog = dialog
+
+    window._on_target_create_folder_requested(ROOT_DIRECTORY_ID, "新目录")
+
+    assert browser.created_folders == [(ROOT_DIRECTORY_ID, "新目录")]
+    assert dialog.current_target() == TargetEntry(item_id="created-folder", name="新目录")
+    assert dialog._ok_button.text() == "移动到「新目录」"
+    assert dialog._create_in_flight is False
+    assert dialog._load_in_flight is False
+    assert dialog._create_folder_button.isEnabled()
+    assert window._target_create_thread is None
+    assert window._target_create_worker is None
+    window._target_dialog = None
+    dialog.deleteLater()
+
+
+def test_target_dialog_create_folder_failure_shows_error_and_reenables(
+    qapp: QApplication,
+) -> None:
+    class _FailingTargetCreateBrowser(FakeFileBrowser):
+        def create_folder(self, parent_id: str, name: str) -> WopanItem:
+            raise FileBrowserError("目录已存在")
+
+    window = MainWindow(_FailingTargetCreateBrowser())
+    dialog = _make_target_dialog(window)
+    window._target_dialog = dialog
+
+    window._on_target_create_folder_requested(ROOT_DIRECTORY_ID, "新目录")
+
+    assert dialog._status_label.text() == "创建失败：目录已存在"
+    assert dialog._create_in_flight is False
+    assert dialog._create_folder_button.isEnabled()
+    assert dialog.current_target() == TargetEntry(item_id=ROOT_DIRECTORY_ID, name="/")
+    assert window._target_create_thread is None
+    window._target_dialog = None
+    dialog.deleteLater()
+
+
+def test_target_dialog_create_folder_login_required_rejects_dialog(
+    qapp: QApplication,
+) -> None:
+    window = MainWindow(LoginExpiredFileBrowser())
+    messages: list[str] = []
+    window.login_required.connect(messages.append)
+    dialog = _make_target_dialog(window)
+    window._target_dialog = dialog
+
+    window._on_target_create_folder_requested(ROOT_DIRECTORY_ID, "新目录")
+
+    assert messages == ["登录已过期，请重新登录"]
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert window._target_create_thread is None
+    window._target_dialog = None
+    dialog.deleteLater()
+
+
+def test_target_dialog_create_folder_skips_while_previous_create_in_flight(
+    qapp: QApplication,
+) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    dialog = _make_target_dialog(window)
+    window._target_dialog = dialog
+    window._target_create_thread = QThread(window)
+
+    window._on_target_create_folder_requested(ROOT_DIRECTORY_ID, "新目录")
+
+    assert browser.created_folders == []
+    assert dialog._status_label.text() == "创建失败：已有创建任务进行中，请稍候"
+    window._target_create_thread = None
+    window._target_dialog = None
+    dialog.deleteLater()
+
+
+def test_target_dialog_create_folder_without_browser_shows_error(qapp: QApplication) -> None:
+    window = MainWindow()
+    dialog = _make_target_dialog(window)
+    window._target_dialog = dialog
+
+    window._on_target_create_folder_requested(ROOT_DIRECTORY_ID, "新目录")
+
+    assert dialog._status_label.text() == "创建失败：请先登录"
+    window._target_dialog = None
+    dialog.deleteLater()
+
+
+def test_target_dialog_create_folder_without_dialog_is_ignored(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+
+    window._on_target_create_folder_requested(ROOT_DIRECTORY_ID, "新目录")
+
+    assert browser.created_folders == []
+    assert window._target_create_thread is None
+
+
+def test_target_dialog_create_terminal_results_guarded(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    dialog = _make_target_dialog(window)
+    window._target_dialog = dialog
+
+    window._on_target_create_succeeded("bogus")
+    assert dialog._pending_selection is None
+
+    window._target_dialog = None
+    window._on_target_create_succeeded(None)
+    window._on_target_create_failed("late")
+    window._on_target_create_login_required("late")
+
+    window._closing = True
+    window._target_dialog = dialog
+    window._on_target_create_succeeded(None)
+    window._on_target_create_failed("closing")
+    window._on_target_create_login_required("closing")
+
+
+class _RecordingInfoBar:
+    calls: list[tuple[str, str]] = []
+
+    @classmethod
+    def warning(cls, *, title: str, content: str, parent: object = None) -> None:
+        cls.calls.append((title, content))
+
+    @classmethod
+    def error(cls, *, title: str, content: str, parent: object = None) -> None:
+        cls.calls.append((title, content))
+
+    @classmethod
+    def success(cls, *, title: str, content: str, parent: object = None) -> None:
+        cls.calls.append((title, content))
+
+    @classmethod
+    def info(cls, *, title: str, content: str, parent: object = None) -> None:
+        cls.calls.append((title, content))
+
+
+def test_move_copy_delete_while_busy_show_visible_warning(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    monkeypatch.setattr(main_window_module, "InfoBar", _RecordingInfoBar)
+    _RecordingInfoBar.calls = []
+    window._move_thread = QThread(window)
+    window._copy_thread = QThread(window)
+    window._delete_thread = QThread(window)
+
+    window.move_displayed_items([1], "folder-2")
+    window.copy_displayed_items([1], "folder-2")
+    window.delete_displayed_items([0])
+
+    assert _RecordingInfoBar.calls == [
+        ("移动", "已有移动任务进行中，请稍候"),
+        ("复制", "已有复制任务进行中，请稍候"),
+        ("删除", "已有删除任务进行中，请稍候"),
+    ]
+    assert browser.moved_items == []
+    assert browser.copied_items == []
+    assert browser.deleted_items == []
+
+
+def test_operation_busy_bar_reference_counting(qapp: QApplication) -> None:
+    window = MainWindow(FakeFileBrowser())
+    bar = window.file_interface.operation_busy_bar
+
+    assert bar.isHidden()
+
+    window.file_interface.set_operation_busy(True)
+    assert not bar.isHidden()
+    window.file_interface.set_operation_busy(True)
+    assert not bar.isHidden()
+    window.file_interface.set_operation_busy(False)
+    assert not bar.isHidden()
+    window.file_interface.set_operation_busy(False)
+    assert bar.isHidden()
+
+
+class _BusyObservingBrowser(FakeFileBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.busy_snapshots: dict[str, bool] = {}
+        self.window: MainWindow | None = None
+
+    def _busy_visible(self) -> bool:
+        assert self.window is not None
+        return not self.window.file_interface.operation_busy_bar.isHidden()
+
+    def move_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        self.busy_snapshots["move"] = self._busy_visible()
+        super().move_items(items, target_parent_id)
+
+    def copy_items(self, items: Sequence[WopanItem], target_parent_id: str) -> None:
+        self.busy_snapshots["copy"] = self._busy_visible()
+        super().copy_items(items, target_parent_id)
+
+    def delete_items(self, items: Sequence[WopanItem]) -> None:
+        self.busy_snapshots["delete"] = self._busy_visible()
+        super().delete_items(items)
+
+
+def test_move_copy_delete_show_busy_indicator_until_terminal(qapp: QApplication) -> None:
+    browser = _BusyObservingBrowser()
+    window = MainWindow(browser)
+    browser.window = window
+    window.refresh_current_directory()
+
+    window.move_displayed_items([1], "folder-2")
+    window.copy_displayed_items([0], "folder-3")
+    window.delete_displayed_items([0])
+
+    assert browser.busy_snapshots == {"move": True, "copy": True, "delete": True}
+    assert window.file_interface.operation_busy_bar.isHidden()

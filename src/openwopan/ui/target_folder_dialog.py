@@ -41,6 +41,7 @@ class TargetFolderDialog(QDialog):
     """
 
     directory_requested = Signal(str)
+    create_folder_requested = Signal(str, str)
 
     def __init__(
         self,
@@ -57,8 +58,10 @@ class TargetFolderDialog(QDialog):
         self._path: list[TargetEntry] = [initial_entry]
         self._selected_target = initial_entry
         self._load_in_flight = False
+        self._create_in_flight = False
         self._pending_entry: TargetEntry | None = None
         self._pending_appends = False
+        self._pending_selection: TargetEntry | None = None
         self.setWindowTitle(mode_label(mode))
         self.resize(420, 480)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
@@ -75,6 +78,10 @@ class TargetFolderDialog(QDialog):
         self._up_button.setToolTip("上级文件夹")
         self._up_button.clicked.connect(self._go_up)
         nav_layout.addWidget(self._up_button)
+        self._create_folder_button = ToolButton(FluentIcon.FOLDER_ADD.icon(), self)
+        self._create_folder_button.setToolTip("新建文件夹")
+        self._create_folder_button.clicked.connect(self._on_create_folder_clicked)
+        nav_layout.addWidget(self._create_folder_button)
         self._hint_label = BodyLabel("双击进入文件夹，单击选中为目标", self)
         nav_layout.addWidget(self._hint_label, 1)
         layout.addLayout(nav_layout)
@@ -121,6 +128,14 @@ class TargetFolderDialog(QDialog):
         self._selected_target = self._path[-1]
         self._path_label.setText(self._format_path())
         self._ok_button.setText(self._format_ok_text())
+        selected = self._pending_selection
+        self._pending_selection = None
+        if selected is not None:
+            matched = self._find_list_item(selected.item_id)
+            if matched is not None:
+                self._folder_list.setCurrentItem(matched)
+                self._selected_target = selected
+                self._ok_button.setText(f"{mode_label(self._mode)}到「{selected.name}」")
         self._load_in_flight = False
         self._status_label.setText("")
         self._refresh_controls()
@@ -129,8 +144,27 @@ class TargetFolderDialog(QDialog):
         """Surface a failed directory load and release navigation."""
         self._pending_entry = None
         self._pending_appends = False
+        self._pending_selection = None
         self._load_in_flight = False
         self._status_label.setText(f"加载失败：{message}")
+        self._refresh_controls()
+
+    def begin_create(self) -> None:
+        """Mark a folder creation as running; controls stay disabled until it ends."""
+        self._create_in_flight = True
+        self._status_label.setText("正在创建文件夹…")
+        self._refresh_controls()
+
+    def show_created_entry(self, entry: TargetEntry) -> None:
+        """Reload the current level and make ``entry`` the selected target."""
+        self._create_in_flight = False
+        self._pending_selection = entry
+        self._reload_current()
+
+    def show_create_error(self, message: str) -> None:
+        """Surface a failed folder creation and re-enable the dialog."""
+        self._create_in_flight = False
+        self._status_label.setText(f"创建失败：{message}")
         self._refresh_controls()
 
     def _show_entries(self, entries: Sequence[TargetEntry]) -> None:
@@ -182,9 +216,40 @@ class TargetFolderDialog(QDialog):
         self._ok_button.setText(self._format_ok_text())
         self._reload_current()
 
+    def _on_create_folder_clicked(self) -> None:
+        """Ask for a name and request the folder creation from the main window."""
+        if self._create_in_flight or self._load_in_flight:
+            return
+        # Function-level import: main_window imports this module at load time,
+        # so a module-level import here would be circular.
+        from openwopan.ui.main_window import NameInputDialog
+
+        dialog = NameInputDialog(
+            title="新建文件夹",
+            hint=f"将在「{self._path[-1].name}」下创建",
+            default_text="新建文件夹",
+            parent=self,
+        )
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        dialog.deleteLater()
+        if not accepted:
+            return
+        self.create_folder_requested.emit(self._path[-1].item_id, dialog.name_text())
+
+    def _find_list_item(self, item_id: str) -> QListWidgetItem | None:
+        for row in range(self._folder_list.count()):
+            item = self._folder_list.item(row)
+            entry = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(entry, TargetEntry) and entry.item_id == item_id:
+                return item
+        return None
+
     def _refresh_controls(self) -> None:
-        self._up_button.setEnabled(len(self._path) > 1 and not self._load_in_flight)
-        self._folder_list.setEnabled(not self._load_in_flight)
+        busy = self._load_in_flight or self._create_in_flight
+        self._up_button.setEnabled(len(self._path) > 1 and not busy)
+        self._create_folder_button.setEnabled(not busy)
+        self._folder_list.setEnabled(not busy)
+        self._ok_button.setEnabled(not self._create_in_flight)
 
     def _format_path(self) -> str:
         return " / ".join(entry.name for entry in self._path)

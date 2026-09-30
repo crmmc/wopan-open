@@ -52,6 +52,7 @@ from qfluentwidgets import (
     FluentIcon,
     FluentWindow,
     IconWidget,
+    IndeterminateProgressBar,
     InfoBar,
     LineEdit,
     MessageBox,
@@ -2132,12 +2133,14 @@ class FileInterface(QWidget):
         self.setObjectName("FileInterface")
         self._window = window
         self._rendering_breadcrumb = False
+        self._operation_busy_count = 0
 
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(24, 20, 24, 24)
         self._main_layout.setSpacing(12)
 
         self._build_top_bar()
+        self._build_operation_busy_bar()
         self._build_content()
         self._connect_signals()
 
@@ -2238,6 +2241,27 @@ class FileInterface(QWidget):
         top_layout.addLayout(action_layout)
         top_layout.addLayout(nav_layout)
         self._main_layout.addWidget(top_bar)
+
+    def _build_operation_busy_bar(self) -> None:
+        """Build the slim indeterminate busy bar for batch folder operations."""
+        self.operation_busy_bar = IndeterminateProgressBar(self, start=False)
+        self.operation_busy_bar.hide()
+        self._main_layout.addWidget(self.operation_busy_bar)
+
+    def set_operation_busy(self, busy: bool) -> None:
+        """Show or hide the batch-operation busy indicator (reference counted).
+
+        Move/copy/delete run on independent threads, so several can be in
+        flight at once; the bar hides only when the last one reaches a
+        terminal state.
+        """
+        self._operation_busy_count = max(0, self._operation_busy_count + (1 if busy else -1))
+        active = self._operation_busy_count > 0
+        self.operation_busy_bar.setVisible(active)
+        if active:
+            self.operation_busy_bar.start()
+        else:
+            self.operation_busy_bar.stop()
 
     def _build_content(self) -> None:
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -2499,6 +2523,8 @@ class MainWindow(_MainWindowBase):
         self._target_dialog: TargetFolderDialog | None = None
         self._target_load_thread: QThread | None = None
         self._target_load_worker: BrowserOperationWorker | None = None
+        self._target_create_thread: QThread | None = None
+        self._target_create_worker: BrowserOperationWorker | None = None
         self._transfer_check_thread: QThread | None = None
         self._transfer_check_worker: BrowserOperationWorker | None = None
         self._transfer_pending: tuple[tuple[WopanItem, ...], str, TransferMode] | None = None
@@ -2678,6 +2704,7 @@ class MainWindow(_MainWindowBase):
             (self._recycle_list_thread, "recycle_list", None),
             (self._recycle_action_thread, "recycle_action", None),
             (self._target_load_thread, "target_load", None),
+            (self._target_create_thread, "target_create", None),
             (self._transfer_check_thread, "transfer_check", None),
             (self._usage_thread, "usage", None),
             (self._download_thread, "download", None),
@@ -3486,9 +3513,11 @@ class MainWindow(_MainWindowBase):
 
         if self._delete_thread is not None:
             LOGGER.debug("main_window.delete.skipped_busy")
+            InfoBar.warning(title="删除", content="已有删除任务进行中，请稍候", parent=self)
             return
         file_browser = self._file_browser
         batch = tuple(items)
+        self.file_interface.set_operation_busy(True)
         thread = QThread(self)
         worker = BrowserOperationWorker(lambda: file_browser.delete_items(batch))
         worker.moveToThread(thread)
@@ -3515,6 +3544,7 @@ class MainWindow(_MainWindowBase):
         self._show_login_required_error(message)
 
     def _clear_delete(self) -> None:
+        self.file_interface.set_operation_busy(False)
         self._delete_finished_thread()
         self._delete_thread = None
         self._delete_worker = None
@@ -3555,8 +3585,10 @@ class MainWindow(_MainWindowBase):
 
         if self._move_thread is not None:
             LOGGER.debug("main_window.move.skipped_busy")
+            InfoBar.warning(title="移动", content="已有移动任务进行中，请稍候", parent=self)
             return
         self._set_status(f"正在移动 {len(items)} 个项目…")
+        self.file_interface.set_operation_busy(True)
         thread = QThread(self)
         worker = BrowserOperationWorker(lambda: file_browser.move_items(items, target_id))
         worker.moveToThread(thread)
@@ -3580,8 +3612,10 @@ class MainWindow(_MainWindowBase):
 
         if self._copy_thread is not None:
             LOGGER.debug("main_window.copy.skipped_busy")
+            InfoBar.warning(title="复制", content="已有复制任务进行中，请稍候", parent=self)
             return
         self._set_status(f"正在复制 {len(items)} 个项目…")
+        self.file_interface.set_operation_busy(True)
         thread = QThread(self)
         worker = BrowserOperationWorker(lambda: file_browser.copy_items(items, target_id))
         worker.moveToThread(thread)
@@ -3608,6 +3642,7 @@ class MainWindow(_MainWindowBase):
         self._show_login_required_error(message)
 
     def _clear_move(self) -> None:
+        self.file_interface.set_operation_busy(False)
         self._delete_finished_thread()
         self._move_thread = None
         self._move_worker = None
@@ -3624,6 +3659,7 @@ class MainWindow(_MainWindowBase):
         self._show_login_required_error(message)
 
     def _clear_copy(self) -> None:
+        self.file_interface.set_operation_busy(False)
         self._delete_finished_thread()
         self._copy_thread = None
         self._copy_worker = None
@@ -4750,15 +4786,17 @@ class MainWindow(_MainWindowBase):
             return
 
         selected_ids = frozenset(item.item_id for item in items)
-        root_entry = self._breadcrumb[0]
+        # Readable root label: the breadcrumb root name is "/", which the
+        # dialog's " / ".join path bar would render as "/ / 子目录".
         dialog = TargetFolderDialog(
             mode,
-            TargetEntry(item_id=root_entry.item_id, name=root_entry.name),
+            TargetEntry(item_id=self._breadcrumb[0].item_id, name="根目录"),
             [],
             excluded_ids=selected_ids,
             parent=self,
         )
         dialog.directory_requested.connect(self._on_target_directory_requested)
+        dialog.create_folder_requested.connect(self._on_target_create_folder_requested)
         self._target_dialog = dialog
         dialog.start_browse()
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
@@ -4820,6 +4858,63 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._target_load_thread = None
         self._target_load_worker = None
+
+    def _on_target_create_folder_requested(self, parent_id: str, name: str) -> None:
+        """Create a folder for the open target dialog on a worker thread."""
+        dialog = self._target_dialog
+        if dialog is None:
+            return
+        if self._target_create_thread is not None:
+            LOGGER.debug("main_window.target_create.skipped_busy")
+            dialog.show_create_error("已有创建任务进行中，请稍候")
+            return
+        file_browser = self._file_browser
+        if file_browser is None:
+            dialog.show_create_error("请先登录")
+            return
+        dialog.begin_create()
+        thread = QThread(self)
+        worker = BrowserOperationWorker(lambda: file_browser.create_folder(parent_id, name))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_target_create_succeeded)
+        worker.failed.connect(self._on_target_create_failed)
+        worker.login_required.connect(self._on_target_create_login_required)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.login_required.connect(thread.quit)
+        thread.finished.connect(self._clear_target_create)
+        self._target_create_thread = thread
+        self._target_create_worker = worker
+        LOGGER.info(
+            "main_window.target_create.start parent_id=%s name_length=%s", parent_id, len(name)
+        )
+        thread.start()
+
+    def _on_target_create_succeeded(self, result: object) -> None:
+        if self._closing:
+            return
+        dialog = self._target_dialog
+        if dialog is None or not isinstance(result, WopanItem):
+            return
+        LOGGER.info("main_window.target_create.success item_id=%s", result.item_id)
+        dialog.show_created_entry(TargetEntry(item_id=result.item_id, name=result.name))
+
+    def _on_target_create_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        if self._target_dialog is not None:
+            self._target_dialog.show_create_error(message)
+
+    def _on_target_create_login_required(self, message: str) -> None:
+        if self._target_dialog is not None:
+            self._target_dialog.reject()
+        self._show_login_required_error(message)
+
+    def _clear_target_create(self) -> None:
+        self._delete_finished_thread()
+        self._target_create_thread = None
+        self._target_create_worker = None
 
     def _check_transfer_conflicts(
         self, items: tuple[WopanItem, ...], target_id: str, mode: TransferMode

@@ -200,3 +200,152 @@ def test_dialog_ignores_items_without_target_entry_data(qapp) -> None:
 
     assert requested == []
     assert dialog.current_target() == ROOT
+
+
+def _install_name_dialog_stub(
+    monkeypatch: pytest.MonkeyPatch, *, accepted: bool = True, name: str = "新目录"
+) -> list[dict[str, object]]:
+    """Replace NameInputDialog inside main_window with a recording stub."""
+    from openwopan.ui import main_window as main_window_module
+
+    created: list[dict[str, object]] = []
+
+    class _StubNameDialog:
+        def __init__(
+            self,
+            *,
+            title: str,
+            hint: str,
+            default_text: str,
+            parent: object = None,
+        ) -> None:
+            created.append(
+                {"title": title, "hint": hint, "default_text": default_text, "deleted": False}
+            )
+
+        exec = staticmethod(
+            lambda: QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected
+        )
+
+        def name_text(self) -> str:
+            return name
+
+        def deleteLater(self) -> None:
+            created[-1]["deleted"] = True
+
+    monkeypatch.setattr(main_window_module, "NameInputDialog", _StubNameDialog)
+    return created
+
+
+def test_create_folder_button_confirms_name_and_emits_request(
+    qapp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stubs = _install_name_dialog_stub(monkeypatch, accepted=True, name="新目录")
+    dialog = TargetFolderDialog("move", ROOT, [FOLDER_A])
+    requests: list[tuple[str, str]] = []
+    dialog.create_folder_requested.connect(
+        lambda parent_id, name: requests.append((parent_id, name))
+    )
+
+    dialog._create_folder_button.click()
+
+    assert len(stubs) == 1
+    assert stubs[0]["title"] == "新建文件夹"
+    assert stubs[0]["default_text"] == "新建文件夹"
+    assert "全部文件" in stubs[0]["hint"]
+    assert stubs[0]["deleted"] is True
+    assert requests == [("root", "新目录")]
+
+
+def test_create_folder_cancelled_emits_nothing(qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+    stubs = _install_name_dialog_stub(monkeypatch, accepted=False)
+    dialog = TargetFolderDialog("move", ROOT, [FOLDER_A])
+    requests: list[tuple[str, str]] = []
+    dialog.create_folder_requested.connect(
+        lambda parent_id, name: requests.append((parent_id, name))
+    )
+
+    dialog._create_folder_button.click()
+
+    assert len(stubs) == 1
+    assert requests == []
+
+
+@pytest.mark.parametrize("busy_attribute", ["_load_in_flight", "_create_in_flight"])
+def test_create_folder_click_ignored_while_busy(
+    qapp, monkeypatch: pytest.MonkeyPatch, busy_attribute: str
+) -> None:
+    stubs = _install_name_dialog_stub(monkeypatch)
+    dialog = TargetFolderDialog("move", ROOT, [FOLDER_A])
+    requests: list[tuple[str, str]] = []
+    dialog.create_folder_requested.connect(
+        lambda parent_id, name: requests.append((parent_id, name))
+    )
+    setattr(dialog, busy_attribute, True)
+
+    dialog._create_folder_button.click()
+
+    assert stubs == []
+    assert requests == []
+
+
+def test_begin_create_disables_controls_until_error_resolves(qapp) -> None:
+    dialog = TargetFolderDialog("move", ROOT, [FOLDER_A])
+
+    dialog.begin_create()
+
+    assert dialog._create_in_flight is True
+    assert dialog._status_label.text() == "正在创建文件夹…"
+    assert not dialog._create_folder_button.isEnabled()
+    assert not dialog._folder_list.isEnabled()
+    assert not dialog._ok_button.isEnabled()
+
+    dialog.show_create_error("目录已存在")
+
+    assert dialog._create_in_flight is False
+    assert dialog._status_label.text() == "创建失败：目录已存在"
+    assert dialog._create_folder_button.isEnabled()
+    assert dialog._folder_list.isEnabled()
+    assert dialog._ok_button.isEnabled()
+
+
+def test_show_created_entry_reloads_and_selects_new_folder(qapp) -> None:
+    dialog = TargetFolderDialog("move", ROOT, [FOLDER_A])
+    requested: list[str] = []
+    dialog.directory_requested.connect(requested.append)
+
+    dialog.show_created_entry(FOLDER_B)
+
+    assert requested == ["root"]
+    assert dialog._create_in_flight is False
+    assert dialog._load_in_flight is True
+    assert dialog._folder_list.isEnabled() is False
+
+    dialog.show_entries([FOLDER_A, FOLDER_B])
+
+    assert dialog.current_target() == FOLDER_B
+    assert dialog._ok_button.text() == "移动到「文档」"
+    assert dialog._pending_selection is None
+    assert dialog._folder_list.currentItem().data(Qt.ItemDataRole.UserRole) == FOLDER_B
+    assert dialog._folder_list.isEnabled() is True
+
+
+def test_show_created_entry_falls_back_when_folder_not_listed(qapp) -> None:
+    dialog = TargetFolderDialog("move", ROOT, [FOLDER_A])
+
+    dialog.show_created_entry(FOLDER_B)
+    dialog.show_entries([FOLDER_A])
+
+    assert dialog.current_target() == ROOT
+    assert dialog._pending_selection is None
+
+
+def test_show_load_error_clears_pending_selection(qapp) -> None:
+    dialog = TargetFolderDialog("move", ROOT, [FOLDER_A])
+
+    dialog.show_created_entry(FOLDER_B)
+    dialog.show_load_error("网络超时")
+
+    assert dialog._pending_selection is None
+    dialog.show_entries([FOLDER_A])
+    assert dialog.current_target() == ROOT
