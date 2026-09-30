@@ -1323,6 +1323,19 @@ class TransferInterface(QWidget):
         records: list[TransferRecord],
         direction: str,
     ) -> None:
+        # Contract 16 (transfer page): a refill that changes the row-to-task
+        # mapping (record removal/addition/reorder/filter change) shifts row
+        # numbers, so a stale row-number selection would silently point at
+        # another task. Progress-only renders keep the same id sequence and
+        # must preserve the user's selection, hence the conditional clear. It
+        # runs before setRowCount so the synchronous itemSelectionChanged ->
+        # _update_batch_bar reads the already-updated backing record list.
+        rendered_ids: list[object] = []
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            rendered_ids.append(item.data(Qt.ItemDataRole.UserRole) if item is not None else None)
+        if rendered_ids != [record.task_id for record in records]:
+            table.clearSelection()
         if table.rowCount() != len(records):
             self._clear_action_widgets(table)
         table.setRowCount(len(records))

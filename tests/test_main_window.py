@@ -15,9 +15,11 @@ from openwopan.ui.main_window import (
     DOWNLOAD_STATUS_FILTERS,
     FILE_SPLITTER_STRETCH_FACTORS,
     ROOT_DISPLAY_NAME,
+    TRANSFER_COL_PROGRESS,
     TRANSFER_TABLE_HEADERS,
     UPLOAD_STATUS_FILTERS,
     MainWindow,
+    TransferRecord,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID
 from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, WopanRecycleItem
@@ -842,6 +844,111 @@ def test_transfer_center_deletes_terminal_records(qapp: QApplication, tmp_path: 
 
     assert window.transfer_interface.upload_records == []
     assert window.transfer_interface.upload_table.rowCount() == 0
+
+
+def test_transfer_record_removal_clears_stale_selection(
+    qapp: QApplication,
+    tmp_path: Path,
+) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+
+    window.refresh_current_directory()
+    for index in range(3):
+        local_path = tmp_path / f"upload-{index}.txt"
+        local_path.write_text("content")
+        window.upload_file_to_current_directory(local_path, run_in_background=False)
+
+    interface = window.transfer_interface
+    table = interface.upload_table
+    assert len(interface.upload_records) == 3
+
+    table.selectRow(1)
+    assert interface.upload_batch_buttons["count"].text() == "已选 1 项"
+
+    # Removing the first record shifts rows up; a stale row-number selection
+    # would keep pointing at row 1, which now holds the never-selected third
+    # record (contract 16, transfer page).
+    removed_id = interface.upload_records[0].task_id
+    interface.remove_records("upload", {removed_id})
+
+    assert [record.name for record in interface.upload_records] == [
+        "upload-1.txt",
+        "upload-2.txt",
+    ]
+    assert table.selectionModel().selectedRows() == []
+    assert interface.upload_batch_buttons["count"].text() == "已选 0 项"
+    for key in ("pause", "resume", "retry"):
+        assert not interface.upload_batch_buttons[key].isEnabled()
+
+
+def test_transfer_progress_render_preserves_selection(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    interface = window.transfer_interface
+    table = interface.upload_table
+    record = TransferRecord(
+        task_id="task-progress",
+        direction="upload",
+        name="upload.txt",
+        size=100,
+        status="上传中",
+    )
+    interface.add_upload_record(record)
+
+    table.selectRow(0)
+    assert interface.upload_batch_buttons["count"].text() == "已选 1 项"
+
+    # Progress-only update leaves the task-id sequence unchanged, so the
+    # coalesced render must keep the user's selection (no unconditional clear).
+    interface.update_record("upload", record.task_id, bytes_done=42)
+    interface.flush_progress_render()
+
+    assert interface.upload_records[0].bytes_done == 42
+    assert table.item(0, TRANSFER_COL_PROGRESS).text() == "42% (42 B / 100 B)"
+    assert [index.row() for index in table.selectionModel().selectedRows()] == [0]
+    assert interface.upload_batch_buttons["count"].text() == "已选 1 项"
+
+
+def test_transfer_filter_change_clears_stale_selection(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+
+    interface = window.transfer_interface
+    table = interface.upload_table
+    interface.add_upload_record(
+        TransferRecord(
+            task_id="task-done",
+            direction="upload",
+            name="done.txt",
+            size=10,
+            status="已完成",
+        )
+    )
+    interface.add_upload_record(
+        TransferRecord(
+            task_id="task-active",
+            direction="upload",
+            name="active.txt",
+            size=10,
+            status="上传中",
+        )
+    )
+
+    table.selectRow(0)
+    assert interface.upload_batch_buttons["count"].text() == "已选 1 项"
+
+    # Filtering to another status shrinks the visible set; the selected row
+    # number stays in range and would otherwise silently repoint at the
+    # never-selected "上传中" record.
+    interface._on_upload_filter_changed("上传中")
+
+    assert [record.name for record in interface._filtered_upload_records()] == ["active.txt"]
+    assert table.selectionModel().selectedRows() == []
+    assert interface.upload_batch_buttons["count"].text() == "已选 0 项"
 
 
 def test_main_window_enables_upload_after_browser_attached(qapp: QApplication) -> None:
