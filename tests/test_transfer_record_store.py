@@ -498,6 +498,7 @@ def test_adapter_degrades_to_memory_when_store_cannot_open(tmp_path: Path) -> No
     )
     broken_adapter.delete_records("upload", ["upload-1"])
     assert broken_adapter.load_history() == ()
+    assert broken_adapter.purge_stale_records() == ()
 
 
 @pytest.mark.parametrize("error", [sqlite3.OperationalError("disk I/O error"), OSError("no space")])
@@ -585,3 +586,174 @@ def test_row_from_values_coerces_anomalous_field_types() -> None:
     assert row.upload_retryable is False
     assert row.created_at == 0.0
     assert row.updated_at == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Retention purge (PRD 10-01 B6 R5)
+# ---------------------------------------------------------------------------
+
+_SECONDS_PER_DAY = 86400.0
+
+
+@pytest.mark.parametrize(
+    ("direction", "status", "retryable", "age_days", "purged"),
+    [
+        # Stale terminal rows of either direction are purged.
+        ("download", "已完成", False, 31, True),
+        ("download", "已取消", False, 31, True),
+        ("upload", "已完成", False, 31, True),
+        ("upload", "已取消", False, 31, True),
+        # Terminal rows are purged regardless of a leftover retryable flag
+        # (a failed-then-retried upload ends 已完成 with retryable still set).
+        ("upload", "已完成", True, 31, True),
+        # Fresh terminal rows survive (boundary: 29 days < 30).
+        ("download", "已完成", False, 29, False),
+        ("upload", "已取消", False, 29, False),
+        # Stale non-retryable upload failure is purged.
+        ("upload", "失败", False, 31, True),
+        # Retryable failures are never purged, however stale.
+        ("upload", "失败", True, 31, False),
+        # Non-terminal rows are never purged.
+        ("upload", "已暂停", True, 31, False),
+        ("upload", "已暂停", False, 31, False),
+        ("upload", "上传中", False, 31, False),
+        ("upload", "等待中", False, 31, False),
+        # Download failures are not in the retention rule at all.
+        ("download", "失败", False, 31, False),
+    ],
+)
+def test_purge_stale_matches_retention_rule(
+    store: TransferRecordStore,
+    direction: str,
+    status: str,
+    retryable: bool,
+    age_days: int,
+    purged: bool,
+) -> None:
+    base = 1_000_000.0
+    store.upsert(
+        _row(
+            direction=direction,
+            task_id="task-1",
+            status=status,
+            upload_retryable=retryable,
+            updated_at=base - age_days * _SECONDS_PER_DAY,
+        )
+    )
+    cutoff = base - 30 * _SECONDS_PER_DAY
+
+    pairs = store.purge_stale(cutoff)
+
+    expected = [("upload" if direction == "upload" else "download", "task-1")] if purged else []
+    assert pairs == expected
+    remaining = store.load_all()
+    assert bool(remaining) != purged
+
+
+def test_purge_stale_boundary_keeps_row_exactly_at_cutoff(
+    store: TransferRecordStore,
+) -> None:
+    """时钟以 updated_at 为准：恰好等于 cutoff 的行不算过期（< 而非 <=）。"""
+    base = 1_000_000.0
+    store.upsert(_row(task_id="at-cutoff", updated_at=base))
+
+    assert store.purge_stale(base) == []
+    assert store.purge_stale(base + 1.0) == [("download", "at-cutoff")]
+    assert store.load_all() == []
+
+
+def test_purge_stale_returns_deleted_pairs_and_clears_db(store: TransferRecordStore) -> None:
+    base = 0.0
+    store.upsert(_row(task_id="stale-done", updated_at=base))
+    store.upsert(
+        _row(
+            task_id="stale-failed",
+            direction="upload",
+            status="失败",
+            upload_retryable=False,
+            updated_at=base,
+        )
+    )
+    store.upsert(_row(task_id="fresh", updated_at=base + 40 * _SECONDS_PER_DAY))
+    store.upsert(
+        _row(
+            task_id="kept-retryable",
+            direction="upload",
+            status="失败",
+            upload_retryable=True,
+            updated_at=base,
+        )
+    )
+
+    pairs = store.purge_stale(30 * _SECONDS_PER_DAY)
+
+    assert sorted(pairs) == [("download", "stale-done"), ("upload", "stale-failed")]
+    assert sorted(row.task_id for row in store.load_all()) == ["fresh", "kept-retryable"]
+
+
+def test_purge_stale_on_empty_db_returns_no_pairs(store: TransferRecordStore) -> None:
+    assert store.purge_stale(0.0) == []
+
+
+def test_adapter_purge_stale_records_uses_retention_default(
+    adapter: TransferHistoryAdapter, store: TransferRecordStore
+) -> None:
+    """适配层默认 30 天：31 天的终态行被清，29 天的保留。"""
+    import time as _time
+
+    now = _time.time()
+    adapter.save_record(
+        _history_row("stale-download", "download", status="已完成", updated_at=now - 31 * 86400)
+    )
+    adapter.save_record(
+        _history_row(
+            "fresh-upload",
+            "upload",
+            status="失败",
+            upload_retryable=False,
+            updated_at=now - 29 * 86400,
+        )
+    )
+
+    pairs = adapter.purge_stale_records()
+
+    assert pairs == (("download", "stale-download"),)
+    assert [row.task_id for row in store.load_all()] == ["fresh-upload"]
+
+
+def test_adapter_purge_stale_records_degrades_to_empty_on_db_error(
+    adapter: TransferHistoryAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def broken_purge(cutoff: float) -> list[tuple[str, str]]:
+        raise sqlite3.OperationalError("disk gone")
+
+    monkeypatch.setattr(adapter._store, "purge_stale", broken_purge)
+
+    with caplog.at_level(logging.ERROR, logger="openwopan.app.transfer_history"):
+        assert adapter.purge_stale_records() == ()
+    assert any("transfer_history.purge.failed" in record.message for record in caplog.records)
+
+
+def _history_row(
+    task_id: str,
+    direction: str,
+    *,
+    status: str,
+    updated_at: float,
+    upload_retryable: bool | None = None,
+) -> TransferRecord:
+    from pathlib import Path as _Path
+
+    return TransferRecord(
+        task_id=task_id,
+        direction=direction,
+        name=f"{task_id}.bin",
+        size=1,
+        target_path=_Path(f"/tmp/{task_id}.bin"),
+        status=status,
+        upload_retryable=(direction == "upload") if upload_retryable is None else upload_retryable,
+        updated_at_epoch=updated_at,
+        created_at_epoch=updated_at - 1.0,
+    )

@@ -805,9 +805,28 @@ class FileBrowserService:
             if state.status == "已完成" or not state.local_path.exists():
                 store.delete(state.task_id)
                 continue
-            updated = store.update(state.task_id, _mark_upload_interrupted)
+            try:
+                updated = store.update(state.task_id, _mark_upload_interrupted)
+            except KeyError:
+                # The session was deleted concurrently (retention purge racing
+                # this recovery loop); nothing left to recover for it.
+                continue
             records.append(_upload_state_record(updated))
         return tuple(records)
+
+    def discard_upload_sessions(self, task_ids: Sequence[str]) -> None:
+        """Delete persisted upload session states by task id.
+
+        Used by the startup retention purge: dropping a terminal transfer
+        record must also drop its session state, otherwise the next restart
+        would resurrect the record row. A no-op without an injected store.
+        """
+        store = self._upload_store
+        if store is None:
+            return
+        for task_id in task_ids:
+            if task_id:
+                store.delete(task_id)
 
     def prepare_folder_upload(
         self,
@@ -1050,10 +1069,13 @@ def _mark_upload_failed(state: UploadTaskState, message: str) -> None:
 
 
 def _mark_upload_interrupted(state: UploadTaskState) -> None:
-    """Normalize a state left behind by an interrupted application run."""
-    state.status = "失败"
+    """Normalize a state left behind by an interrupted application run.
+
+    被打断 ≠ 出错：恢复语义是「已暂停」，续传由用户手动触发。
+    """
+    state.status = "已暂停"
     state.error = (
-        f"应用中断，可续传（已完成 {len(state.completed_indexes)}/{state.total_parts} 分片）"
+        f"应用中断，已暂停（已完成 {len(state.completed_indexes)}/{state.total_parts} 分片）"
     )
 
 

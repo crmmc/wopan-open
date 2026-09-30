@@ -778,6 +778,11 @@ class TransferRecordPersistence(Protocol):
     def load_history(self) -> tuple[TransferRecord, ...]:
         """Load all persisted rows ordered by update time ascending."""
 
+    def purge_stale_records(
+        self, max_age_days: int = ...
+    ) -> tuple[tuple[str, str], ...]:
+        """Delete retention-expired terminal rows; return their (direction, task_id) keys."""
+
 
 @dataclass(slots=True)
 class QueuedUploadFile:
@@ -2607,6 +2612,8 @@ class MainWindow(_MainWindowBase):
         self._transfer_history_thread: QThread | None = None
         self._transfer_history_worker: BrowserOperationWorker | None = None
         self._transfer_history_loaded = False
+        self._transfer_purge_thread: QThread | None = None
+        self._transfer_purge_worker: BrowserOperationWorker | None = None
         self._scan_thread: QThread | None = None
         self._scan_worker: UploadScanWorker | None = None
         self._upload_scan_pending: list[tuple[tuple[Path, ...], str]] = []
@@ -2734,6 +2741,7 @@ class MainWindow(_MainWindowBase):
             (self._download_recovery_thread, "download_recovery", None),
             (self._upload_recovery_thread, "upload_recovery", None),
             (self._transfer_history_thread, "transfer_history", None),
+            (self._transfer_purge_thread, "transfer_purge", None),
             (self._download_close_thread, "download_close", None),
             (self._download_operation_thread, "download_operation", None),
             (self._scan_thread, "upload_scan", None),
@@ -2995,6 +3003,8 @@ class MainWindow(_MainWindowBase):
             self.transfer_interface._render_upload_table()
         if downloads:
             self.transfer_interface._render_download_table()
+        # R7：历史加载完成后启动一次保留期清理（在 worker 线程执行）。
+        self._purge_stale_transfer_records()
 
     def _raise_transfer_sequence(self, direction: str, task_id: str) -> None:
         """Lift the id sequence above restored numeric ids to avoid collisions."""
@@ -3012,6 +3022,79 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._transfer_history_thread = None
         self._transfer_history_worker = None
+
+    def _purge_stale_transfer_records(self) -> None:
+        """Purge retention-expired history rows once per session (worker thread).
+
+        Coordinates both stores (PRD 10-01 B6 R6): the record rows are purged
+        through the history adapter, then the matching upload session states
+        are discarded through the file browser so the next restart cannot
+        resurrect the deleted rows. sqlite DELETE is millisecond-level, but
+        the qt-threading contract 9 keeps IO off the GUI thread.
+        """
+        if (
+            self._closing
+            or self._transfer_history is None
+            or self._transfer_purge_thread is not None
+        ):
+            return
+        history = self._transfer_history
+        browser = self._file_browser
+
+        def purge() -> tuple[tuple[str, str], ...]:
+            purged = history.purge_stale_records()
+            upload_ids = sorted(
+                {task_id for direction, task_id in purged if direction == "upload"}
+            )
+            if upload_ids:
+                discard_sessions = getattr(browser, "discard_upload_sessions", None)
+                if callable(discard_sessions):
+                    discard_sessions(upload_ids)
+            # 下载终态行的状态文件由生命周期管理，但完成态会保留到用户删行；
+            # 清理记录行时残留状态一并删除，避免孤儿状态文件。
+            download_ids = sorted(
+                {task_id for direction, task_id in purged if direction == "download"}
+            )
+            if download_ids:
+                remove_download_record = getattr(browser, "remove_download_record", None)
+                if callable(remove_download_record):
+                    for task_id in download_ids:
+                        remove_download_record(task_id)
+            return purged
+
+        thread = QThread(self)
+        worker = BrowserOperationWorker(purge)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._on_transfer_purge_succeeded)
+        worker.failed.connect(self._on_transfer_purge_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._clear_transfer_purge)
+        self._transfer_purge_thread = thread
+        self._transfer_purge_worker = worker
+        thread.start()
+
+    def _on_transfer_purge_succeeded(self, result: object) -> None:
+        if not isinstance(result, tuple) or self._closing:
+            return
+        if result:
+            LOGGER.info("main_window.transfer_purge.deleted count=%d", len(result))
+        uploads = {task_id for direction, task_id in result if direction == "upload"}
+        downloads = {task_id for direction, task_id in result if direction == "download"}
+        # R8：清理发生在历史行渲染之后，删除的行要从界面同步移除。
+        if uploads:
+            self.transfer_interface.remove_records("upload", uploads)
+        if downloads:
+            self.transfer_interface.remove_records("download", downloads)
+
+    def _on_transfer_purge_failed(self, message: str) -> None:
+        LOGGER.warning("main_window.transfer_purge.failed error=%s", message)
+
+    def _clear_transfer_purge(self) -> None:
+        self._delete_finished_thread()
+        self._transfer_purge_thread = None
+        self._transfer_purge_worker = None
 
     def set_auth_session(self, session: AuthSession) -> None:
         """Attach a safe authenticated-session summary to the UI."""
@@ -5903,7 +5986,20 @@ class MainWindow(_MainWindowBase):
             return
         pending = self._paused_uploads.pop(task_id, None)
         if pending is None:
-            return
+            # 重启恢复的「已暂停」行：本会话没有 worker / 暂停登记，
+            # 从记录重建启动参数，服务层按持久化会话断点续传。
+            if record.target_path is None or not record.upload_parent_id:
+                message = "缺少上传任务信息，请重新选择文件上传"
+                self._set_status(f"继续上传失败：{message}")
+                InfoBar.warning(title="继续上传", content=message, parent=self)
+                return
+            pending = PendingUploadTask(
+                parent_id=record.upload_parent_id,
+                local_path=record.target_path,
+                task_id=task_id,
+                upload_name=record.upload_name,
+                show_enqueue_status=False,
+            )
         if any(item.task_id == task_id for item in self._folder_upload_queue):
             self.transfer_interface.update_record(
                 "upload", task_id, status="等待中", can_resume=False
@@ -6061,7 +6157,12 @@ class MainWindow(_MainWindowBase):
             worker.request_cancel()
             self._set_status("正在停止上传；已发出的请求可能仍会在云端完成")
             return
-        InfoBar.warning(title="删除上传任务", content="任务尚未退出，请稍后重试", parent=self)
+        # 重启恢复的非终态行（如「已暂停」）：本会话没有存活 worker/队列，
+        # 无需等待退出，直接移除；同时丢弃其持久化会话，避免下次重启复活。
+        discard_sessions = getattr(self._file_browser, "discard_upload_sessions", None)
+        if callable(discard_sessions):
+            discard_sessions([task_id])
+        self.transfer_interface.remove_records("upload", {task_id})
 
     def _cancel_folder_upload(self) -> None:
         root_id = self._folder_upload_record_id

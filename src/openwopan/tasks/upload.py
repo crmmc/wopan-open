@@ -270,7 +270,7 @@ def _scan_directory(
 # ---------------------------------------------------------------------------
 
 
-UploadTaskStatus = Literal["进行中", "失败", "已完成"]
+UploadTaskStatus = Literal["进行中", "失败", "已完成", "已暂停"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,7 +492,7 @@ def _read_index_list(value: object) -> list[int]:
 
 
 def _read_upload_status(value: object) -> UploadTaskStatus:
-    if value in {"进行中", "失败", "已完成"}:
+    if value in {"进行中", "失败", "已完成", "已暂停"}:
         return value  # type: ignore[return-value]
     return "进行中"
 

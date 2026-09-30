@@ -12,16 +12,19 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
 from openwopan.storage.transfer_records import (
+    TRANSFER_RECORD_RETENTION_DAYS,
     TransferRecordRow,
     TransferRecordStore,
 )
 from openwopan.ui.main_window import TransferRecord
 
 LOGGER = logging.getLogger(__name__)
+_SECONDS_PER_DAY = 86400.0
 
 
 class TransferHistoryAdapter:
@@ -103,6 +106,24 @@ class TransferHistoryAdapter:
             LOGGER.exception("transfer_history.load.failed")
             return ()
         return tuple(_to_record(row) for row in rows)
+
+    def purge_stale_records(
+        self, max_age_days: int = TRANSFER_RECORD_RETENTION_DAYS
+    ) -> tuple[tuple[str, str], ...]:
+        """Delete retention-expired terminal rows; return their (direction, task_id) keys.
+
+        Failures degrade to a no-op with an exception-level log, matching the
+        other adapter methods: the caller (startup purge flow) only uses the
+        returned keys to chain linked upload-session cleanup.
+        """
+        if self._store is None:
+            return ()
+        cutoff = time.time() - max_age_days * _SECONDS_PER_DAY
+        try:
+            return tuple(self._store.purge_stale(cutoff))
+        except (sqlite3.Error, OSError):
+            LOGGER.exception("transfer_history.purge.failed")
+            return ()
 
 
 def _to_row(record: TransferRecord) -> TransferRecordRow:
