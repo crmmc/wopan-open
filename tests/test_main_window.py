@@ -416,8 +416,9 @@ def test_main_window_loads_root_and_enters_child_folder(qapp: QApplication) -> N
 
     window.enter_displayed_folder(0)
 
-    # 进入 folder-1 后树同步会补一次根目录列表（面包屑上一层级）
-    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, "folder-1", ROOT_DIRECTORY_ID]
+    # B24：进入 folder-1 后树同步的祖先层（根目录）直接命中已访问缓存，
+    # 不再对根目录重复发列表请求
+    assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, "folder-1"]
     assert window.current_directory_id() == "folder-1"
     assert window.breadcrumb_names() == (ROOT_DISPLAY_NAME, "Folder")
     assert [item.name for item in window.displayed_items()] == ["child.txt"]
@@ -463,6 +464,23 @@ def test_recycle_success_marks_dirty_flag(qapp: QApplication) -> None:
         window._recycle_dirty = False
         slot(None)
         assert window._recycle_dirty is True
+
+
+def test_recycle_restore_clears_visited_directory_cache(qapp: QApplication) -> None:
+    # 恢复的目标目录可能不是当前目录；脏标记消费只强制刷新当前目录，
+    # 缓存若不整体失效，导航到恢复目标会看到缺少恢复文件的旧列表。
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+
+    window.refresh_current_directory()
+    window.enter_displayed_folder(0)
+    assert window._directory_cache  # 已访问目录进入缓存
+
+    window._on_recycle_restore_succeeded(None)
+
+    assert window._recycle_dirty is True
+    assert window._directory_cache == {}
 
 
 def test_switch_back_to_file_page_consumes_dirty_flag(qapp: QApplication) -> None:
