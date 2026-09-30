@@ -4922,7 +4922,7 @@ def test_folder_tree_expands_along_current_path(qapp: QApplication) -> None:
     root_item = tree.topLevelItem(0)
     assert root_item is not None
     assert root_item.childCount() == 2
-    folder_node = root_item.child(1)
+    folder_node = root_item.child(0)
     assert folder_node.text(0) == "Folder"
     assert folder_node.isExpanded() is True
     deep_node = folder_node.child(0)
@@ -5076,14 +5076,14 @@ def test_render_folder_tree_sorts_siblings_casefold_and_keeps_path_order(
 
     root_node = tree.topLevelItem(0)
     # Siblings sort ascending by name.casefold(); the breadcrumb path node "A"
-    # is NOT merged into the sibling sort — it stays appended in path position.
+    # is merged into that sort and lands at its own sorted position.
     assert [root_node.child(i).text(0) for i in range(root_node.childCount())] == [
+        "A",
         "b",
         "B",
         "c",
-        "A",
     ]
-    folder_node = root_node.child(3)
+    folder_node = root_node.child(0)
     assert folder_node.text(0) == "A"
     assert [folder_node.child(i).text(0) for i in range(folder_node.childCount())] == [
         "alpha",
@@ -5126,6 +5126,45 @@ def test_render_folder_tree_sibling_order_consistent_across_listings(
     second = sibling_texts()
 
     assert first == ["Alpha", "Bravo", "charlie", "delta"]
+    assert second == first
+
+
+def test_render_folder_tree_current_path_does_not_shift_sibling_order(
+    qapp: QApplication,
+) -> None:
+    window = MainWindow()
+    tree = window.file_interface.folder_tree
+    root = main_window_module.BreadcrumbEntry(item_id=ROOT_DIRECTORY_ID, name="/")
+    entry_b = main_window_module.BreadcrumbEntry(item_id="folder-B", name="B")
+    entry_c = main_window_module.BreadcrumbEntry(item_id="folder-C", name="C")
+
+    def folders(names: tuple[str, ...]) -> tuple[WopanItem, ...]:
+        return tuple(
+            WopanItem(
+                item_id=f"folder-{name}",
+                name=name,
+                kind=WopanItemKind.FOLDER,
+                parent_id=ROOT_DIRECTORY_ID,
+            )
+            for name in names
+        )
+
+    def sibling_texts() -> list[str]:
+        node = tree.topLevelItem(0)
+        return [node.child(i).text(0) for i in range(node.childCount())]
+
+    siblings = folders(("A", "B", "C"))
+
+    # Same sibling set, two different visited folders: the breadcrumb path
+    # node must land at its casefold-sorted position instead of being
+    # appended last, otherwise each navigation visibly reshuffles the tree
+    # (backlog B23 UAT follow-up).
+    window.file_interface.render_folder_tree((root, entry_b), (siblings,))
+    first = sibling_texts()
+    window.file_interface.render_folder_tree((root, entry_c), (siblings,))
+    second = sibling_texts()
+
+    assert first == ["A", "B", "C"]
     assert second == first
 
 
