@@ -1148,6 +1148,36 @@ def test_main_window_move_prompt_opens_dialog_without_subfolders(
     assert instances[0].initial_folders == []
 
 
+@pytest.mark.parametrize(
+    ("prompt_method", "expected_verb"),
+    [("prompt_move_item", "移动"), ("prompt_copy_item", "复制")],
+)
+def test_main_window_transfer_prompt_shows_readable_root_path(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_method: str,
+    expected_verb: str,
+) -> None:
+    """The dialog root segment reads 根目录, never a "/ /" double separator."""
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    opened: list[TargetFolderDialog] = []
+
+    def _capture_exec(dialog: TargetFolderDialog) -> int:
+        opened.append(dialog)
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(TargetFolderDialog, "exec", _capture_exec)
+    getattr(window, prompt_method)(1)
+
+    dialog = opened[0]
+    assert dialog._path_label.text() == "根目录"
+    assert dialog._ok_button.text() == f"{expected_verb}到此（根目录）"
+    assert "/ /" not in dialog._path_label.text()
+    dialog.deleteLater()
+
+
 class QueuedFileBrowser(FakeFileBrowser):
     def __init__(self) -> None:
         super().__init__()

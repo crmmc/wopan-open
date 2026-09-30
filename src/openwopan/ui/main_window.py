@@ -4786,10 +4786,11 @@ class MainWindow(_MainWindowBase):
             return
 
         selected_ids = frozenset(item.item_id for item in items)
-        root_entry = self._breadcrumb[0]
+        # Readable root label: the breadcrumb root name is "/", which the
+        # dialog's " / ".join path bar would render as "/ / 子目录".
         dialog = TargetFolderDialog(
             mode,
-            TargetEntry(item_id=root_entry.item_id, name=root_entry.name),
+            TargetEntry(item_id=self._breadcrumb[0].item_id, name="根目录"),
             [],
             excluded_ids=selected_ids,
             parent=self,
