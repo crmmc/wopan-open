@@ -2305,7 +2305,7 @@ class FileInterface(QWidget):
         self.upload_button.clicked.connect(self._window.prompt_upload_file)
         self.upload_file_action.triggered.connect(self._window.prompt_upload_file)
         self.upload_folder_action.triggered.connect(self._window.prompt_upload_folder)
-        self.refresh_button.clicked.connect(lambda: self._window.refresh_current_directory())
+        self.refresh_button.clicked.connect(lambda: self._window.refresh_all_information())
         self.back_button.clicked.connect(self._window.go_up_one_level)
         self.download_button.clicked.connect(self._download_selected_row)
         self.delete_button.clicked.connect(self._delete_selected_row)
@@ -2477,6 +2477,8 @@ class MainWindow(_MainWindowBase):
         self._recycle_list_worker: BrowserOperationWorker | None = None
         self._recycle_action_thread: QThread | None = None
         self._recycle_action_worker: BrowserOperationWorker | None = None
+        # 回收站发生过影响云盘内容的操作后置位；切回文件页时消费一次完整刷新
+        self._recycle_dirty = False
         self._target_dialog: TargetFolderDialog | None = None
         self._target_load_thread: QThread | None = None
         self._target_load_worker: BrowserOperationWorker | None = None
@@ -2820,9 +2822,18 @@ class MainWindow(_MainWindowBase):
         self._stacked_widget.currentChanged.connect(self._on_navigation_page_changed)
 
     def _on_navigation_page_changed(self, _index: int) -> None:
-        """Reload the recycle bin when its page becomes the visible page."""
+        """Reload the visible page's data on navigation.
+
+        Recycle page: reload the bin. File page: if a recycle-bin mutation
+        happened since the last visit, consume the dirty flag once and run a
+        full refresh (list + cloud usage).
+        """
         if not self.recycle_interface.isHidden():
             self.refresh_recycle_items()
+            return
+        if not self.file_interface.isHidden() and self._recycle_dirty:
+            self._recycle_dirty = False
+            self.refresh_all_information()
 
     def _switch_to_interface(self, widget: QWidget, route_key: str) -> None:
         if self._stacked_widget is None or self._navigation_interface is None:
@@ -2946,6 +2957,7 @@ class MainWindow(_MainWindowBase):
         """Clear account state from the UI."""
         self._auth_session = None
         self._cloud_usage = None
+        self._recycle_dirty = False
         self.account_interface.set_session(None)
         self.account_interface.set_usage(None)
         self.file_interface.set_storage_usage(None)
@@ -3708,6 +3720,7 @@ class MainWindow(_MainWindowBase):
         thread.start()
 
     def _on_recycle_restore_succeeded(self, result: object) -> None:
+        self._recycle_dirty = True
         self._set_status("恢复成功，已回到原位置")
         self.refresh_recycle_items()
 
@@ -3716,6 +3729,7 @@ class MainWindow(_MainWindowBase):
         InfoBar.error(title="恢复失败", content=message, parent=self)
 
     def _on_recycle_purge_succeeded(self, result: object) -> None:
+        self._recycle_dirty = True
         self._set_status("已彻底删除，无法恢复")
         self.refresh_recycle_items()
 
@@ -3724,6 +3738,7 @@ class MainWindow(_MainWindowBase):
         InfoBar.error(title="彻底删除失败", content=message, parent=self)
 
     def _on_recycle_empty_succeeded(self, result: object) -> None:
+        self._recycle_dirty = True
         self._set_status("回收站已清空")
         self.refresh_recycle_items()
 

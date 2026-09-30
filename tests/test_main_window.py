@@ -446,6 +446,77 @@ def test_main_window_refreshes_all_account_information(qapp: QApplication) -> No
     assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
+def test_recycle_success_marks_dirty_flag(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+
+    for slot in (
+        window._on_recycle_restore_succeeded,
+        window._on_recycle_purge_succeeded,
+        window._on_recycle_empty_succeeded,
+    ):
+        window._recycle_dirty = False
+        slot(None)
+        assert window._recycle_dirty is True
+
+
+def test_switch_back_to_file_page_consumes_dirty_flag(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+
+    window._stacked_widget.setCurrentWidget(window.recycle_interface)
+    window._recycle_dirty = True
+    usage_calls = len(browser.usage_account_ids)
+    list_calls = len(browser.requested_parent_ids)
+
+    window._stacked_widget.setCurrentWidget(window.file_interface)
+
+    assert window._recycle_dirty is False
+    assert len(browser.usage_account_ids) == usage_calls + 1
+    assert len(browser.requested_parent_ids) == list_calls + 1
+
+
+def test_switch_back_to_file_page_without_dirty_flag_skips_refresh(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+
+    window._stacked_widget.setCurrentWidget(window.recycle_interface)
+    window._recycle_dirty = False
+    usage_calls = len(browser.usage_account_ids)
+    list_calls = len(browser.requested_parent_ids)
+
+    window._stacked_widget.setCurrentWidget(window.file_interface)
+
+    assert len(browser.usage_account_ids) == usage_calls
+    assert len(browser.requested_parent_ids) == list_calls
+
+
+def test_file_refresh_button_refreshes_cloud_usage_too(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window.set_auth_session(AuthSession(account_id="13800138000", display_name="User One"))
+    usage_calls = len(browser.usage_account_ids)
+    list_calls = len(browser.requested_parent_ids)
+
+    window.file_interface.refresh_button.click()
+
+    assert len(browser.usage_account_ids) == usage_calls + 1
+    assert len(browser.requested_parent_ids) == list_calls + 1
+
+
+def test_clear_auth_session_resets_dirty_flag(qapp: QApplication) -> None:
+    browser = FakeFileBrowser()
+    window = MainWindow(browser)
+    window._recycle_dirty = True
+
+    window.clear_auth_session()
+
+    assert window._recycle_dirty is False
+
+
 def test_settings_interface_persists_non_transfer_settings(
     qapp: QApplication,
     tmp_path: Path,
