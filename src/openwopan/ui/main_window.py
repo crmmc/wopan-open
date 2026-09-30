@@ -2408,25 +2408,38 @@ class FileInterface(QWidget):
         for depth in range(len(breadcrumb)):
             next_entry = breadcrumb[depth + 1] if depth + 1 < len(breadcrumb) else None
             folders = levels[depth] if depth < len(levels) else ()
-            for folder in folders:
-                if next_entry is not None and folder.item_id == next_entry.item_id:
-                    continue
-                current.addChild(
-                    make_node(
-                        folder.name,
-                        (*ids_chain, folder.item_id),
-                        (*names_chain, folder.name),
-                        (),
-                    )
+            # Server listing order is unstable across calls; every sibling of
+            # a level — including the breadcrumb path node — is inserted at
+            # its casefold-sorted position, otherwise the visited folder
+            # would jump to the end on each navigation and the tree would
+            # visibly reshuffle (backlog B23 UAT follow-up).
+            sibling_nodes = [
+                make_node(
+                    folder.name,
+                    (*ids_chain, folder.item_id),
+                    (*names_chain, folder.name),
+                    (),
                 )
-            if next_entry is None:
+                for folder in folders
+                if next_entry is None or folder.item_id != next_entry.item_id
+            ]
+            path_node = None
+            if next_entry is not None:
+                ids_chain = (*ids_chain, next_entry.item_id)
+                names_chain = (*names_chain, next_entry.name)
+                path_node = make_node(next_entry.name, ids_chain, names_chain, ())
+                sibling_nodes.append(path_node)
+            sibling_nodes.sort(key=lambda node: node.text(0).casefold())
+            for node in sibling_nodes:
+                current.addChild(node)
+            if path_node is None:
                 break
-            ids_chain = (*ids_chain, next_entry.item_id)
-            names_chain = (*names_chain, next_entry.name)
-            child = make_node(next_entry.name, ids_chain, names_chain, ())
-            current.addChild(child)
             current.setExpanded(True)
-            current = child
+            current = path_node
+        # The loop above only expands intermediate path nodes; the current
+        # (last) node must be expanded too so its own subfolders are visible
+        # right after a click navigates here (backlog B22).
+        current.setExpanded(True)
         self.folder_tree.setCurrentItem(current)
 
     def _render_table(self, items: tuple[WopanItem, ...]) -> None:
@@ -2512,6 +2525,7 @@ class MainWindow(_MainWindowBase):
         self._search_window: SearchResultsWindow | None = None
         self._tree_sync_thread: QThread | None = None
         self._tree_sync_worker: BrowserOperationWorker | None = None
+        self._tree_sync_pending = False
         self._copy_thread: QThread | None = None
         self._copy_worker: BrowserOperationWorker | None = None
         self._recycle_list_thread: QThread | None = None
@@ -3168,6 +3182,10 @@ class MainWindow(_MainWindowBase):
         if file_browser is None:
             return
         if self._tree_sync_thread is not None:
+            # A tree sync is in flight; remember the latest intent so the
+            # pending request is replayed once it clears instead of being
+            # dropped (trailing semantics, mirroring the directory refresh).
+            self._tree_sync_pending = True
             LOGGER.debug("main_window.tree_sync.skipped_busy")
             return
         breadcrumb = tuple(self._breadcrumb)
@@ -3223,6 +3241,9 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._tree_sync_thread = None
         self._tree_sync_worker = None
+        if self._tree_sync_pending:
+            self._tree_sync_pending = False
+            self._sync_folder_tree()
 
     def _on_search_jump_requested(
         self,

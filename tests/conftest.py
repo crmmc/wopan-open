@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import gc
 import os
-import resource
 import sys
 from collections.abc import Iterator
 
@@ -114,6 +113,10 @@ def pytest_unconfigure(config: pytest.Config) -> None:
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if _MEMTRACE_FD is None:
+        return
+    try:
+        import resource  # POSIX-only; lazy so Windows never crashes at import
+    except ImportError:  # pragma: no cover - no resource module on Windows
         return
     ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     line = f"{report.nodeid}\t{report.when}\t{ru_maxrss}\n"
