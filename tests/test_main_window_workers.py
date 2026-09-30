@@ -95,6 +95,7 @@ def _sync_worker_tests(request: pytest.FixtureRequest) -> None:
         "test_refresh_directory_updates_ui_on_gui_thread",
         "test_refresh_directory_ignores_in_flight_request",
         "test_create_folder_updates_ui_on_gui_thread",
+        "test_target_create_folder_updates_ui_on_gui_thread",
         "test_upload_drop_scans_off_gui_thread",
         "test_upload_drop_uses_one_summary_for_conflict_decision",
         "test_upload_drop_cancel_does_not_create_tasks",
@@ -1038,6 +1039,52 @@ def test_create_folder_updates_ui_on_gui_thread(qapp: QApplication) -> None:
     assert create_thread_ids and create_thread_ids[0] != gui_thread_id
     assert list_thread_ids and list_thread_ids[-1] != gui_thread_id
     assert any(item.name == "Reports" for item in window.displayed_items())
+
+
+class _TargetCreateRecordingMainWindow(MainWindow):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.create_handler_thread_id: int | None = None
+
+    def _on_target_create_succeeded(self, result: object) -> None:
+        super()._on_target_create_succeeded(result)
+        self.create_handler_thread_id = threading.get_ident()
+
+
+def test_target_create_folder_updates_ui_on_gui_thread(qapp: QApplication) -> None:
+    browser = WorkerFileBrowser()
+    window = _TargetCreateRecordingMainWindow(browser)
+    gui_thread_id = threading.get_ident()
+    create_thread_ids: list[int] = []
+    original_create_folder = browser.create_folder
+
+    def create_folder(parent_id: str, name: str) -> WopanItem:
+        create_thread_ids.append(threading.get_ident())
+        return original_create_folder(parent_id, name)
+
+    browser.create_folder = create_folder  # type: ignore[method-assign]
+    dialog = main_window_module.TargetFolderDialog(
+        "move",
+        main_window_module.TargetEntry(item_id=ROOT_DIRECTORY_ID, name="全部文件"),
+        [],
+    )
+    dialog.directory_requested.connect(window._on_target_directory_requested)
+    dialog.create_folder_requested.connect(window._on_target_create_folder_requested)
+    window._target_dialog = dialog
+
+    dialog.create_folder_requested.emit(ROOT_DIRECTORY_ID, "Reports")
+
+    assert _wait_until(
+        qapp,
+        lambda: window._target_create_thread is None and window._target_load_thread is None,
+    )
+    assert window.create_handler_thread_id == gui_thread_id
+    assert create_thread_ids and create_thread_ids[0] != gui_thread_id
+    assert dialog.current_target() == main_window_module.TargetEntry(
+        item_id="new-folder", name="Reports"
+    )
+    window._target_dialog = None
+    dialog.deleteLater()
 
 
 def test_create_folder_failure_clears_thread_and_reports_status(
@@ -2097,6 +2144,7 @@ class _StubTargetDialog:
         self.deleted = False
         self.browse_started = False
         self.directory_requested = _StubTargetDialogSignal()
+        self.create_folder_requested = _StubTargetDialogSignal()
         type(self).instances.append(self)
 
     exec = _accept_result_exec()
