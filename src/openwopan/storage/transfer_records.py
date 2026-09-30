@@ -26,6 +26,9 @@ TRANSFER_RECORDS_DIR_NAME = "transfer_records"
 TRANSFER_RECORDS_DB_NAME = "records.sqlite3"
 SCHEMA_VERSION = 1
 VALID_DIRECTIONS = frozenset({"upload", "download"})
+# Retention: terminal rows older than this are purged once per session.
+# Deliberately a module constant, not an AppSettings field (PRD 10-01 B6).
+TRANSFER_RECORD_RETENTION_DAYS = 30
 
 _COLUMNS: tuple[str, ...] = (
     "direction",
@@ -108,6 +111,15 @@ _SQL_SELECT_ALL = (
     "ORDER BY updated_at ASC, created_at ASC, direction ASC, task_id ASC"
 )
 _SQL_DELETE = "DELETE FROM transfer_records WHERE direction = ? AND task_id = ?"
+# Retention rule (PRD 10-01 B6 R5): expire terminal rows by updated_at only —
+# 已完成/已取消 in either direction, or an upload 失败 that is not retryable.
+# Retryable uploads and every non-terminal row (已暂停 etc.) are never matched.
+_SQL_SELECT_PURGE = (
+    "SELECT direction, task_id FROM transfer_records "
+    "WHERE updated_at < ? "
+    "AND (status IN ('已完成', '已取消') "
+    "OR (direction = 'upload' AND status = '失败' AND upload_retryable = 0))"
+)
 
 
 def transfer_records_db_path() -> Path:
@@ -226,7 +238,7 @@ class TransferRecordStore:
             connection.commit()
 
     def load_all(self) -> list[TransferRecordRow]:
-        """Return all rows ordered by updated time ascending with a stable tie-break."""
+        """Return all rows ordered by update time ascending with a stable tie-break."""
         with self._lock:
             connection = self._require_connection()
             values_list = connection.execute(_SQL_SELECT_ALL).fetchall()
@@ -242,6 +254,27 @@ class TransferRecordStore:
                 continue
             rows.append(row)
         return rows
+
+    def purge_stale(self, cutoff: float) -> list[tuple[str, str]]:
+        """Delete retention-expired terminal rows; return their (direction, task_id) keys.
+
+        A row expires when ``updated_at < cutoff`` and it is terminal for
+        retention purposes: 已完成/已取消 (either direction), or an upload 失败
+        with ``upload_retryable = 0``. Retryable rows and non-terminal rows are
+        never deleted. The select+delete pair runs under the store lock on the
+        single connection, so callers get exactly the keys that were removed
+        and can chain linked cleanup (upload session states) without residue.
+        """
+        with self._lock:
+            connection = self._require_connection()
+            pairs: list[tuple[str, str]] = []
+            for direction, task_id in connection.execute(_SQL_SELECT_PURGE, (cutoff,)):
+                if isinstance(direction, str) and isinstance(task_id, str) and task_id:
+                    pairs.append((direction, task_id))
+            if pairs:
+                connection.executemany(_SQL_DELETE, pairs)
+                connection.commit()
+        return pairs
 
     def _apply_migrations(self, connection: sqlite3.Connection) -> None:
         current = int(connection.execute("PRAGMA user_version").fetchone()[0])

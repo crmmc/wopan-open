@@ -1699,16 +1699,51 @@ def test_service_recovers_interrupted_uploads(
 
     assert [record.task_id for record in records] == ["kept-task"]
     record = records[0]
-    assert record.status == "失败"
+    assert record.status == "已暂停"
     assert record.resumable is True
     assert record.completed_parts == 1
     assert record.total_parts == 3
     assert "应用中断" in record.error
+    assert "已暂停" in record.error
     assert "1/3" in record.error
     assert _state(store, "kept-task") is not None
-    assert _state(store, "kept-task").status == "失败"  # type: ignore[union-attr]
+    assert _state(store, "kept-task").status == "已暂停"  # type: ignore[union-attr]
     assert _state(store, "finished-task") is None
     assert _state(store, "missing-task") is None
+
+
+def test_recover_uploads_skips_session_deleted_mid_recovery(tmp_path: Path) -> None:
+    """恢复循环中会话被并发删除（保留期清理竞态）时不炸、不产记录。"""
+    store = UploadTaskStore(root_path=tmp_path)
+    local_path = tmp_path / "kept.bin"
+    local_path.write_bytes(b"data")
+    store.save(
+        UploadTaskState(
+            task_id="kept-task",
+            file_name="kept.bin",
+            local_path=local_path,
+            parent_id="folder-1",
+            upload_name=None,
+            file_size=3,
+            file_mtime=1.0,
+            part_size=5,
+            total_parts=1,
+            unique_id="u1",
+            batch_no="b1",
+        )
+    )
+    service = FileBrowserService(FakeClient(), upload_store=store)  # type: ignore[arg-type]
+
+    original_update = store.update
+
+    def update_then_delete(task_id: str, change: object) -> object:
+        # 模拟清理线程在 load_all 之后、update 之前删除了会话
+        store.delete(task_id)
+        return original_update(task_id, change)  # type: ignore[arg-type,return-value]
+
+    store.update = update_then_delete  # type: ignore[method-assign]
+
+    assert service.recover_uploads() == ()
 
 
 def test_service_recovers_nothing_without_store() -> None:
@@ -2007,3 +2042,40 @@ def test_service_recovered_record_carries_upload_name_for_retry_key(
         )
         == anonymous_task_id
     )
+
+
+def test_discard_upload_sessions_deletes_states(tmp_path: Path) -> None:
+    """B6 R6：按 task_id 丢弃持久化会话；无 store 时为 no-op。"""
+    store = UploadTaskStore(root_path=tmp_path)
+    local_path = tmp_path / "a.bin"
+    local_path.write_bytes(b"data")
+    for task_id in ("task-a", "task-b"):
+        store.save(
+            UploadTaskState(
+                task_id=task_id,
+                file_name=f"{task_id}.bin",
+                local_path=local_path,
+                parent_id="folder-1",
+                upload_name=None,
+                file_size=1,
+                file_mtime=1.0,
+                part_size=5,
+                total_parts=1,
+                unique_id=f"u-{task_id}",
+                batch_no="b1",
+            )
+        )
+    service = FileBrowserService(FakeClient(), upload_store=store)  # type: ignore[arg-type]
+
+    service.discard_upload_sessions(["task-a", "", "task-b"])
+
+    assert _state(store, "task-a") is None
+    assert _state(store, "task-b") is None
+
+
+def test_discard_upload_sessions_without_store_is_noop() -> None:
+    service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
+
+    service.discard_upload_sessions(["task-a"])
+
+    assert service.recover_uploads() == ()

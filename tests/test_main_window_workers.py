@@ -33,12 +33,14 @@ from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequire
 from openwopan.app.transfer_history import TransferHistoryAdapter
 from openwopan.storage.settings import AppSettings
 from openwopan.storage.transfer_records import TransferRecordStore
-from openwopan.tasks.download import DownloadTaskControl
+from openwopan.tasks.download import DownloadTaskControl, DownloadTaskState, DownloadTaskStore
 from openwopan.tasks.upload import (
     FolderUploadJob,
     PlannedUploadFile,
     UploadBatchSummary,
     UploadSummaryEntry,
+    UploadTaskState,
+    UploadTaskStore,
     scan_folder_tree,
 )
 from openwopan.ui.main_window import (
@@ -102,6 +104,7 @@ def _sync_worker_tests(request: pytest.FixtureRequest) -> None:
         "test_upload_drop_accepts_batch_with_partial_failure",
         "test_upload_conflict_check_runs_off_gui_thread",
         "test_close_ignores_late_upload_check_result",
+        "test_transfer_purge_runs_off_gui_thread",
     }
     if request.node.name.split("[", 1)[0] not in real_thread_tests:
         request.getfixturevalue("sync_threads")
@@ -7523,11 +7526,11 @@ def _upload_recovery_record(task_id: str) -> SimpleNamespace:
         local_path=Path(f"/tmp/{task_id}.bin"),
         target_parent_id="0",
         upload_name="persisted.bin",
-        status="失败",
+        status="已暂停",
         completed_parts=1,
         total_parts=3,
         file_size=100,
-        error="应用中断，可续传（已完成 1/3 分片）",
+        error="应用中断，已暂停（已完成 1/3 分片）",
         resumable=True,
     )
 
@@ -7551,7 +7554,7 @@ class UploadRecoveryBrowser(WorkerFileBrowser):
 def test_startup_recovers_upload_rows_as_retryable(
     qapp: QApplication, sync_threads: None
 ) -> None:
-    """AC7：启动恢复渲染「失败 + 可重试」上传行。"""
+    """AC7/B5：启动恢复渲染「已暂停 + 可续传」上传行。"""
     records = tuple(
         _upload_recovery_record(f"upload-{index}") for index in range(1, 4)
     )
@@ -7562,9 +7565,10 @@ def test_startup_recovers_upload_rows_as_retryable(
     rows = window.transfer_interface.upload_records
     assert [row.task_id for row in rows] == ["upload-1", "upload-2", "upload-3"]
     row = rows[0]
-    assert row.status == "失败"
+    assert row.status == "已暂停"
     assert row.upload_retryable is True
     assert "1/3" in row.error
+    assert "已暂停" in row.error
     assert row.size == 100
     assert row.target_path == Path("/tmp/upload-1.bin")
     assert row.upload_parent_id == "0"
@@ -7637,6 +7641,79 @@ def test_recovered_upload_row_retry_uses_original_target(
     assert browser.upload_names == ["persisted.bin"]
 
 
+def test_recovered_paused_upload_row_resume_restarts_upload(
+    qapp: QApplication, tmp_path: Path, sync_threads: None
+) -> None:
+    """B5 回归：恢复行是「已暂停」，继续按钮可用且续传走原目标原文件。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "persisted.bin"
+    local_path.write_bytes(b"data")
+    record = _upload_recovery_record("upload-9")
+    record.local_path = local_path
+    window._on_upload_recovery_succeeded((record,))
+
+    row = window.transfer_interface._find_record("upload", "upload-9")
+    assert row is not None
+    assert row.status == "已暂停"
+    widget = window.transfer_interface.upload_table.cellWidget(0, 5)
+    resume_button = next(
+        child for child in widget.findChildren(QWidget) if child.toolTip() == "继续"
+    )
+    retry_button = next(
+        child for child in widget.findChildren(QWidget) if child.toolTip() == "重试"
+    )
+    assert resume_button.isEnabled()
+    assert not retry_button.isEnabled()
+
+    window._resume_upload_task("upload-9")
+
+    assert browser.uploaded_files == [("0", local_path)]
+    assert browser.upload_names == ["persisted.bin"]  # 恢复行携带原 upload_name
+    updated = window.transfer_interface._find_record("upload", "upload-9")
+    assert updated is not None
+    assert updated.status == "已完成"
+
+
+def test_resume_recovered_paused_row_without_target_info_notifies(
+    qapp: QApplication, sync_threads: None
+) -> None:
+    """恢复行缺少目标信息时给出提示，不启动上传。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    record = _upload_recovery_record("upload-9")
+    record.target_parent_id = None
+    window._on_upload_recovery_succeeded((record,))
+
+    window._resume_upload_task("upload-9")
+
+    assert browser.uploaded_files == []
+    assert "继续上传失败" in window.status_message()
+    row = window.transfer_interface._find_record("upload", "upload-9")
+    assert row is not None
+    assert row.status == "已暂停"
+
+
+def test_remove_recovered_paused_upload_row_discards_session(
+    qapp: QApplication, sync_threads: None
+) -> None:
+    """B5 回归：删除重启恢复的「已暂停」行直接移除并丢弃会话（防复活）。"""
+    discarded: list[list[str]] = []
+
+    class DiscardBrowser(WorkerFileBrowser):
+        def discard_upload_sessions(self, task_ids: Sequence[str]) -> None:
+            discarded.append(list(task_ids))
+
+    browser = DiscardBrowser()
+    window = MainWindow(browser)
+    window._on_upload_recovery_succeeded((_upload_recovery_record("upload-9"),))
+
+    window._remove_transfer_records("upload", {"upload-9"})
+
+    assert window.transfer_interface._find_record("upload", "upload-9") is None
+    assert discarded == [["upload-9"]]
+
+
 # ---------------------------------------------------------------------------
 # Persistent transfer history (SQLite-backed restore across restarts)
 # ---------------------------------------------------------------------------
@@ -7651,6 +7728,7 @@ class FakeTransferPersistence:
         self.deleted: list[tuple[str, set[str]]] = []
         self.history: tuple[TransferRecord, ...] = ()
         self.load_calls = 0
+        self.purged: tuple[tuple[str, str], ...] = ()
 
     def save_record(self, record: TransferRecord) -> None:
         self.saved.append(record)
@@ -7674,6 +7752,11 @@ class FakeTransferPersistence:
     def load_history(self) -> tuple[TransferRecord, ...]:
         self.load_calls += 1
         return self.history
+
+    def purge_stale_records(
+        self, max_age_days: int = 30
+    ) -> tuple[tuple[str, str], ...]:
+        return self.purged
 
 
 def _opened_store(tmp_path: Path) -> TransferRecordStore:
@@ -7796,6 +7879,7 @@ def test_set_file_browser_restores_history_once_on_gui_thread(
 ) -> None:
     store = _opened_store(tmp_path)
     seeder = TransferHistoryAdapter(store)
+    fresh = time.time()
     seeder.save_record(
         _history_record(
             "upload-3",
@@ -7803,9 +7887,12 @@ def test_set_file_browser_restores_history_once_on_gui_thread(
             status="失败",
             upload_parent_id="0",
             upload_retryable=True,
+            updated_at_epoch=fresh,
         )
     )
-    seeder.save_record(_history_record("download-5", "download"))
+    seeder.save_record(
+        _history_record("download-5", "download", updated_at_epoch=fresh)
+    )
     window = MainWindow(HistoryRestoreBrowser(), transfer_record_store=store)
     renders: list[str] = []
     monkeypatch.setattr(
@@ -7915,11 +8002,11 @@ def test_upload_recovery_upserts_restored_row(
 
     rows = window.transfer_interface.upload_records
     assert len(rows) == 1
-    assert rows[0].status == "失败"
+    assert rows[0].status == "已暂停"
     assert rows[0].upload_retryable is True
     db_rows = store.load_all()
     assert len(db_rows) == 1
-    assert db_rows[0].status == "失败"
+    assert db_rows[0].status == "已暂停"
     store.close()
 
 
@@ -8112,3 +8199,244 @@ def test_download_batch_flow_persists_records(
     store.close()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Retention purge wiring (PRD 10-01 B6 R6/R7/R8)
+# ---------------------------------------------------------------------------
+
+
+def _seed_upload_state(store: UploadTaskStore, tmp_path: Path, task_id: str) -> None:
+    local_path = tmp_path / f"{task_id}.bin"
+    local_path.write_bytes(b"data")
+    store.save(
+        UploadTaskState(
+            task_id=task_id,
+            file_name=f"{task_id}.bin",
+            local_path=local_path,
+            parent_id="0",
+            upload_name=None,
+            file_size=4,
+            file_mtime=1.0,
+            part_size=5,
+            total_parts=1,
+            unique_id=f"u-{task_id}",
+            batch_no="b1",
+        )
+    )
+
+
+class RetentionPurgeBrowser(WorkerFileBrowser):
+    """Browser double exposing the session surfaces used by the purge."""
+
+    def __init__(
+        self,
+        upload_store: UploadTaskStore,
+        download_store: DownloadTaskStore | None = None,
+    ) -> None:
+        super().__init__()
+        self._retention_store = upload_store
+        self._retention_download_store = download_store
+        self.discarded: list[list[str]] = []
+        self.removed_download_states: list[str] = []
+
+    def download_records(self) -> tuple[SimpleNamespace, ...]:
+        return ()
+
+    def discard_upload_sessions(self, task_ids: Sequence[str]) -> None:
+        self.discarded.append(list(task_ids))
+        for task_id in task_ids:
+            self._retention_store.delete(task_id)
+
+    def remove_download_record(self, task_id: str) -> None:
+        self.removed_download_states.append(task_id)
+        if self._retention_download_store is not None:
+            self._retention_download_store.delete(task_id)
+
+    def recover_uploads(self) -> tuple[SimpleNamespace, ...]:
+        records: list[SimpleNamespace] = []
+        for state in self._retention_store.load_all():
+            records.append(
+                SimpleNamespace(
+                    task_id=state.task_id,
+                    name=state.file_name,
+                    local_path=state.local_path,
+                    target_parent_id=state.parent_id,
+                    upload_name=state.upload_name,
+                    status="已暂停",
+                    completed_parts=len(state.completed_indexes),
+                    total_parts=state.total_parts,
+                    file_size=state.file_size,
+                    error="应用中断，已暂停（已完成 0/1 分片）",
+                    resumable=True,
+                )
+            )
+        return tuple(records)
+
+
+def test_transfer_purge_full_chain_prevents_resurrection(
+    qapp: QApplication, sync_threads: None, tmp_path: Path
+) -> None:
+    """B6 回归：超期终态行被清、界面同步、联动删会话、重启不复活、可续传行保留。"""
+    now = time.time()
+    record_store = _opened_store(tmp_path)
+    seeder = TransferHistoryAdapter(record_store)
+    seeder.save_record(
+        _history_record(
+            "stale-failed",
+            "upload",
+            status="失败",
+            upload_parent_id="0",
+            upload_retryable=False,
+            updated_at_epoch=now - 31 * 86400,
+        )
+    )
+    seeder.save_record(
+        _history_record("stale-done", "download", updated_at_epoch=now - 40 * 86400)
+    )
+    seeder.save_record(
+        _history_record(
+            "kept-retryable",
+            "upload",
+            status="失败",
+            upload_parent_id="0",
+            upload_retryable=True,
+            updated_at_epoch=now - 31 * 86400,
+        )
+    )
+    seeder.save_record(
+        _history_record("fresh-done", "download", updated_at_epoch=now - 86400)
+    )
+    upload_store = UploadTaskStore(root_path=tmp_path / "sessions")
+    _seed_upload_state(upload_store, tmp_path, "stale-failed")
+    _seed_upload_state(upload_store, tmp_path, "kept-retryable")
+    download_store = DownloadTaskStore(root_path=tmp_path / "downloads")
+    download_store.save(
+        DownloadTaskState(
+            task_id="stale-done",
+            file_name="stale-done.bin",
+            save_path=tmp_path / "stale-done.bin",
+            status="已完成",
+            download_id="fid-stale",
+        )
+    )
+    browser = RetentionPurgeBrowser(upload_store, download_store)
+    window = MainWindow(browser, transfer_record_store=record_store)
+
+    window.set_file_browser(browser)
+
+    rendered_uploads = [row.task_id for row in window.transfer_interface.upload_records]
+    rendered_downloads = [
+        row.task_id for row in window.transfer_interface.download_records
+    ]
+    assert rendered_uploads == ["kept-retryable"]
+    assert rendered_downloads == ["fresh-done"]
+    db_rows = {row.task_id for row in record_store.load_all()}
+    assert db_rows == {"kept-retryable", "fresh-done"}
+    assert browser.discarded == [["stale-failed"]]
+    assert upload_store.load("stale-failed") is None
+    assert upload_store.load("kept-retryable") is not None
+    # 终态下载行的残留状态文件随记录行一并清理
+    assert browser.removed_download_states == ["stale-done"]
+    assert download_store.load("stale-done") is None
+
+    # 模拟重启：恢复流程不会再为被清理的任务重建记录行
+    recovered = browser.recover_uploads()
+    assert [record.task_id for record in recovered] == ["kept-retryable"]
+    record_store.close()
+
+
+def test_transfer_purge_runs_off_gui_thread(
+    qapp: QApplication, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R7 契约 9：清理在 worker 线程执行；删除行数 >0 记 INFO 日志。"""
+    now = time.time()
+    record_store = _opened_store(tmp_path)
+    TransferHistoryAdapter(record_store).save_record(
+        _history_record("stale-done", "download", updated_at_epoch=now - 31 * 86400)
+    )
+    upload_store = UploadTaskStore(root_path=tmp_path / "sessions")
+    browser = RetentionPurgeBrowser(upload_store)
+    window = MainWindow(browser, transfer_record_store=record_store)
+    history = window._transfer_history
+    assert isinstance(history, TransferHistoryAdapter)
+    original_purge = history.purge_stale_records
+    purge_threads: list[int] = []
+
+    def recording_purge(max_age_days: int = 30) -> tuple[tuple[str, str], ...]:
+        purge_threads.append(threading.get_ident())
+        return original_purge(max_age_days)
+
+    history.purge_stale_records = recording_purge  # type: ignore[method-assign]
+    gui_thread = threading.get_ident()
+
+    with caplog.at_level(logging.INFO, logger="openwopan.ui.main_window"):
+        window.set_file_browser(browser)
+
+        assert _wait_until(qapp, lambda: window._transfer_purge_thread is None)
+        assert _wait_until(qapp, lambda: window._transfer_history_thread is None)
+        assert _wait_until(qapp, lambda: bool(purge_threads))
+    assert purge_threads and all(tid != gui_thread for tid in purge_threads)
+    assert any(
+        "transfer_purge.deleted" in record.message and "count=1" in record.message
+        for record in caplog.records
+    )
+    assert _wait_until(
+        qapp,
+        lambda: window.transfer_interface.download_records == [],
+    )
+    assert record_store.load_all() == []
+    record_store.close()
+
+
+def test_transfer_purge_guards_and_single_flight(
+    qapp: QApplication, sync_threads: None
+) -> None:
+    """关闭中 / 无历史 / 已在跑：清理 kick 不再起新线程。"""
+    window = MainWindow()
+    fake = FakeTransferPersistence()
+    fake.purged = (("upload", "u-1"),)
+    window._transfer_history = fake
+
+    window._closing = True
+    window._purge_stale_transfer_records()
+    assert window._transfer_purge_thread is None
+
+    window._closing = False
+    window._transfer_history = None
+    window._purge_stale_transfer_records()
+    assert window._transfer_purge_thread is None
+
+    window._transfer_history = fake
+    sentinel = object()
+    window._transfer_purge_thread = sentinel  # type: ignore[assignment]
+    window._purge_stale_transfer_records()
+    assert window._transfer_purge_thread is sentinel
+
+
+def test_transfer_purge_handlers_ignore_malformed_or_log_failures(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow()
+    fake = FakeTransferPersistence()
+    window._transfer_history = fake
+    window.transfer_interface._persistence = fake
+
+    # 非元组 / 空结果：不触碰界面
+    window._on_transfer_purge_succeeded("not-a-tuple")
+    window._on_transfer_purge_succeeded(())
+    assert fake.deleted == []
+
+    # 有效结果：按方向同步移除渲染行
+    window._on_transfer_purge_succeeded((("upload", "u-1"), ("download", "d-1")))
+    assert fake.deleted == [("upload", {"u-1"}), ("download", {"d-1"})]
+
+    # 失败只记日志，不打扰用户
+    failures: list[str] = []
+    monkeypatch.setattr(
+        main_window_module.LOGGER,
+        "warning",
+        lambda message, *args: failures.append(message % args if args else message),
+    )
+    window._on_transfer_purge_failed("boom")
+    assert failures and any("transfer_purge.failed" in message for message in failures)
