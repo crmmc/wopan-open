@@ -540,6 +540,50 @@ def test_read_wopan_item_type_handles_missing_type() -> None:
 
 
 @pytest.mark.parametrize(
+    ("sha_value", "include_key", "expected"),
+    [
+        ("abc123def", True, "abc123def"),
+        ("", True, None),
+        (None, True, None),
+        ("ignored", False, None),
+    ],
+    ids=["present", "empty", "none", "missing"],
+)
+def test_read_wopan_item_parses_sha256(
+    sha_value: str | None, include_key: bool, expected: str | None
+) -> None:
+    raw: dict[str, object] = {"id": "1", "name": "n", "type": "1"}
+    if include_key:
+        raw["sha256"] = sha_value
+
+    item = client_module._read_wopan_item(raw, "0")
+
+    assert item.sha256 == expected
+
+
+@pytest.mark.parametrize(
+    ("sha_value", "include_key", "expected"),
+    [
+        ("abc123def", True, "abc123def"),
+        ("", True, None),
+        (None, True, None),
+        ("ignored", False, None),
+    ],
+    ids=["present", "empty", "none", "missing"],
+)
+def test_read_search_item_parses_sha256(
+    sha_value: str | None, include_key: bool, expected: str | None
+) -> None:
+    raw: dict[str, object] = {"id": "1", "fileName": "n"}
+    if include_key:
+        raw["sha256"] = sha_value
+
+    item = client_module._read_search_item(raw)
+
+    assert item.sha256 == expected
+
+
+@pytest.mark.parametrize(
     ("value", "expected"),
     [
         (None, None),

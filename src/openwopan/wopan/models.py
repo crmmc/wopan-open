@@ -24,6 +24,9 @@ class WopanItem:
     download_id: str | None = None
     size: int | None = None
     updated_at: datetime | None = None
+    # Whole-file SHA256 advertised by QueryAllFiles/SearchFile; None when the
+    # upstream response omits it (or carries an empty string).
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not self.item_id:

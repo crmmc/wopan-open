@@ -411,6 +411,43 @@ def test_file_browser_service_downloads_file_to_local_path(tmp_path: Path) -> No
     assert not local_path.with_name("report.txt.part").exists()
 
 
+@pytest.mark.parametrize(
+    ("sha256", "expected"),
+    [("abc123def", "abc123def"), (None, None)],
+    ids=["with-sha256", "without-sha256"],
+)
+def test_file_browser_service_passes_expected_sha256_to_downloader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sha256: str | None,
+    expected: str | None,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_download_url(http_client, url, local_path, **kwargs):
+        captured.update(kwargs)
+        return DownloadResult(
+            status="已完成", task_id=kwargs["task_id"], local_path=local_path
+        )
+
+    monkeypatch.setattr("openwopan.app.file_browser.download_url", fake_download_url)
+    service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
+    item = WopanItem(
+        item_id="file-1",
+        name="report.bin",
+        kind=WopanItemKind.FILE,
+        download_id="fid-1",
+        sha256=sha256,
+    )
+    local_path = tmp_path / "report.bin"
+
+    result = service.download_file(item, local_path)
+
+    assert result.status == "已完成"
+    assert captured["expected_sha256"] == expected
+    assert captured["download_id"] == "fid-1"
+
+
 def test_file_browser_service_downloads_file_with_ranges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import errno
+import hashlib
+import logging
+import os
 from pathlib import Path
 from typing import BinaryIO
 
@@ -1379,8 +1382,10 @@ def test_merge_parts_returns_early_when_stopped(tmp_path: Path) -> None:
     control = DownloadTaskControl()
     control.request_cancel()
 
-    _merge_parts(store, state, parts, control)
+    digest = _merge_parts(store, state, parts, control)
 
+    # An interrupted merge yields no digest; the caller's stop check takes over.
+    assert digest is None
     assert not store.merged_path("t1").exists() or store.merged_path("t1").stat().st_size == 0
 
 
@@ -1913,3 +1918,410 @@ def test_state_to_record_supports_resume_only_when_stopped(tmp_path: Path) -> No
     done.supports_resume = True
     done.status = "已完成"
     assert _state_to_record(done).supports_resume is False
+
+
+# ---------------------------------------------------------------------------
+# Resume fast path (mtime_ns) and whole-file SHA256 verification (10-01)
+# ---------------------------------------------------------------------------
+
+
+def _recording_range_handler(requested_ranges: list[str]):
+    """Range handler that records every requested Range header into the list."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": str(len(CONTENT))})
+        range_header = request.headers.get("Range")
+        requested_ranges.append(range_header or "")
+        start, end = _parse_range(range_header)
+        return httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {start}-{end}/{len(CONTENT)}"},
+            content=CONTENT[start : end + 1],
+        )
+
+    return handler
+
+
+def _pause_after_first_part(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_ranges: list[str],
+) -> tuple[DownloadTaskStore, str, Path]:
+    """Download a 17-byte file in two Range parts, pausing when part 1 starts."""
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    local_path = tmp_path / "out.bin"
+    store = DownloadTaskStore(tmp_path / "store")
+    task_id = make_download_task_id("fid-1", local_path)
+
+    paused = download_url(
+        httpx.Client(transport=httpx.MockTransport(_recording_range_handler(requested_ranges))),
+        "https://download.example.test/file",
+        local_path,
+        settings=_range_settings(),
+        store=store,
+        task_id=task_id,
+        file_name="out.bin",
+        download_id="fid-1",
+        control=_PauseAfterFirstPart(),
+    )
+    assert paused.status == "已暂停"
+    return store, task_id, local_path
+
+
+def test_validate_existing_parts_reuses_part_on_mtime_match_without_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = DownloadTaskStore(tmp_path)
+    parts = _build_parts(4, 4)
+    part_file = store.part_path("t1", 0)
+    part_file.parent.mkdir(parents=True, exist_ok=True)
+    part_file.write_bytes(b"abcd")
+    state = _state(
+        task_id="t1",
+        save_path=tmp_path / "out.bin",
+        parts=[
+            DownloadPartRecord(
+                index=0,
+                start=0,
+                end=3,
+                expected_size=4,
+                actual_size=4,
+                md5=_compute_md5(part_file),
+                mtime_ns=part_file.stat().st_mtime_ns,
+            )
+        ],
+    )
+    store.save(state)
+
+    def fail(_path: Path) -> str:
+        raise AssertionError("healthy part must be reused without hashing")
+
+    monkeypatch.setattr(download, "_compute_md5", fail)
+
+    downloaded, reusable = _validate_existing_parts(store, state, parts)
+
+    assert downloaded == 4
+    assert reusable == {0}
+
+
+def test_validate_existing_parts_refreshes_mtime_after_rehash(tmp_path: Path) -> None:
+    store = DownloadTaskStore(tmp_path)
+    parts = _build_parts(4, 4)
+    part_file = store.part_path("t1", 0)
+    part_file.parent.mkdir(parents=True, exist_ok=True)
+    part_file.write_bytes(b"abcd")
+    state = _state(
+        task_id="t1",
+        save_path=tmp_path / "out.bin",
+        parts=[
+            DownloadPartRecord(
+                index=0,
+                start=0,
+                end=3,
+                expected_size=4,
+                actual_size=4,
+                md5=_compute_md5(part_file),
+            )
+        ],
+    )
+    store.save(state)
+
+    downloaded, reusable = _validate_existing_parts(store, state, parts)
+
+    assert downloaded == 4
+    assert reusable == {0}
+    updated = store.load("t1")
+    assert updated is not None
+    assert updated.parts[0].mtime_ns == part_file.stat().st_mtime_ns
+
+
+def test_validate_existing_parts_rejects_unknown_algorithm(tmp_path: Path) -> None:
+    store = DownloadTaskStore(tmp_path)
+    parts = _build_parts(4, 4)
+    part_file = store.part_path("t1", 0)
+    part_file.parent.mkdir(parents=True, exist_ok=True)
+    part_file.write_bytes(b"abcd")
+    state = _state(
+        task_id="t1",
+        save_path=tmp_path / "out.bin",
+        parts=[
+            DownloadPartRecord(
+                index=0,
+                start=0,
+                end=3,
+                expected_size=4,
+                actual_size=4,
+                md5=_compute_md5(part_file),
+                algorithm="crc32",
+            )
+        ],
+    )
+    store.save(state)
+
+    downloaded, reusable = _validate_existing_parts(store, state, parts)
+
+    assert downloaded == 0
+    assert reusable == set()
+    assert not part_file.exists()
+    updated = store.load("t1")
+    assert updated is not None and updated.parts == []
+
+
+def test_resume_with_healthy_parts_hashes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1: a fully healthy task resumes with zero digest calls."""
+    requested_ranges: list[str] = []
+    store, task_id, local_path = _pause_after_first_part(
+        tmp_path, monkeypatch, requested_ranges
+    )
+    state = store.load(task_id)
+    assert state is not None
+    assert state.parts[0].mtime_ns == store.part_path(task_id, 0).stat().st_mtime_ns
+
+    digest_calls: list[Path] = []
+    real_md5 = download._compute_md5
+
+    def counting_md5(path: Path) -> str:
+        digest_calls.append(path)
+        return real_md5(path)
+
+    monkeypatch.setattr(download, "_compute_md5", counting_md5)
+
+    resumed = download_url(
+        httpx.Client(transport=httpx.MockTransport(_recording_range_handler(requested_ranges))),
+        "https://download.example.test/file",
+        local_path,
+        settings=_range_settings(),
+        store=store,
+        task_id=task_id,
+        file_name="out.bin",
+        download_id="fid-1",
+    )
+
+    assert resumed.status == "已完成"
+    assert local_path.read_bytes() == CONTENT
+    assert digest_calls == []
+    # Part 0 was reused; only the missing part 1 was requested again.
+    assert requested_ranges == ["bytes=0-15", "bytes=16-16", "bytes=16-16"]
+
+
+@pytest.mark.parametrize("tampered", ["intact_bytes", "corrupted_bytes"])
+def test_resume_rehashes_part_after_mtime_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tampered: str
+) -> None:
+    requested_ranges: list[str] = []
+    store, task_id, local_path = _pause_after_first_part(
+        tmp_path, monkeypatch, requested_ranges
+    )
+    part_path = store.part_path(task_id, 0)
+    if tampered == "corrupted_bytes":
+        part_path.write_bytes(b"X" * 16)
+    stat_result = part_path.stat()
+    os.utime(part_path, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000))
+
+    digest_calls: list[Path] = []
+    real_md5 = download._compute_md5
+
+    def counting_md5(path: Path) -> str:
+        digest_calls.append(path)
+        return real_md5(path)
+
+    monkeypatch.setattr(download, "_compute_md5", counting_md5)
+
+    resumed = download_url(
+        httpx.Client(transport=httpx.MockTransport(_recording_range_handler(requested_ranges))),
+        "https://download.example.test/file",
+        local_path,
+        settings=_range_settings(),
+        store=store,
+        task_id=task_id,
+        file_name="out.bin",
+        download_id="fid-1",
+    )
+
+    assert resumed.status == "已完成"
+    assert local_path.read_bytes() == CONTENT
+    # The mtime mismatch triggers exactly one re-hash of the tampered part.
+    assert digest_calls == [part_path]
+    if tampered == "intact_bytes":
+        # Re-hash passed: the part is reused, no Range re-request for part 0.
+        assert requested_ranges == ["bytes=0-15", "bytes=16-16", "bytes=16-16"]
+    else:
+        # Re-hash failed: the checkpoint is dropped and part 0 re-downloaded.
+        assert requested_ranges == [
+            "bytes=0-15",
+            "bytes=16-16",
+            "bytes=0-15",
+            "bytes=16-16",
+        ]
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("expected_mode",),
+    [("match",), ("match_upper",), ("mismatch",), ("missing",)],
+)
+def test_download_sha256_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_mode: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC3: matching publishes, mismatching clears everything, missing skips."""
+    monkeypatch.setattr(download, "BYTES_PER_MB", 4)
+    store = DownloadTaskStore(tmp_path / "store")
+    local_path = tmp_path / "out.bin"
+    state = _state(task_id="t1", save_path=local_path)
+    state.total_bytes = len(CONTENT)
+    state.part_size = 16
+    if expected_mode == "match":
+        state.expected_sha256 = _sha256_hex(CONTENT)
+    elif expected_mode == "match_upper":
+        state.expected_sha256 = _sha256_hex(CONTENT).upper()
+    elif expected_mode == "mismatch":
+        state.expected_sha256 = "0" * 64
+    store.save(state)
+
+    if expected_mode == "mismatch":
+        with pytest.raises(DownloadError, match="文件校验失败"):
+            _run_ranges(tmp_path, _range_handler(), store=store)
+
+        assert not local_path.exists()
+        failed = store.load("t1")
+        assert failed is not None
+        assert failed.status == "失败"
+        assert failed.error == "文件校验失败，临时数据已清理，请重新下载"
+        assert failed.supports_resume is False
+        assert failed.parts == []
+        assert failed.bytes_done == 0
+        assert failed.expected_sha256 == "0" * 64
+        assert not store.task_temp_dir("t1").exists()
+        assert not store.merged_path("t1").exists()
+        return
+
+    with caplog.at_level(logging.DEBUG, logger="openwopan.tasks.download"):
+        result = _run_ranges(tmp_path, _range_handler(), store=store)
+
+    assert result.status == "已完成"
+    assert local_path.read_bytes() == CONTENT
+    if expected_mode == "missing":
+        assert any(
+            "download.merge_sha256_skipped" in message for message in caplog.messages
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_mode",),
+    [("match",), ("match_upper",), ("mismatch",)],
+)
+def test_download_zero_byte_sha256_semantics(
+    tmp_path: Path, expected_mode: str
+) -> None:
+    """AC3 extension: the zero-byte path verifies the empty-content hash too.
+
+    A mismatched whole-file hash takes the same non-resumable failure
+    semantics as the merge path; expected is None (or absent) skips the check.
+    """
+    statuses: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"Content-Length": "0"})
+        pytest.fail("zero-byte download must not send a GET request")
+
+    store = DownloadTaskStore(tmp_path / "store")
+    target = tmp_path / "empty.bin"
+    state = _state(task_id="empty-sha", save_path=target)
+    if expected_mode == "match":
+        state.expected_sha256 = _sha256_hex(b"")
+    elif expected_mode == "match_upper":
+        state.expected_sha256 = _sha256_hex(b"").upper()
+    elif expected_mode == "mismatch":
+        state.expected_sha256 = "0" * 64
+    store.save(state)
+
+    if expected_mode == "mismatch":
+        with pytest.raises(DownloadError, match="文件校验失败"):
+            download_url(
+                httpx.Client(transport=httpx.MockTransport(handler)),
+                "https://download.example.test/empty",
+                target,
+                settings=AppSettings(),
+                store=store,
+                task_id="empty-sha",
+                file_name="empty.bin",
+                callbacks=DownloadCallbacks(status=statuses.append),
+            )
+
+        assert not target.exists()
+        assert not store.task_temp_dir("empty-sha").exists()
+        failed = store.load("empty-sha")
+        assert failed is not None
+        assert failed.status == "失败"
+        assert failed.error == "文件校验失败，临时数据已清理，请重新下载"
+        assert failed.supports_resume is False
+        assert failed.parts == []
+        assert failed.bytes_done == 0
+        assert statuses[-1] == "失败"
+        return
+
+    result = download_url(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        "https://download.example.test/empty",
+        target,
+        settings=AppSettings(),
+        store=store,
+        task_id="empty-sha",
+        file_name="empty.bin",
+        callbacks=DownloadCallbacks(status=statuses.append),
+    )
+
+    assert result.status == "已完成"
+    assert target.exists() and target.stat().st_size == 0
+    assert statuses[-1] == "已完成"
+
+
+def test_merge_parts_returns_sha256_of_merged_output(tmp_path: Path) -> None:
+    store = DownloadTaskStore(tmp_path)
+    parts = _build_parts(8, 4)
+    for part in parts:
+        path = store.part_path("t1", part.index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"abcd" if part.index == 0 else b"efgh")
+    state = _state(task_id="t1", save_path=tmp_path / "out.bin")
+
+    digest = _merge_parts(store, state, parts, DownloadTaskControl())
+
+    assert digest == _sha256_hex(b"abcdefgh")
+    assert store.merged_path("t1").read_bytes() == b"abcdefgh"
+
+
+def test_download_url_persists_expected_sha256_from_caller(tmp_path: Path) -> None:
+    """The expected_sha256 argument is stored with the task before merging."""
+    store = DownloadTaskStore(tmp_path / "store")
+    local_path = tmp_path / "out.bin"
+    state = _state(task_id="t1", save_path=local_path)
+    state.expected_sha256 = None
+    store.save(state)
+
+    with pytest.raises(DownloadError, match="文件校验失败"):
+        download_url(
+            httpx.Client(transport=httpx.MockTransport(_range_handler())),
+            "https://download.example.test/file",
+            local_path,
+            settings=_range_settings(),
+            store=store,
+            task_id="t1",
+            file_name="out.bin",
+            download_id="fid-1",
+            expected_sha256="0" * 64,
+        )
+
+    failed = store.load("t1")
+    assert failed is not None
+    assert failed.expected_sha256 == "0" * 64
