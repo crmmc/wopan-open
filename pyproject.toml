@@ -1,6 +1,6 @@
 [project]
 name = "openwopan"
-version = "0.1.0"
+version = "1.0.0"
 description = "Open source desktop client for China Unicom WoPan."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,6 +12,11 @@ dependencies = [
     "keyring",
     "platformdirs",
 ]
+
+[project.urls]
+Repository = "https://github.com/crmmc/OpenWoPan"
+Changelog = "https://github.com/crmmc/OpenWoPan/blob/main/CHANGELOG.md"
+License = "https://github.com/crmmc/OpenWoPan/blob/main/LICENSE"
 
 [project.scripts]
 openwopan = "openwopan.app.main:main"
