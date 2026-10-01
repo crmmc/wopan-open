@@ -7,12 +7,13 @@ import logging
 import math
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -30,6 +31,10 @@ RATE_LIMIT_BACKOFF_SECONDS = 2.0
 MAX_RATE_LIMITS = 50
 MAX_URL_REFRESHES = 3
 TASK_METADATA_VERSION = 1
+DOWNLOAD_DB_NAME = "tasks.sqlite3"
+DOWNLOAD_SHA256_FAILURE_MESSAGE = "文件校验失败，临时数据已清理，请重新下载"
+# Whole-file SHA256 of an empty download; the zero-byte path compares against it.
+EMPTY_CONTENT_SHA256 = hashlib.sha256(b"").hexdigest()
 
 DownloadStatus = Literal[
     "等待中",
@@ -105,7 +110,13 @@ class DownloadPart:
 
 @dataclass(frozen=True, slots=True)
 class DownloadPartRecord:
-    """Persisted completed part metadata."""
+    """Persisted completed part metadata.
+
+    ``mtime_ns`` snapshots the part file's ``st_mtime_ns`` at record time so
+    resume validation can reuse an untouched file without re-reading it.
+    ``algorithm`` names the digest the ``md5`` column carries (only ``md5``
+    exists today; the column reserves room for a future switch).
+    """
 
     index: int
     start: int
@@ -113,6 +124,8 @@ class DownloadPartRecord:
     expected_size: int
     actual_size: int
     md5: str
+    mtime_ns: int | None = None
+    algorithm: str = "md5"
 
 
 @dataclass(slots=True)
@@ -131,6 +144,7 @@ class DownloadTaskState:
     supports_resume: bool = False
     error: str = ""
     version: int = TASK_METADATA_VERSION
+    expected_sha256: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     parts: list[DownloadPartRecord] = field(default_factory=list)
@@ -181,12 +195,146 @@ class DownloadTaskControl:
             LOGGER.debug("download.active_response_close_failed")
 
 
+# -- SQLite schema (resume index only; part byte files stay on the filesystem) --
+
+# Ordered, versioned, idempotent migrations applied against PRAGMA user_version.
+# Future schema changes append a new (version, script) entry at the tail.
+MIGRATIONS: tuple[tuple[int, str], ...] = (
+    (
+        1,
+        """
+        CREATE TABLE IF NOT EXISTS download_tasks (
+            task_id TEXT PRIMARY KEY,
+            file_name TEXT NOT NULL DEFAULT '',
+            save_path TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '等待中',
+            download_id TEXT,
+            total_bytes INTEGER,
+            bytes_done INTEGER NOT NULL DEFAULT 0,
+            part_size INTEGER,
+            max_connections INTEGER NOT NULL DEFAULT 1,
+            supports_resume INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT '',
+            version INTEGER NOT NULL DEFAULT 1,
+            expected_sha256 TEXT,
+            created_at REAL NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS download_parts (
+            task_id TEXT NOT NULL,
+            part_index INTEGER NOT NULL,
+            start INTEGER NOT NULL,
+            end_offset INTEGER NOT NULL,
+            expected_size INTEGER NOT NULL,
+            actual_size INTEGER NOT NULL,
+            md5 TEXT NOT NULL DEFAULT '',
+            algorithm TEXT NOT NULL DEFAULT 'md5',
+            mtime_ns INTEGER,
+            PRIMARY KEY (task_id, part_index),
+            FOREIGN KEY (task_id) REFERENCES download_tasks(task_id) ON DELETE CASCADE
+        );
+        """,
+    ),
+)
+
+# Plain literal statements: every value flows through the ? placeholders and
+# the SQL text itself is static, so no runtime formatting ever enters it.
+_SQL_UPSERT_TASK = """
+INSERT INTO download_tasks (
+    task_id, file_name, save_path, status, download_id, total_bytes,
+    bytes_done, part_size, max_connections, supports_resume, error,
+    version, expected_sha256, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(task_id) DO UPDATE SET
+    file_name = excluded.file_name,
+    save_path = excluded.save_path,
+    status = excluded.status,
+    download_id = excluded.download_id,
+    total_bytes = excluded.total_bytes,
+    bytes_done = excluded.bytes_done,
+    part_size = excluded.part_size,
+    max_connections = excluded.max_connections,
+    supports_resume = excluded.supports_resume,
+    error = excluded.error,
+    version = excluded.version,
+    expected_sha256 = excluded.expected_sha256,
+    created_at = excluded.created_at,
+    updated_at = excluded.updated_at
+"""
+_SQL_UPSERT_PART = """
+INSERT INTO download_parts (
+    task_id, part_index, start, end_offset, expected_size,
+    actual_size, md5, algorithm, mtime_ns
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(task_id, part_index) DO UPDATE SET
+    start = excluded.start,
+    end_offset = excluded.end_offset,
+    expected_size = excluded.expected_size,
+    actual_size = excluded.actual_size,
+    md5 = excluded.md5,
+    algorithm = excluded.algorithm,
+    mtime_ns = excluded.mtime_ns
+"""
+_SQL_SELECT_TASK = """
+SELECT task_id, file_name, save_path, status, download_id, total_bytes,
+       bytes_done, part_size, max_connections, supports_resume, error,
+       version, expected_sha256, created_at, updated_at
+FROM download_tasks WHERE task_id = ?
+"""
+# load_all keeps the legacy JSON ordering (created_at, then task_id); the
+# transfer-center listing keeps the legacy file-name ordering.
+_SQL_SELECT_ALL_TASKS = """
+SELECT task_id, file_name, save_path, status, download_id, total_bytes,
+       bytes_done, part_size, max_connections, supports_resume, error,
+       version, expected_sha256, created_at, updated_at
+FROM download_tasks ORDER BY created_at ASC, task_id ASC
+"""
+_SQL_SELECT_ALL_TASKS_BY_ID = """
+SELECT task_id, file_name, save_path, status, download_id, total_bytes,
+       bytes_done, part_size, max_connections, supports_resume, error,
+       version, expected_sha256, created_at, updated_at
+FROM download_tasks ORDER BY task_id ASC
+"""
+_SQL_SELECT_PARTS = """
+SELECT task_id, part_index, start, end_offset, expected_size,
+       actual_size, md5, algorithm, mtime_ns
+FROM download_parts WHERE task_id = ? ORDER BY part_index ASC
+"""
+_SQL_SELECT_ALL_PARTS = """
+SELECT task_id, part_index, start, end_offset, expected_size,
+       actual_size, md5, algorithm, mtime_ns
+FROM download_parts ORDER BY task_id ASC, part_index ASC
+"""
+_SQL_SELECT_TASK_EXISTS = "SELECT 1 FROM download_tasks WHERE task_id = ?"
+_SQL_DELETE_TASK = "DELETE FROM download_tasks WHERE task_id = ?"
+_SQL_DELETE_PARTS_OF_TASK = "DELETE FROM download_parts WHERE task_id = ?"
+_SQL_DELETE_PART_ROW = (
+    "DELETE FROM download_parts WHERE task_id = ? AND part_index = ?"
+)
+# bytes_done is always derived from the part rows, never stored independently.
+_SQL_REFRESH_BYTES_DONE = """
+UPDATE download_tasks
+SET bytes_done = (SELECT COALESCE(SUM(actual_size), 0) FROM download_parts WHERE task_id = ?),
+    updated_at = ?
+WHERE task_id = ?
+"""
+
+
 class DownloadTaskStore:
-    """JSON-backed storage for resumable download metadata and part files."""
+    """SQLite-backed storage for resumable download metadata and part files.
+
+    Task metadata and part checkpoints live in ``tasks.sqlite3`` (an index
+    only); the part byte files (``part{n}``, ``part{n}.downloading``, ``merged``)
+    stay on the filesystem at the same paths as before. Legacy per-task JSON
+    metadata is imported into the database on first open and then deleted.
+    """
 
     def __init__(self, root_path: Path | None = None) -> None:
         self._root_path = root_path or user_cache_path(APP_NAME, APP_AUTHOR) / "downloads"
         self._lock = threading.RLock()
+        self._connection: sqlite3.Connection | None = None
 
     @property
     def root_path(self) -> Path:
@@ -194,7 +342,11 @@ class DownloadTaskStore:
         return self._root_path
 
     def task_path(self, task_id: str) -> Path:
-        """Return one task metadata path."""
+        """Return the legacy per-task JSON metadata path (migration source only).
+
+        Part of the JSON migration cluster; remove together with it (see the
+        comment above ``_dump_task_state``).
+        """
         return self._root_path / "tasks" / f"{task_id}.json"
 
     def task_temp_dir(self, task_id: str) -> Path:
@@ -213,50 +365,88 @@ class DownloadTaskStore:
         """Return the temporary merged file path."""
         return self.task_temp_dir(task_id) / "merged"
 
-    def load(self, task_id: str) -> DownloadTaskState | None:
-        """Load a persisted task state."""
-        path = self.task_path(task_id)
-        if not path.exists():
-            return None
+    def open(self) -> None:
+        """Connect, run migrations, and import legacy JSON metadata.
+
+        Idempotent and lock-guarded; every public method opens the store on
+        first use, so callers never need to manage the connection themselves.
+        """
+        self._require_connection()
+
+    def close(self) -> None:
+        """Commit and close the connection; safe to call repeatedly."""
         with self._lock:
-            try:
-                with path.open("r", encoding="utf-8") as file:
-                    raw = json.load(file)
-            except (OSError, json.JSONDecodeError):
-                LOGGER.warning("download.task_state.invalid task_id=%s", task_id)
+            if self._connection is None:
+                return
+            connection, self._connection = self._connection, None
+            connection.commit()
+            connection.close()
+
+    def load(self, task_id: str) -> DownloadTaskState | None:
+        """Load a persisted task state with its part rows."""
+        with self._lock:
+            connection = self._require_connection()
+            task_values = connection.execute(_SQL_SELECT_TASK, (task_id,)).fetchone()
+            if task_values is None:
                 return None
-        if not isinstance(raw, dict):
-            return None
-        return _read_task_state(raw)
+            task = _task_from_values(task_values)
+            if task is None:
+                LOGGER.warning(
+                    "download.task_row.skipped task_id=%s columns=%d",
+                    task_id,
+                    len(task_values),
+                )
+                return None
+            task.parts = self._load_parts(connection, task_id)
+            return task
 
     def load_all(self) -> list[DownloadTaskState]:
         """Load all valid persisted task states in creation order."""
-        tasks_path = self._root_path / "tasks"
-        if not tasks_path.exists():
-            return []
         with self._lock:
-            paths = sorted(tasks_path.glob("*.json"))
+            connection = self._require_connection()
+            task_values = connection.execute(_SQL_SELECT_ALL_TASKS).fetchall()
+            part_values = connection.execute(_SQL_SELECT_ALL_PARTS).fetchall()
+        parts_by_task: dict[str, list[DownloadPartRecord]] = {}
+        for values in part_values:
+            row = _part_row_from_values(values)
+            if row is None:
+                LOGGER.warning(
+                    "download.part_row.skipped columns=%d task_id=%r",
+                    len(values),
+                    values[0] if values else None,
+                )
+                continue
+            parts_by_task.setdefault(row[0], []).append(row[1])
         states: list[DownloadTaskState] = []
-        for path in paths:
-            task_id = path.stem
-            state = self.load(task_id)
-            if state is not None:
-                states.append(state)
-        states.sort(key=lambda state: (state.created_at, state.task_id))
+        for values in task_values:
+            task = _task_from_values(values)
+            if task is None:
+                LOGGER.warning(
+                    "download.task_row.skipped columns=%d task_id=%r",
+                    len(values),
+                    values[0] if values else None,
+                )
+                continue
+            task.parts = parts_by_task.get(task.task_id, [])
+            states.append(task)
         return states
 
     def save(self, state: DownloadTaskState) -> None:
-        """Persist task metadata atomically."""
+        """Persist the whole task state in one transaction (metadata + parts)."""
         state.updated_at = time.time()
-        path = self.task_path(state.task_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = _dump_task_state(state)
-        tmp_path = path.with_suffix(".json.tmp")
         with self._lock:
-            with tmp_path.open("w", encoding="utf-8") as file:
-                json.dump(data, file, ensure_ascii=False, indent=2)
-                file.write("\n")
-            tmp_path.replace(path)
+            connection = self._require_connection()
+            try:
+                connection.execute(_SQL_UPSERT_TASK, _task_parameters(state))
+                connection.execute(_SQL_DELETE_PARTS_OF_TASK, (state.task_id,))
+                connection.executemany(
+                    _SQL_UPSERT_PART,
+                    [_part_parameters(record, state.task_id) for record in state.parts],
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def update(
         self, task_id: str, change: Callable[[DownloadTaskState], None]
@@ -271,9 +461,16 @@ class DownloadTaskStore:
             return state
 
     def delete(self, task_id: str) -> None:
-        """Delete task metadata and temporary files."""
+        """Delete task metadata rows and temporary files."""
         with self._lock:
-            self.task_path(task_id).unlink(missing_ok=True)
+            connection = self._require_connection()
+            try:
+                connection.execute(_SQL_DELETE_PARTS_OF_TASK, (task_id,))
+                connection.execute(_SQL_DELETE_TASK, (task_id,))
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
             shutil.rmtree(self.task_temp_dir(task_id), ignore_errors=True)
 
     def cleanup_temp(self, task_id: str) -> None:
@@ -281,39 +478,300 @@ class DownloadTaskStore:
         shutil.rmtree(self.task_temp_dir(task_id), ignore_errors=True)
 
     def list_records(self) -> tuple[DownloadTaskRecord, ...]:
-        """Return persisted transfer-center records."""
-        tasks_dir = self._root_path / "tasks"
-        if not tasks_dir.exists():
-            return ()
+        """Return persisted transfer-center records in task-id order."""
+        with self._lock:
+            connection = self._require_connection()
+            task_values = connection.execute(_SQL_SELECT_ALL_TASKS_BY_ID).fetchall()
         records: list[DownloadTaskRecord] = []
-        for path in sorted(tasks_dir.glob("*.json")):
-            state = self.load(path.stem)
-            if state is None:
+        for values in task_values:
+            task = _task_from_values(values)
+            if task is None:
+                LOGGER.warning(
+                    "download.task_row.skipped columns=%d task_id=%r",
+                    len(values),
+                    values[0] if values else None,
+                )
                 continue
-            records.append(_state_to_record(state))
+            records.append(_state_to_record(task))
         return tuple(records)
 
     def record_part(self, task_id: str, record: DownloadPartRecord) -> None:
-        """Persist one part record."""
+        """Upsert one part row and re-derive ``bytes_done`` in the same transaction."""
         with self._lock:
-            state = self.load(task_id)
-            if state is None:
+            connection = self._require_connection()
+            exists = connection.execute(_SQL_SELECT_TASK_EXISTS, (task_id,)).fetchone()
+            if exists is None:
                 return
-            existing = [part for part in state.parts if part.index != record.index]
-            state.parts = [*existing, record]
-            state.bytes_done = sum(part.actual_size for part in state.parts)
-            self.save(state)
+            try:
+                connection.execute(_SQL_UPSERT_PART, _part_parameters(record, task_id))
+                connection.execute(
+                    _SQL_REFRESH_BYTES_DONE, (task_id, time.time(), task_id)
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def remove_part_record(self, task_id: str, index: int) -> None:
-        """Delete one part record and file."""
+        """Delete one part row, refresh ``bytes_done``, and drop its files."""
         with self._lock:
-            state = self.load(task_id)
-            if state is not None:
-                state.parts = [part for part in state.parts if part.index != index]
-                state.bytes_done = sum(part.actual_size for part in state.parts)
-                self.save(state)
+            connection = self._require_connection()
+            try:
+                connection.execute(_SQL_DELETE_PART_ROW, (task_id, index))
+                connection.execute(
+                    _SQL_REFRESH_BYTES_DONE, (task_id, time.time(), task_id)
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
             self.part_path(task_id, index).unlink(missing_ok=True)
             self.part_downloading_path(task_id, index).unlink(missing_ok=True)
+
+    def _require_connection(self) -> sqlite3.Connection:
+        """Return the live connection, creating and migrating it on first use."""
+        with self._lock:
+            if self._connection is not None:
+                return self._connection
+            self._root_path.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(
+                self._root_path / DOWNLOAD_DB_NAME, check_same_thread=False
+            )
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                self._apply_migrations(connection)
+                connection.commit()
+            except BaseException:
+                connection.close()
+                raise
+            self._connection = connection
+            self._migrate_json_tasks(connection)
+            return connection
+
+    def _load_parts(
+        self, connection: sqlite3.Connection, task_id: str
+    ) -> list[DownloadPartRecord]:
+        parts: list[DownloadPartRecord] = []
+        for values in connection.execute(_SQL_SELECT_PARTS, (task_id,)).fetchall():
+            row = _part_row_from_values(values)
+            if row is None:
+                LOGGER.warning(
+                    "download.part_row.skipped columns=%d task_id=%r",
+                    len(values),
+                    values[0] if values else None,
+                )
+                continue
+            parts.append(row[1])
+        return parts
+
+    def _apply_migrations(self, connection: sqlite3.Connection) -> None:
+        current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        for version, script in MIGRATIONS:
+            if version <= current:
+                continue
+            connection.executescript(script)
+            # PRAGMA values cannot be parameterized; the version is an internal
+            # constant, not external input.
+            connection.execute(  # nosemgrep: formatted-sql-query, sqlalchemy-execute-raw-query
+                f"PRAGMA user_version = {int(version)}"
+            )
+
+    def _migrate_json_tasks(self, connection: sqlite3.Connection) -> None:
+        """Import legacy per-task JSON metadata once; keep unparsable files.
+
+        Idempotent by primary key (INSERT OR REPLACE): a crash mid-migration
+        replays safely on the next open, and already-imported JSON files are
+        deleted so they are never imported twice.
+
+        Removal plan: this method, ``task_path``, and the module-level JSON
+        cluster documented above ``_dump_task_state`` exist only to import
+        pre-SQLite metadata. Delete them together once ``tasks/*.json`` can
+        no longer exist on any user install (pick a removal version).
+        """
+        tasks_dir = self._root_path / "tasks"
+        if not tasks_dir.is_dir():
+            return
+        for path in sorted(tasks_dir.glob("*.json")):
+            raw = _read_json_metadata_file(path)
+            state = _read_task_state(raw) if raw is not None else None
+            if state is None:
+                LOGGER.warning(
+                    "download.task_state.migrate_invalid file=%s", path.name
+                )
+                continue
+            try:
+                connection.execute(_SQL_UPSERT_TASK, _task_parameters(state))
+                connection.execute(_SQL_DELETE_PARTS_OF_TASK, (state.task_id,))
+                connection.executemany(
+                    _SQL_UPSERT_PART,
+                    [_part_parameters(record, state.task_id) for record in state.parts],
+                )
+                connection.commit()
+            except sqlite3.Error:
+                LOGGER.exception(
+                    "download.task_state.migrate_failed file=%s", path.name
+                )
+                continue
+            path.unlink(missing_ok=True)
+
+
+def _read_json_metadata_file(path: Path) -> dict[str, Any] | None:
+    """Read one legacy JSON metadata file; None when unreadable or not an object."""
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            raw = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _task_parameters(state: DownloadTaskState) -> tuple[object, ...]:
+    """Bind one task row's values; the SQL text itself is a static literal."""
+    return (
+        state.task_id,
+        state.file_name,
+        str(state.save_path),
+        state.status,
+        state.download_id,
+        state.total_bytes,
+        state.bytes_done,
+        state.part_size,
+        state.max_connections,
+        int(state.supports_resume),
+        state.error,
+        state.version,
+        state.expected_sha256,
+        state.created_at,
+        state.updated_at,
+    )
+
+
+def _part_parameters(record: DownloadPartRecord, task_id: str) -> tuple[object, ...]:
+    """Bind one part row's values; the SQL text itself is a static literal."""
+    return (
+        task_id,
+        record.index,
+        record.start,
+        record.end,
+        record.expected_size,
+        record.actual_size,
+        record.md5,
+        record.algorithm,
+        record.mtime_ns,
+    )
+
+
+def _task_from_values(values: tuple[object, ...]) -> DownloadTaskState | None:
+    """Build a typed task state from one database tuple; None when invalid."""
+    if len(values) != 15:
+        return None
+    (
+        task_id,
+        file_name,
+        save_path,
+        status,
+        download_id,
+        total_bytes,
+        bytes_done,
+        part_size,
+        max_connections,
+        supports_resume,
+        error,
+        version,
+        expected_sha256,
+        created_at,
+        updated_at,
+    ) = values
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    if not isinstance(file_name, str) or not file_name:
+        return None
+    if not isinstance(save_path, str) or not save_path:
+        return None
+    return DownloadTaskState(
+        task_id=task_id,
+        file_name=file_name,
+        save_path=Path(save_path),
+        status=_read_status(status),
+        download_id=_read_text(download_id) or None,
+        total_bytes=_read_optional_non_negative_int(total_bytes),
+        bytes_done=_read_non_negative_int(bytes_done),
+        part_size=_read_optional_positive_int(part_size),
+        max_connections=max(1, _read_non_negative_int(max_connections)),
+        supports_resume=bool(_read_non_negative_int(supports_resume)),
+        error=_read_text(error),
+        version=_read_non_negative_int(version) or TASK_METADATA_VERSION,
+        expected_sha256=_read_text(expected_sha256) or None,
+        created_at=_row_float(created_at),
+        updated_at=_row_float(updated_at),
+    )
+
+
+def _part_row_from_values(
+    values: tuple[object, ...],
+) -> tuple[str, DownloadPartRecord] | None:
+    """Build one (task_id, part record) pair; None when the row is invalid."""
+    if len(values) != 9:
+        return None
+    (
+        task_id,
+        part_index,
+        start,
+        end,
+        expected_size,
+        actual_size,
+        md5,
+        algorithm,
+        mtime_ns,
+    ) = values
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    index_value = _row_int(part_index)
+    start_value = _row_int(start)
+    end_value = _row_int(end)
+    expected_value = _row_int(expected_size)
+    actual_value = _row_int(actual_size)
+    if (
+        index_value is None
+        or start_value is None
+        or end_value is None
+        or expected_value is None
+        or actual_value is None
+    ):
+        return None
+    if index_value < 0 or start_value < 0:
+        return None
+    if end_value < start_value or expected_value <= 0:
+        return None
+    if not 0 < actual_value <= expected_value:
+        return None
+    if not isinstance(md5, str) or not md5:
+        return None
+    return (
+        task_id,
+        DownloadPartRecord(
+            index=index_value,
+            start=start_value,
+            end=end_value,
+            expected_size=expected_value,
+            actual_size=actual_value,
+            md5=md5,
+            mtime_ns=_row_int(mtime_ns),
+            algorithm=_read_text(algorithm) or "md5",
+        ),
+    )
+
+
+def _row_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _row_float(value: object) -> float:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return 0.0
 
 
 def make_download_task_id(download_id: str, local_path: Path) -> str:
@@ -332,6 +790,7 @@ def download_url(
     task_id: str,
     file_name: str,
     download_id: str | None = None,
+    expected_sha256: str | None = None,
     refresh_url: RefreshUrlCallback | None = None,
     callbacks: DownloadCallbacks | None = None,
     control: DownloadTaskControl | None = None,
@@ -358,6 +817,7 @@ def download_url(
     state.file_name = file_name
     state.save_path = local_path
     state.download_id = download_id or state.download_id
+    state.expected_sha256 = expected_sha256 or state.expected_sha256
     store.save(state)
 
     total_size = _probe_download_size(http_client, url)
@@ -419,6 +879,15 @@ def _complete_zero_byte_download(
     stop_result = control.stop_result()
     if stop_result in ("paused", "cancelled"):
         return _stop_range_download(stop_result, store, latest, callbacks, control)
+
+    # Same whole-file integrity gate as the merge path: part digests are
+    # trivially correct for zero bytes, so the upstream hash is the only
+    # defense. Checked before the temporary file is created — a mismatched
+    # expected hash can never produce a publishable output.
+    expected_sha256 = latest.expected_sha256
+    if expected_sha256 is not None and expected_sha256.lower() != EMPTY_CONTENT_SHA256:
+        _fail_sha256_verification(store, latest, callbacks)
+        raise DownloadError(DOWNLOAD_SHA256_FAILURE_MESSAGE)
 
     empty_path = store.merged_path(latest.task_id)
     try:
@@ -577,12 +1046,21 @@ def _download_with_ranges(
     store.save(latest)
     _emit_status(callbacks, "合并中")
     _emit_progress(callbacks, total_size, total_size)
-    _merge_parts(store, latest, parts, control)
+    merged_sha256 = _merge_parts(store, latest, parts, control)
 
     stop_result = control.stop_result()
     if stop_result in ("paused", "cancelled"):
         return _stop_range_download(stop_result, store, latest, callbacks, control)
 
+    expected_sha256 = latest.expected_sha256
+    if expected_sha256 is None:
+        LOGGER.debug("download.merge_sha256_skipped task_id=%s", latest.task_id)
+    elif merged_sha256 is not None and merged_sha256.lower() != expected_sha256.lower():
+        # Part digests can all be correct while the assembled file is not; the
+        # bad part cannot be located, so everything is cleared for a fresh
+        # non-resumable retry (no output file is ever published).
+        _fail_sha256_verification(store, latest, callbacks)
+        raise DownloadError(DOWNLOAD_SHA256_FAILURE_MESSAGE)
     merged_path = store.merged_path(latest.task_id)
     if merged_path.stat().st_size != total_size:
         _mark_failed(store, latest, callbacks, "下载分片合并后大小不一致")
@@ -612,7 +1090,12 @@ def _stop_range_part(
         progress_callback(part.index, 0)
         return stop_result
 
-    actual_size = temp_path.stat().st_size if temp_path.exists() else 0
+    stat_result = temp_path.stat() if temp_path.exists() else None
+    actual_size = stat_result.st_size if stat_result is not None else 0
+    # mtime_ns is captured from the same stat call as the size so the record
+    # always describes the exact bytes on disk at this moment (the rename to
+    # part{index} below preserves it).
+    mtime_ns = stat_result.st_mtime_ns if stat_result is not None else None
     if 0 < actual_size <= part.expected_size:
         digest = _compute_md5(temp_path)
         if actual_size == part.expected_size:
@@ -626,6 +1109,7 @@ def _stop_range_part(
                 expected_size=part.expected_size,
                 actual_size=actual_size,
                 md5=digest,
+                mtime_ns=mtime_ns,
             ),
         )
         progress_callback(part.index, actual_size)
@@ -737,6 +1221,8 @@ def _download_range_part(
 
         if temp_path.exists() and temp_path.stat().st_size == part.expected_size:
             temp_path.replace(final_path)
+            # stat after the rename so mtime_ns describes the published part
+            # file, never the transient .downloading one.
             store.record_part(
                 task_id,
                 DownloadPartRecord(
@@ -746,6 +1232,7 @@ def _download_range_part(
                     expected_size=part.expected_size,
                     actual_size=part.expected_size,
                     md5=md5.hexdigest(),
+                    mtime_ns=final_path.stat().st_mtime_ns,
                 ),
             )
             return "ok"
@@ -808,6 +1295,32 @@ def _mark_failed(
     _emit_connections(callbacks, 0, latest.max_connections)
 
 
+def _fail_sha256_verification(
+    store: DownloadTaskStore,
+    state: DownloadTaskState,
+    callbacks: DownloadCallbacks,
+) -> None:
+    """Clear every resumable artifact and enter a non-resumable failure state.
+
+    All part digests were correct but the assembled file did not match the
+    upstream SHA256, so the bad part cannot be located: temporary files and
+    part rows are removed together and the task is marked 失败 with
+    ``supports_resume=False`` so the only way forward is a fresh download.
+    """
+    store.cleanup_temp(state.task_id)
+
+    def apply(latest: DownloadTaskState) -> None:
+        latest.parts = []
+        latest.bytes_done = 0
+        latest.supports_resume = False
+        latest.status = "失败"
+        latest.error = DOWNLOAD_SHA256_FAILURE_MESSAGE
+
+    latest = store.update(state.task_id, apply)
+    _emit_status(callbacks, "失败")
+    _emit_connections(callbacks, 0, latest.max_connections)
+
+
 def _validate_existing_parts(
     store: DownloadTaskStore,
     state: DownloadTaskState,
@@ -829,33 +1342,31 @@ def _validate_existing_parts(
             continue
         if record.actual_size == planned.expected_size:
             path = store.part_path(state.task_id, record.index)
-            if not path.exists():
-                store.remove_part_record(state.task_id, record.index)
-                continue
-            if path.stat().st_size != planned.expected_size:
-                store.remove_part_record(state.task_id, record.index)
-                continue
-            if _compute_md5(path) != record.md5:
-                store.remove_part_record(state.task_id, record.index)
-                continue
-            reusable.add(record.index)
-            downloaded += planned.expected_size
-            continue
-        if not 0 < record.actual_size < planned.expected_size:
+            expected_disk_size = planned.expected_size
+            complete = True
+        elif 0 < record.actual_size < planned.expected_size:
+            path = store.part_downloading_path(state.task_id, record.index)
+            expected_disk_size = record.actual_size
+            complete = False
+        else:
             store.remove_part_record(state.task_id, record.index)
             continue
-        path = store.part_downloading_path(state.task_id, record.index)
         if not path.exists():
             store.remove_part_record(state.task_id, record.index)
             continue
-        if path.stat().st_size != record.actual_size:
+        stat_result = path.stat()
+        if stat_result.st_size != expected_disk_size:
             store.remove_part_record(state.task_id, record.index)
             continue
-        if _compute_md5(path) != record.md5:
+        if not _part_intact(store, state.task_id, record, path, stat_result):
             store.remove_part_record(state.task_id, record.index)
             continue
-        partial.add(record.index)
-        downloaded += record.actual_size
+        if complete:
+            reusable.add(record.index)
+            downloaded += planned.expected_size
+        else:
+            partial.add(record.index)
+            downloaded += record.actual_size
 
     temp_dir = store.task_temp_dir(state.task_id)
     if temp_dir.exists():
@@ -878,6 +1389,42 @@ def _validate_existing_parts(
     return downloaded, reusable
 
 
+def _part_intact(
+    store: DownloadTaskStore,
+    task_id: str,
+    record: DownloadPartRecord,
+    path: Path,
+    stat_result: os.stat_result,
+) -> bool:
+    """Validate one part checkpoint with the mtime fast path.
+
+    A recorded ``st_mtime_ns`` matching the file on disk means the bytes were
+    never touched since the digest was computed, so the file is reused without
+    reading it. Otherwise the recorded algorithm re-hashes the file once; a
+    passing re-hash refreshes the stored mtime so the next resume takes the
+    fast path again.
+    """
+    if record.mtime_ns is not None and stat_result.st_mtime_ns == record.mtime_ns:
+        return True
+    digest = _digest_for(record.algorithm, path)
+    if digest is None or digest != record.md5:
+        return False
+    store.record_part(task_id, replace(record, mtime_ns=stat_result.st_mtime_ns))
+    return True
+
+
+def _digest_for(algorithm: str, path: Path) -> str | None:
+    """Hash one part file with its recorded algorithm.
+
+    Unknown algorithms fail validation so the stale record is removed instead
+    of being trusted; only ``md5`` exists today.
+    """
+    if algorithm == "md5":
+        return _compute_md5(path)
+    LOGGER.warning("download.part_unknown_algorithm algorithm=%s", algorithm)
+    return None
+
+
 def _clear_parts_if_plan_changed(
     store: DownloadTaskStore,
     state: DownloadTaskState,
@@ -895,22 +1442,31 @@ def _merge_parts(
     state: DownloadTaskState,
     parts: list[DownloadPart],
     control: DownloadTaskControl,
-) -> None:
+) -> str | None:
+    """Concatenate part files into ``merged`` while hashing the output once.
+
+    The SHA256 is computed incrementally inside the same write loop, so no
+    second disk read is needed. Returns the output digest, or ``None`` when a
+    pause/cancel interrupted the merge before it finished.
+    """
     merged_path = store.merged_path(state.task_id)
     merged_path.parent.mkdir(parents=True, exist_ok=True)
     _remove_partial_file(merged_path)
+    sha256 = hashlib.sha256()
     try:
         with merged_path.open("wb") as output:
             for part in parts:
                 stop_result = control.stop_result()
                 if stop_result in ("paused", "cancelled"):
-                    return
+                    return None
                 part_path = store.part_path(state.task_id, part.index)
                 with part_path.open("rb") as input_file:
                     while chunk := input_file.read(DOWNLOAD_CHUNK_SIZE):
                         output.write(chunk)
+                        sha256.update(chunk)
     except OSError as exc:
         raise DownloadError(f"合并分片文件失败：{exc}") from exc
+    return sha256.hexdigest()
 
 
 def _build_parts(total_size: int, part_size: int) -> list[DownloadPart]:
@@ -1044,6 +1600,17 @@ def _state_to_record(state: DownloadTaskState) -> DownloadTaskRecord:
     )
 
 
+# --- Legacy JSON migration cluster (removal candidates) --------------------
+# This cluster exists only to import pre-SQLite per-task JSON metadata and has
+# no other production purpose (no code path writes task JSON anymore):
+#   _dump_task_state   — JSON serializer; no production caller left, tests use
+#                        it as a fixture builder only
+#   _read_task_state   — JSON parser, called only by _migrate_json_tasks
+#   _read_part_record  — JSON part parser, called only by _read_task_state
+# (_read_json_metadata_file, near _migrate_json_tasks, and the task_path helper
+# complete the cluster.) When tasks/*.json can no longer exist on any user
+# install, delete the whole cluster plus those two, together with the tests
+# that import these helpers. See _migrate_json_tasks for the same plan.
 def _dump_task_state(state: DownloadTaskState) -> dict[str, Any]:
     return {
         "version": state.version,
@@ -1058,6 +1625,7 @@ def _dump_task_state(state: DownloadTaskState) -> dict[str, Any]:
         "max_connections": state.max_connections,
         "supports_resume": state.supports_resume,
         "error": state.error,
+        "expected_sha256": state.expected_sha256,
         "created_at": state.created_at,
         "updated_at": state.updated_at,
         "parts": [
@@ -1068,6 +1636,8 @@ def _dump_task_state(state: DownloadTaskState) -> dict[str, Any]:
                 "expected_size": part.expected_size,
                 "actual_size": part.actual_size,
                 "md5": part.md5,
+                "mtime_ns": part.mtime_ns,
+                "algorithm": part.algorithm,
             }
             for part in state.parts
         ],
@@ -1100,6 +1670,7 @@ def _read_task_state(raw: dict[str, Any]) -> DownloadTaskState | None:
         supports_resume=bool(raw.get("supports_resume")),
         error=_read_text(raw.get("error")),
         version=_read_non_negative_int(raw.get("version")) or TASK_METADATA_VERSION,
+        expected_sha256=_read_text(raw.get("expected_sha256")) or None,
         created_at=float(raw.get("created_at") or time.time()),
         updated_at=float(raw.get("updated_at") or time.time()),
         parts=parts,
@@ -1123,6 +1694,12 @@ def _read_part_record(raw: object) -> DownloadPartRecord | None:
         or not md5
     ):
         return None
+    raw_mtime_ns = raw.get("mtime_ns")
+    mtime_ns = (
+        raw_mtime_ns
+        if isinstance(raw_mtime_ns, int) and not isinstance(raw_mtime_ns, bool)
+        else None
+    )
     return DownloadPartRecord(
         index=index,
         start=start,
@@ -1130,6 +1707,8 @@ def _read_part_record(raw: object) -> DownloadPartRecord | None:
         expected_size=expected_size,
         actual_size=actual_size,
         md5=md5,
+        mtime_ns=mtime_ns,
+        algorithm=_read_text(raw.get("algorithm")) or "md5",
     )
 
 

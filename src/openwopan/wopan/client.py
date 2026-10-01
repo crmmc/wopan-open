@@ -1319,6 +1319,7 @@ def _read_wopan_item(raw: dict[str, Any], fallback_parent_id: str) -> WopanItem:
         download_id=_read_optional_text(raw.get("fid")),
         size=_read_optional_int(raw.get("size")),
         updated_at=_read_wopan_timestamp(raw),
+        sha256=_read_optional_text(raw.get("sha256")),
     )
 
 
@@ -1350,6 +1351,7 @@ def _read_search_item(raw: dict[str, Any]) -> WopanItem:
         download_id=_read_optional_text(raw.get("fid")),
         size=size,
         updated_at=_read_wopan_timestamp(raw),
+        sha256=_read_optional_text(raw.get("sha256")),
     )
 
 

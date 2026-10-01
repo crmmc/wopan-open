@@ -546,6 +546,7 @@ class FileBrowserService:
                 task_id=resolved_task_id,
                 file_name=item.name,
                 download_id=download_id,
+                expected_sha256=item.sha256,
                 refresh_url=refresh_download_url,
                 callbacks=DownloadCallbacks(
                     progress=progress_callback,
