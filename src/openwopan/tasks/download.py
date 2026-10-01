@@ -342,7 +342,11 @@ class DownloadTaskStore:
         return self._root_path
 
     def task_path(self, task_id: str) -> Path:
-        """Return the legacy per-task JSON metadata path (migration source only)."""
+        """Return the legacy per-task JSON metadata path (migration source only).
+
+        Part of the JSON migration cluster; remove together with it (see the
+        comment above ``_dump_task_state``).
+        """
         return self._root_path / "tasks" / f"{task_id}.json"
 
     def task_temp_dir(self, task_id: str) -> Path:
@@ -578,6 +582,11 @@ class DownloadTaskStore:
         Idempotent by primary key (INSERT OR REPLACE): a crash mid-migration
         replays safely on the next open, and already-imported JSON files are
         deleted so they are never imported twice.
+
+        Removal plan: this method, ``task_path``, and the module-level JSON
+        cluster documented above ``_dump_task_state`` exist only to import
+        pre-SQLite metadata. Delete them together once ``tasks/*.json`` can
+        no longer exist on any user install (pick a removal version).
         """
         tasks_dir = self._root_path / "tasks"
         if not tasks_dir.is_dir():
@@ -1591,6 +1600,17 @@ def _state_to_record(state: DownloadTaskState) -> DownloadTaskRecord:
     )
 
 
+# --- Legacy JSON migration cluster (removal candidates) --------------------
+# This cluster exists only to import pre-SQLite per-task JSON metadata and has
+# no other production purpose (no code path writes task JSON anymore):
+#   _dump_task_state   — JSON serializer; no production caller left, tests use
+#                        it as a fixture builder only
+#   _read_task_state   — JSON parser, called only by _migrate_json_tasks
+#   _read_part_record  — JSON part parser, called only by _read_task_state
+# (_read_json_metadata_file, near _migrate_json_tasks, and the task_path helper
+# complete the cluster.) When tasks/*.json can no longer exist on any user
+# install, delete the whole cluster plus those two, together with the tests
+# that import these helpers. See _migrate_json_tasks for the same plan.
 def _dump_task_state(state: DownloadTaskState) -> dict[str, Any]:
     return {
         "version": state.version,
