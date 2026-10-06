@@ -406,9 +406,21 @@ class UploadTaskStore:
             return state
 
     def delete(self, task_id: str) -> None:
-        """Delete one persisted task metadata file."""
+        """Delete one persisted task metadata file (best-effort cleanup).
+
+        Called after uploads succeed or cancel: a Windows file-handle race on
+        unlink must never flip an already-successful upload into a failure,
+        so OSError is logged and swallowed.
+        """
         with self._lock:
-            self.task_path(task_id).unlink(missing_ok=True)
+            try:
+                self.task_path(task_id).unlink(missing_ok=True)
+            except OSError as exc:
+                LOGGER.warning(
+                    "upload.task_state.delete_failed task_id=%s error_type=%s",
+                    task_id,
+                    type(exc).__name__,
+                )
 
 
 def _normalize_completed_indexes(indexes: list[int], total_parts: int) -> list[int]:

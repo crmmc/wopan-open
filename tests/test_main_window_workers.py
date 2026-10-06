@@ -4163,6 +4163,108 @@ def test_upload_recovery_runs_once_per_session(qapp: QApplication) -> None:
     assert window._upload_recovery_done
 
 
+def test_download_recovery_runs_once_per_session(qapp: QApplication) -> None:
+    """下载恢复的一次性守卫：重新登录路径不二次入队（上传侧对等）。"""
+
+    class _RecoverDownloadBrowser(WorkerFileBrowser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recover_calls = 0
+
+        def recover_downloads(self) -> tuple[object, ...]:
+            self.recover_calls += 1
+            return ()
+
+    browser = _RecoverDownloadBrowser()
+    window = MainWindow(browser)
+
+    window._recover_downloads()
+    window._download_recovery_thread = None  # 同步线程已清理，模拟回到空闲
+    window._recover_downloads()
+
+    assert browser.recover_calls == 1
+    assert window._download_recovery_done
+
+
+def test_set_file_browser_closes_old_backend_downloads(qapp: QApplication) -> None:
+    """替换 backend（重新登录）时协作关闭旧下载调度器，防双执行器。"""
+
+    class _ClosingBrowser(WorkerFileBrowser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls: list[bool] = []
+
+        def close_downloads(self, *, wait: bool = True) -> None:
+            self.close_calls.append(wait)
+
+    old_browser = _ClosingBrowser()
+    window = MainWindow(old_browser)
+
+    window.set_file_browser(_ClosingBrowser())
+
+    assert old_browser.close_calls == [False]
+
+
+def test_download_recovery_failure_normalizes_zombie_rows(qapp: QApplication) -> None:
+    """下载恢复失败：历史里的非终态行归一为可恢复暂停态，不留僵尸「下载中」。"""
+    window = MainWindow(WorkerFileBrowser())
+    window.transfer_interface.add_download_record(
+        TransferRecord(
+            task_id="dl-1",
+            direction="download",
+            name="x.bin",
+            size=10,
+            target_path=Path("/tmp/x.bin"),
+            status="下载中",
+        )
+    )
+
+    window._on_download_recovery_failed("存储不可用")
+
+    record = window.transfer_interface._find_record("download", "dl-1")
+    assert record is not None
+    assert record.status == "已暂停" and record.can_resume
+    assert "存储不可用" in record.error
+
+
+def test_download_recovery_replays_pending_events(qapp: QApplication) -> None:
+    """恢复建行后回放滞留的调度器事件，终态事件清理 pending 防泄漏。"""
+    window = MainWindow(WorkerFileBrowser())
+    event = main_window_module.DownloadTaskEvent(
+        task_id="dl-1", status="下载中", bytes_done=5, total_bytes=10
+    )
+    window._on_download_event(event)  # 行不存在 → 暂存
+    assert "dl-1" in window._pending_download_events
+
+    window._on_download_recovery_succeeded(
+        (
+            SimpleNamespace(
+                task_id="dl-1",
+                name="x.bin",
+                target_path=Path("/tmp/x.bin"),
+                status="等待中",
+                total_bytes=10,
+                bytes_done=0,
+                active_connections=0,
+                max_connections=1,
+                supports_resume=False,
+            ),
+        )
+    )
+
+    record = window.transfer_interface._find_record("download", "dl-1")
+    assert record is not None
+    assert record.status == "下载中" and record.bytes_done == 5  # 事件已回放
+    assert "dl-1" not in window._pending_download_events
+
+    terminal = main_window_module.DownloadTaskEvent(
+        task_id="dl-1", status="已完成", bytes_done=10, total_bytes=10
+    )
+    window._pending_download_events["dl-1"] = terminal
+    window._on_download_event(terminal)
+    assert "dl-1" not in window._pending_download_events
+
+
 def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

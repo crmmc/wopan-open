@@ -1752,6 +1752,15 @@ class TransferInterface(QWidget):
                 or visible[row].status == "已暂停"
             )
         }
+        if not task_ids and rows:
+            # 选中了不可删除的行（下载方向仅终态/已暂停可删）：明确提示，
+            # 不做无声吞掉操作的静默返回。
+            InfoBar.warning(
+                title="删除下载任务",
+                content="没有可删除的任务：仅已暂停/已完成/失败/已取消的下载可删除",
+                parent=self,
+            )
+            return
         self._request_delete_ids(direction, task_ids)
 
     def _request_delete_ids(self, direction: str, task_ids: set[str]) -> None:
@@ -1913,6 +1922,17 @@ class TransferInterface(QWidget):
                 0 <= row < len(visible)
                 and visible[row].can_resume
                 and visible[row].status in {"已暂停", "失败"}
+                for row in rows
+            )
+        )
+        # 与单行删除按钮同款门控：下载方向仅终态/已暂停可删。
+        buttons["delete"].setEnabled(
+            any(
+                0 <= row < len(visible)
+                and (
+                    visible[row].status in TERMINAL_TRANSFER_STATUSES
+                    or visible[row].status == "已暂停"
+                )
                 for row in rows
             )
         )
@@ -2841,6 +2861,7 @@ class MainWindow(_MainWindowBase):
         self._download_submit_paths: dict[QThread, set[Path]] = {}
         self._download_reserved_targets: set[Path] = set()
         self._download_recovery_thread: QThread | None = None
+        self._download_recovery_done = False
         self._upload_recovery_thread: QThread | None = None
         self._upload_recovery_worker: BrowserOperationWorker | None = None
         self._upload_recovery_done = False
@@ -2971,24 +2992,32 @@ class MainWindow(_MainWindowBase):
         self._download_reserved_targets.clear()
         self._upload_conflict_pending.clear()
         self._upload_scan_pending.clear()
-        for folder_pending in self._folder_prepare_pending:
-            self.transfer_interface.update_record(
-                "upload", folder_pending.record_id, status="已取消"
-            )
-        for paused_task_id in self._paused_uploads:
-            self.transfer_interface.update_record("upload", paused_task_id, status="已取消")
-        self._paused_uploads.clear()
-        self._folder_prepare_pending.clear()
-        for queued in self._folder_upload_queue:
-            self.transfer_interface.update_record("upload", queued.task_id, status="已取消")
-        self._folder_upload_queue.clear()
-        if self._folder_upload_record_id is not None:
-            self.transfer_interface.update_record(
-                "upload", self._folder_upload_record_id, status="已取消"
-            )
-        for pending in self._upload_pending:
-            self.transfer_interface.update_record("upload", pending.task_id, status="已取消")
-        self._upload_pending.clear()
+        # 收尾逐条状态更新合并为一次渲染：表格即将销毁，逐条全渲染全部浪费。
+        with self.transfer_interface.batch_updates():
+            for folder_pending in self._folder_prepare_pending:
+                self.transfer_interface.update_record(
+                    "upload", folder_pending.record_id, status="已取消"
+                )
+            for paused_task_id in self._paused_uploads:
+                self.transfer_interface.update_record(
+                    "upload", paused_task_id, status="已取消"
+                )
+            self._paused_uploads.clear()
+            self._folder_prepare_pending.clear()
+            for queued in self._folder_upload_queue:
+                self.transfer_interface.update_record(
+                    "upload", queued.task_id, status="已取消"
+                )
+            self._folder_upload_queue.clear()
+            if self._folder_upload_record_id is not None:
+                self.transfer_interface.update_record(
+                    "upload", self._folder_upload_record_id, status="已取消"
+                )
+            for pending in self._upload_pending:
+                self.transfer_interface.update_record(
+                    "upload", pending.task_id, status="已取消"
+                )
+            self._upload_pending.clear()
         thread_entries: list[tuple[QThread | None, str, str | None]] = [
             (self._directory_thread, "directory", None),
             (self._create_thread, "create", None),
@@ -3195,6 +3224,17 @@ class MainWindow(_MainWindowBase):
 
     def set_file_browser(self, file_browser: FileBrowserBackend) -> None:
         """Attach a UI-safe file browser backend and load the root directory."""
+        if self._file_browser is not None and self._file_browser is not file_browser:
+            # 重新登录会带着新 backend 再次进入：旧 backend 的下载调度器
+            # 若继续运行，会与新调度器并发写同一批分片文件和 sqlite 行
+            # （两者共享磁盘下载存储）。协作暂停并关闭旧调度器，未完成
+            # 任务由新 backend 的恢复流程按持久化状态重新入队。
+            close_downloads = getattr(self._file_browser, "close_downloads", None)
+            if callable(close_downloads):
+                try:
+                    close_downloads(wait=False)
+                except Exception:  # pragma: no cover - docs/testing-exemptions.md
+                    LOGGER.exception("main_window.set_file_browser.close_old_failed")
         self._file_browser = file_browser
         set_callback = getattr(file_browser, "set_download_event_callback", None)
         if callable(set_callback):
@@ -4586,6 +4626,9 @@ class MainWindow(_MainWindowBase):
             return
 
         terminal = event.status in TERMINAL_TRANSFER_STATUSES
+        if terminal:
+            # 终态后再无状态转换可补：丢弃同任务的滞留事件，防泄漏。
+            self._pending_download_events.pop(event.task_id, None)
         status = event.status if terminal or event.status != record.status else None
         total_bytes = (
             event.total_bytes
@@ -5887,11 +5930,15 @@ class MainWindow(_MainWindowBase):
         record_id = task_id or self._download_task_id
         if record_id is None:
             return
+        record = self.transfer_interface._find_record("download", record_id)
+        # max_connections 未变化时传 None，保持 progress_only 合并管道生效
+        # （与 _on_download_event 的去重一致）。
+        unchanged_max = record is not None and record.max_connections == max_connections
         self.transfer_interface.update_record(
             "download",
             record_id,
             active_connections=active_connections,
-            max_connections=max_connections,
+            max_connections=None if unchanged_max else max_connections,
         )
 
     def _on_download_succeeded(
@@ -6637,12 +6684,20 @@ class MainWindow(_MainWindowBase):
         return None
 
     def _recover_downloads(self) -> None:
-        if self._file_browser is None:
+        if (
+            self._file_browser is None
+            or self._download_recovery_done
+            or self._download_recovery_thread is not None
+        ):
             return
         recover = getattr(self._file_browser, "recover_downloads", None)
         if not callable(recover):
             self._load_persisted_download_records()
             return
+        # 一次性守卫（与 _recover_uploads/_load_transfer_history 对等）：
+        # 重新登录会再次触发 set_file_browser，二次恢复会把同一批持久化
+        # 下载重新入队。
+        self._download_recovery_done = True
         thread = QThread(self)
         worker = BrowserOperationWorker(recover)
         worker.moveToThread(thread)
@@ -6664,10 +6719,29 @@ class MainWindow(_MainWindowBase):
         if result:
             self.transfer_interface.flush_progress_render()
             self.transfer_interface._render_download_table()
+            # 恢复建行前到达的调度器事件一直滞留在 pending：现在按行回放，
+            # 补上恢复期间丢失的状态转换。
+            for record in list(self.transfer_interface.download_records):
+                event = self._pending_download_events.pop(record.task_id, None)
+                if event is not None:
+                    self._on_download_event(event)
 
     def _on_download_recovery_failed(self, message: str) -> None:
         LOGGER.warning("main_window.download.recovery.failed error=%s", message)
         self._set_status(f"恢复下载任务失败：{message}")
+        # 调度器缺席时历史里的非终态下载行没有任何执行体（上传侧在历史
+        # 加载时归一）；不归一会保留僵尸「下载中」，且暂停会触发调度器
+        # KeyError 弹费解错误。统一标注为可恢复的暂停态。
+        with self.transfer_interface.batch_updates():
+            for record in list(self.transfer_interface.download_records):
+                if record.status not in TERMINAL_TRANSFER_STATUSES:
+                    self.transfer_interface.update_record(
+                        "download",
+                        record.task_id,
+                        status="已暂停",
+                        can_resume=True,
+                        error=f"恢复下载任务失败：{message}",
+                    )
 
     def _clear_download_recovery(self) -> None:
         self._delete_finished_thread()
