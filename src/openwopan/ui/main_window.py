@@ -962,6 +962,8 @@ class TransferInterface(QWidget):
     pause_downloads_requested = Signal(object)
     resume_downloads_requested = Signal(object)
     retry_upload_requested = Signal(object)
+    # 目录准备/排队批次没有列表行（qB/传统网盘语义），取消入口走这个信号。
+    folder_prepare_cancel_requested = Signal()
 
     def __init__(
         self,
@@ -1331,6 +1333,12 @@ class TransferInterface(QWidget):
             "打开下载文件夹",
             top_bar,
         )
+        self.cancel_folder_prepare_button = PushButton(
+            FIF.CANCEL.icon(),
+            "取消目录创建",
+            top_bar,
+        )
+        self.cancel_folder_prepare_button.hide()
 
         top_layout.addWidget(self.title_label)
         top_layout.addWidget(self.segmented_widget)
@@ -1339,6 +1347,7 @@ class TransferInterface(QWidget):
         top_layout.addWidget(self.upload_filter_combo)
         top_layout.addWidget(self.download_filter_label)
         top_layout.addWidget(self.download_filter_combo)
+        top_layout.addWidget(self.cancel_folder_prepare_button)
         top_layout.addWidget(self.open_download_folder_button)
         self._main_layout.addWidget(top_bar)
 
@@ -1449,6 +1458,9 @@ class TransferInterface(QWidget):
         self.upload_filter_combo.currentIndexChanged.connect(self._on_upload_filter_changed)
         self.download_filter_combo.currentIndexChanged.connect(self._on_download_filter_changed)
         self.open_download_folder_button.clicked.connect(self._request_open_download_folder)
+        self.cancel_folder_prepare_button.clicked.connect(
+            self.folder_prepare_cancel_requested.emit
+        )
         self.upload_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("upload"))
         self.download_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("download"))
         self.upload_batch_buttons["select_all"].clicked.connect(
@@ -3097,6 +3109,9 @@ class MainWindow(_MainWindowBase):
         self.transfer_interface.pause_downloads_requested.connect(self._pause_selected_downloads)
         self.transfer_interface.resume_downloads_requested.connect(self._resume_selected_downloads)
         self.transfer_interface.retry_upload_requested.connect(self._retry_selected_uploads)
+        self.transfer_interface.folder_prepare_cancel_requested.connect(
+            self._request_cancel_folder_prepare
+        )
         self.recycle_interface = RecycleInterface(self)
         self.recycle_interface.refresh_requested.connect(self.refresh_recycle_items)
         self.recycle_interface.restore_requested.connect(self._restore_recycle_items)
@@ -3141,19 +3156,11 @@ class MainWindow(_MainWindowBase):
         self._upload_scan_pending.clear()
         # 收尾逐条状态更新合并为一次渲染：表格即将销毁，逐条全渲染全部浪费。
         with self.transfer_interface.batch_updates():
-            for folder_pending in self._folder_prepare_pending:
-                self.transfer_interface.update_record(
-                    "upload", folder_pending.record_id, status="已取消"
-                )
+            # 文件夹批次无列表行（目录创建属准备阶段）：排队批次直接作废，
+            # 其子文件行与独立任务的「已暂停/等待中」保持原状态落盘——
+            # 重启后由历史加载归一为「已暂停」并可手动继续，服务层按持久
+            # 会话断点续传。关闭不应把用户暂停/排队的任务变成已取消。
             self._folder_prepare_pending.clear()
-            if self._folder_upload_record_id is not None:
-                # 批次调度随进程消亡，汇总行落终态；其子文件行与独立任务的
-                # 「已暂停/等待中」保持原状态落盘——重启后由历史加载归一为
-                # 「已暂停」并可手动继续，服务层按持久化会话断点续传。
-                self.transfer_interface.update_record(
-                    "upload", self._folder_upload_record_id, status="已取消"
-                )
-            # 只清内存结构不写状态：关闭不应把用户暂停/排队的任务变成已取消。
             self._paused_uploads.clear()
             self._upload_pending.clear()
         thread_entries: list[tuple[QThread | None, str, str | None]] = [
@@ -5177,11 +5184,8 @@ class MainWindow(_MainWindowBase):
             self._folder_prepare_thread is not None
             or self._folder_upload_record_id is not None
         ):
-            record_id = self._create_upload_record(
-                local_root,
-                name=root_name if root_name is not None else local_root.name,
-                parent_id=(_parent_id if _parent_id is not None else self.current_directory_id()),
-            )
+            # 文件夹批次不进传输列表：目录创建属于准备阶段（API 直建），
+            # 列表里只有原子文件任务。record_id 仅作内部批次令牌。
             self._folder_prepare_pending.append(
                 PendingFolderUpload(
                     local_path=local_root,
@@ -5189,11 +5193,12 @@ class MainWindow(_MainWindowBase):
                         _parent_id if _parent_id is not None else self.current_directory_id()
                     ),
                     root_name=root_name,
-                    record_id=record_id,
+                    record_id=self._next_transfer_task_id("folder"),
                     merge=merge,
                 )
             )
-            self._set_status(f"已添加「{local_root.name}」上传任务")
+            self._set_status(f"「{local_root.name}」已加入上传队列")
+            self._update_folder_prepare_cancel_visibility()
             return
 
         parent_id = _parent_id if _parent_id is not None else self.current_directory_id()
@@ -5203,16 +5208,10 @@ class MainWindow(_MainWindowBase):
             len(local_root.name),
             merge,
         )
-        if _record_id is None:
-            record_id = self._create_upload_record(
-                local_root,
-                name=root_name if root_name is not None else local_root.name,
-                parent_id=parent_id,
-            )
-        else:
-            record_id = _record_id
+        # 同上：批次令牌不建行，准备阶段在状态栏提示（传统网盘的做法——
+        # 目录创建成功后文件才进列表，失败则一个文件任务都不加）。
+        record_id = _record_id if _record_id is not None else self._next_transfer_task_id("folder")
         self._folder_upload_record_id = record_id
-        self.transfer_interface.update_record("upload", record_id, status="创建目录中")
         file_browser = self._file_browser
         thread = QThread(self)
         prepare_cancel = threading.Event()
@@ -5255,6 +5254,7 @@ class MainWindow(_MainWindowBase):
         self._folder_upload_target_dir_id = parent_id
         self._set_status(f"正在创建目录「{local_root.name}」...")
         thread.start()
+        self._update_folder_prepare_cancel_visibility()
 
     def _on_folder_upload_prepared(self, result: object) -> None:
         if self._closing:
@@ -5263,9 +5263,6 @@ class MainWindow(_MainWindowBase):
             self._finish_folder_upload()
             return
         job = cast(FolderUploadJob, result)
-        record_id = self._folder_upload_record_id
-        if record_id is not None:
-            self.transfer_interface.update_record("upload", record_id, status="上传中")
         LOGGER.info(
             "main_window.folder_upload.prepare.success root_item_id=%s file_count=%s",
             job.root_item_id,
@@ -5298,11 +5295,13 @@ class MainWindow(_MainWindowBase):
                 )
         self._folder_upload_child_ids = child_ids
         self._folder_children_registered = True
-        self._set_status(f"已添加 {len(child_ids)} 个上传任务")
         if child_ids:
+            self._set_status(f"已添加 {len(child_ids)} 个上传任务")
             self._start_next_upload_task()
         else:
-            self._maybe_finish_folder_upload()
+            # 合并重传全部命中（云端已存在同名同大小）：不建任何行。
+            self._set_status("没有需要上传的文件")
+            self._finish_folder_upload()
 
     def _on_folder_upload_prepare_failed(self, message: str) -> None:
         if self._closing:
@@ -5311,7 +5310,7 @@ class MainWindow(_MainWindowBase):
             self._finish_folder_upload()
             return
         LOGGER.warning("main_window.folder_upload.prepare.failed error_length=%s", len(message))
-        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
+        # 目录创建失败：一个文件任务都不会添加（传统网盘语义），只报错。
         self._set_status(f"上传文件夹失败：{message}")
         InfoBar.error(title="上传文件夹失败", content=message, parent=self)
 
@@ -5321,7 +5320,6 @@ class MainWindow(_MainWindowBase):
         if self._folder_upload_record_id in self._upload_removal_requested:
             self._finish_folder_upload()
             return
-        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
         self._show_login_required_error(message)
 
     def _clear_folder_prepare(self) -> None:
@@ -5341,6 +5339,7 @@ class MainWindow(_MainWindowBase):
         # 这里补一次收尾判定。
         self._maybe_finish_folder_upload()
         self._start_next_pending_folder()
+        self._update_folder_prepare_cancel_visibility()
 
     def _start_next_pending_folder(self) -> None:
         if (
@@ -5415,7 +5414,6 @@ class MainWindow(_MainWindowBase):
         self._invalidate_directory_cache()
         if root_id in self._upload_removal_requested:
             self._upload_removal_requested.discard(root_id)
-            self.transfer_interface.remove_records("upload", {root_id})
             if target_dir_id is not None and self.current_directory_id() == target_dir_id:
                 self.refresh_current_directory()
             self._start_next_pending_folder()
@@ -5428,21 +5426,17 @@ class MainWindow(_MainWindowBase):
         content = f"成功 {success_count} 个，失败 {failure_count} 个"
         if cancel_count:
             content += f"，取消 {cancel_count} 个"
-        if root_id is not None:
-            if cancel_count:
-                self.transfer_interface.update_record("upload", root_id, status="已取消")
-            elif failure_count:
-                self._mark_transfer_failed("upload", root_id, content)
+        if success_count or failure_count or cancel_count:
+            # 全零批次（合并重传全部命中）不弹汇总，状态栏已提示。
+            if failure_count == 0:
+                InfoBar.info(title="上传完成", content=content, parent=self)
             else:
-                self.transfer_interface.update_record("upload", root_id, status="已完成")
-        if failure_count == 0:
-            InfoBar.info(title="上传完成", content=content, parent=self)
-        else:
-            InfoBar.warning(title="上传完成", content=content, parent=self)
-        self._set_status(f"文件夹上传完成：{content}")
+                InfoBar.warning(title="上传完成", content=content, parent=self)
+            self._set_status(f"文件夹上传完成：{content}")
         if target_dir_id is not None and self.current_directory_id() == target_dir_id:
             self.refresh_current_directory()
         self._start_next_pending_folder()
+        self._update_folder_prepare_cancel_visibility()
 
     def prompt_create_folder(self) -> None:
         """Prompt for a folder name and create it."""
@@ -6310,7 +6304,6 @@ class MainWindow(_MainWindowBase):
         if failed_task_id not in self._folder_upload_child_ids:
             return
         child_ids = set(self._folder_upload_child_ids)
-        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
         self._folder_upload_record_id = None
         self._folder_upload_child_ids.clear()
         self._folder_children_registered = False
@@ -6720,6 +6713,28 @@ class MainWindow(_MainWindowBase):
         # 无需等待退出，直接移除；同时丢弃其持久化会话，避免下次重启复活。
         self._discard_upload_sessions_for_record(record)
         self.transfer_interface.remove_records("upload", {task_id})
+
+    def _request_cancel_folder_prepare(self) -> None:
+        """目录准备/排队中的文件夹批次没有列表行，取消入口收在这里。
+
+        一次点击取消当前准备中的批次并丢弃整个排队队列（排队批次不可见，
+        无法逐个取消）；已创建的云端目录不回滚。
+        """
+        queued = len(self._folder_prepare_pending)
+        self._folder_prepare_pending.clear()
+        if self._folder_upload_record_id is not None:
+            self._cancel_folder_upload()
+        elif queued:
+            self._set_status("已取消排队中的文件夹上传")
+        self._update_folder_prepare_cancel_visibility()
+
+    def _update_folder_prepare_cancel_visibility(self) -> None:
+        button = getattr(self.transfer_interface, "cancel_folder_prepare_button", None)
+        if button is None:
+            return
+        button.setVisible(
+            self._folder_prepare_thread is not None or bool(self._folder_prepare_pending)
+        )
 
     def _cancel_folder_upload(self) -> None:
         root_id = self._folder_upload_record_id
