@@ -33,6 +33,7 @@ from openwopan.wopan.models import (
     WopanItemKind,
     WopanRecycleItem,
 )
+from openwopan.wopan.naming import server_file_name
 
 UploadProgressCallback = Callable[[int, int], None]
 UploadPartResultCallback = Callable[[int, str], None]
@@ -906,16 +907,20 @@ class WopanClient:
 
         UAT (2026-09-26): once the server has assembled all parts the file
         exists in the cloud even when the client never captured the fid from
-        the final part response. Only a FILE entry matching both the exact
-        name and the exact size counts, so an older same-name file is never
+        the final part response. Only a FILE entry matching both the name
+        and the exact size counts, so an older same-name file is never
         mistaken for this upload; same-name conflicts are already rejected by
         the service layer's pre-upload check, so the first hit is taken.
-        Entries without a fid cannot yield a usable item and are ignored.
+        The name is matched in its server-stored form too, because names
+        longer than the server limit are truncated when stored (UAT
+        2026-10-06). Entries without a fid cannot yield a usable item and
+        are ignored.
         """
+        stored_name = server_file_name(file_name)
         for item in self.list_files(parent_id):
             if (
                 item.kind is WopanItemKind.FILE
-                and item.name == file_name
+                and item.name in (file_name, stored_name)
                 and item.size == file_size
                 and item.download_id
             ):

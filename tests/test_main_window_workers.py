@@ -4710,6 +4710,34 @@ def test_resolve_upload_paths_merge_threads_merge_and_skips_conflicting_files(
     assert file_calls == []  # 同名顶层文件跳过
 
 
+def test_resolve_upload_paths_merge_skips_file_with_truncated_cloud_name(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """合并策略：顶层长名文件的云端截断名已存在 → 不再重复建任务。"""
+    from openwopan.tasks.upload import server_file_name
+
+    window = MainWindow(WorkerFileBrowser())
+    long_name = "a" * 99 + ".mkv"
+    long_file = tmp_path / long_name
+    long_file.write_bytes(b"y")
+    file_calls: list[Path] = []
+    monkeypatch.setattr(
+        window,
+        "upload_file_to_current_directory",
+        lambda path, **kwargs: file_calls.append(path),
+    )
+
+    window._resolve_upload_paths(
+        (long_file,),
+        {server_file_name(long_name)},
+        parent_id="0",
+        run_in_background=True,
+        resolution="merge",
+    )
+
+    assert file_calls == []
+
+
 def test_upload_summary_dialog_merge_resolution(qapp: QApplication, tmp_path: Path) -> None:
     """确认对话框提供「合并」第三选项并正确返回策略。"""
     from openwopan.tasks.upload import UploadBatchSummary, UploadSummaryEntry

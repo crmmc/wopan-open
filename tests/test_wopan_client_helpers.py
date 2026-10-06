@@ -1032,6 +1032,45 @@ def test_upload_file_all_parts_done_recovers_fid_from_listing(
     assert item.file_type == client_module.guess_upload_file_type("report.bin")
 
 
+def test_upload_file_all_parts_done_recovers_fid_for_truncated_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """长名上传完成后云端存截断名：目录恢复按服务端存储形态命中（UAT 2026-10-06）。"""
+    monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    long_name = "a" * 99 + ".bin"
+    stored_name = f"{'a' * 96}.bin"
+    local_file = tmp_path / long_name
+    local_file.write_bytes(b"012345678901234")
+    listing = {
+        "systemDirs": [],
+        "files": [
+            {
+                "id": "entry-1",
+                "fid": "fid-recovered",
+                "name": stored_name,
+                "type": "1",
+                "size": 15,
+            },
+        ],
+    }
+    handler, requests = _recovery_handler(listing)
+    resume = client_module.UploadResumeContext(
+        unique_id="u",
+        batch_no="b",
+        completed_indexes=frozenset({1, 2, 3}),
+        known_fid="",
+    )
+
+    item = _upload_client(handler).upload_file(
+        "folder-1", local_file, upload_part_size_mb=5, max_upload_threads=2, resume=resume
+    )
+
+    assert requests == ["dispatcher:QueryAllFiles"]
+    assert item.item_id == "fid-recovered"
+    assert item.name == long_name  # 客户端记录仍以本地名为准
+    assert item.size == 15
+
+
 def test_upload_file_all_parts_done_listing_miss_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

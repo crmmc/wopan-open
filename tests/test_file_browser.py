@@ -27,9 +27,11 @@ from openwopan.tasks.download import (
 )
 from openwopan.tasks.scheduler import DownloadCallbacks, DownloadScheduler, DownloadTaskInput
 from openwopan.tasks.upload import (
+    MergeUploadEstimate,
     UploadTaskState,
     UploadTaskStore,
     make_upload_task_id,
+    server_file_name,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID, UploadResumeContext
 from openwopan.wopan.errors import (
@@ -1197,6 +1199,110 @@ def test_estimate_merge_uploads_root_missing_counts_everything(tmp_path: Path) -
 
     assert estimate.files_to_upload == 5
     assert estimate.files_skipped == 0
+
+
+def _truncated_name_fixture(tmp_path: Path, cloud_size: int) -> tuple[_MergeCloudClient, Path]:
+    """本地 103 字符长名文件 vs 云端 100 字符截断名存储。"""
+    client = _MergeCloudClient()
+    long_name = "a" * 99 + ".mkv"  # 主名 99 + ".mkv" = 103
+    stored_name = server_file_name(long_name)
+    cloud_root = WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
+    stored_file = WopanItem(
+        item_id="f1",
+        name=stored_name,
+        kind=WopanItemKind.FILE,
+        parent_id="cloud-photos",
+        size=cloud_size,
+        download_id="fid-1",
+    )
+    client.entries["0"] = [cloud_root]
+    client.entries["cloud-photos"] = [stored_file]
+
+    local_root = tmp_path / "photos"
+    local_root.mkdir()
+    (local_root / long_name).write_bytes(b"a" * 100)
+    return client, local_root
+
+
+def test_prepare_merge_skips_files_stored_with_truncated_names(tmp_path: Path) -> None:
+    """长名文件上传后云端以截断名存储：合并模式按存储形态识别为已存在。
+
+    UAT 2026-10-06：服务端把超过 100 字符的文件名截断（主名保留至总长
+    100），此前按精确名比对会误判"缺失"而反复重传。
+    """
+    client, local_root = _truncated_name_fixture(tmp_path, cloud_size=100)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+    estimate = service.estimate_merge_uploads("0", local_root, root_name="photos")
+
+    assert job.files == ()  # 截断名 + 同大小 → 已上传，跳过
+    assert client.created == []  # 根目录复用，不重建
+    assert estimate == MergeUploadEstimate(files_to_upload=0, files_skipped=1)
+
+
+def test_prepare_merge_truncated_name_size_mismatch_plans_fitting_copy(
+    tmp_path: Path,
+) -> None:
+    """截断名同名但大小不同 → 补传副本名，且副本名必须在服务端限制内。"""
+    client, local_root = _truncated_name_fixture(tmp_path, cloud_size=999)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+    estimate = service.estimate_merge_uploads("0", local_root, root_name="photos")
+
+    (planned,) = job.files
+    assert len(planned.name) <= 100  # (copy) 标记不能落在截断点之后
+    assert "(copy)" in planned.name
+    assert estimate == MergeUploadEstimate(files_to_upload=1, files_skipped=0)
+
+
+def test_prepare_folder_upload_long_dotted_dir_names_do_not_collide(
+    tmp_path: Path,
+) -> None:
+    """同 96 前缀的两个长名子目录：按服务端存储形态去重，第二个用副本名。
+
+    目录名只在含扩展名点时适用截断规则；此处用带点目录名构造碰撞。
+    """
+    client = _MergeCloudClient()
+    local_root = tmp_path / "fresh"
+    long_a = "a" * 96 + "XXX" + ".dir"  # 103 字符，存储形态与 long_a/b 相同
+    long_b = "a" * 96 + "YYY" + ".dir"
+    (local_root / long_a).mkdir(parents=True)
+    (local_root / long_b).mkdir()
+    (local_root / long_a / "f.mkv").write_bytes(b"a")
+    (local_root / long_b / "g.mkv").write_bytes(b"b")
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root)  # 非合并、不重命名
+
+    created_names = [name for (_parent, name) in client.created]
+    assert len(created_names) == 3  # 根目录 + 两个子目录
+    second_dir = created_names[2]
+    assert len(second_dir) <= 100  # 副本名落在服务端限制内
+    assert "(copy)" in second_dir
+    assert len(job.files) == 2
+
+
+def test_upload_file_precheck_matches_truncated_cloud_names(tmp_path: Path) -> None:
+    """单文件上传前置检查：云端已有截断名 → 启动即拒绝，不再传完 N-1 片后 500。"""
+    client = _MergeCloudClient()
+    long_name = "a" * 99 + ".mkv"
+    stored = WopanItem(
+        item_id="f1",
+        name=server_file_name(long_name),
+        kind=WopanItemKind.FILE,
+        parent_id="0",
+        size=100,
+        download_id="fid-1",
+    )
+    client.entries["0"] = [stored]
+    local = tmp_path / long_name
+    local.write_bytes(b"a" * 100)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserError, match="上传目标已存在"):
+        service.upload_file("0", local, upload_name=long_name)
 
 
 def test_prepare_folder_upload_stops_between_cloud_creates(tmp_path: Path) -> None:

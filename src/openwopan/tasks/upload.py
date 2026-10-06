@@ -16,6 +16,7 @@ from typing import Any, Literal
 from platformdirs import user_cache_path
 
 from openwopan.storage.settings import APP_AUTHOR, APP_NAME
+from openwopan.wopan.naming import SERVER_FILE_NAME_LIMIT, server_file_name
 
 LOGGER = logging.getLogger(__name__)
 
@@ -106,15 +107,36 @@ class UploadTarget:
 
 
 def next_available_name(requested: str, used: set[str]) -> str:
-    """Return ``requested``, or a repeatedly suffixed ``(copy)`` name."""
-    if requested not in used:
+    """Return ``requested``, or a repeatedly suffixed ``(copy)`` name.
+
+    Names are matched by their server-stored form (the server truncates
+    names beyond ``SERVER_FILE_NAME_LIMIT``), and suffixed candidates are
+    generated to already fit that limit — otherwise the ``(copy)`` marker
+    would sit past the truncation point and collide server-side again.
+    """
+    if requested not in used and server_file_name(requested) not in used:
         return requested
-    path = Path(requested)
-    candidate = f"{path.stem} (copy){path.suffix}"
-    while candidate in used:
-        candidate_path = Path(candidate)
-        candidate = f"{candidate_path.stem} (copy){candidate_path.suffix}"
-    return candidate
+    marker = " (copy)"
+    ext = Path(requested).suffix
+    stem = Path(requested).stem
+    max_stem = max(SERVER_FILE_NAME_LIMIT - len(ext), len(marker) + 1)
+    copies = 1
+    while len(marker) * copies <= max_stem:
+        base = stem[: max_stem - len(marker) * copies]
+        candidate = f"{base}{marker * copies}{ext}"
+        if candidate not in used and server_file_name(candidate) not in used:
+            return candidate
+        copies += 1
+    # Degenerate fallback (every fitting "(copy)" variant is taken):
+    # numeric suffixes stay distinct inside the fitting window, and the
+    # bounded attempts guarantee termination on any listing.
+    for attempt in range(2, 1000):
+        tag = f" ({attempt})"
+        base = stem[: max_stem - len(tag)]
+        candidate = f"{base}{tag}{ext}"
+        if candidate not in used and server_file_name(candidate) not in used:
+            return candidate
+    raise ValueError("无法为上传文件生成可用名称：同名冲突过多")
 
 
 def find_upload_conflicts(
@@ -124,9 +146,10 @@ def find_upload_conflicts(
     used_names = set(existing_names)
     conflicts: list[Path] = []
     for path in paths:
-        if path.name in used_names:
+        stored = server_file_name(path.name)
+        if path.name in used_names or stored in used_names:
             conflicts.append(path)
-        used_names.add(path.name)
+        used_names.add(stored)
     return tuple(conflicts)
 
 
@@ -146,9 +169,12 @@ def resolve_upload_targets(
     targets: list[UploadTarget] = []
     for path in paths:
         requested_name = path.name
-        if requested_name not in used_names:
+        if (
+            requested_name not in used_names
+            and server_file_name(requested_name) not in used_names
+        ):
             targets.append(UploadTarget(path, None))
-            used_names.add(requested_name)
+            used_names.add(server_file_name(requested_name))
             continue
         if resolution == "skip":
             continue
@@ -159,7 +185,7 @@ def resolve_upload_targets(
             raise ValueError(f"不支持的上传冲突策略：{resolution}")
         upload_name = next_available_name(requested_name, used_names)
         targets.append(UploadTarget(path, upload_name))
-        used_names.add(upload_name)
+        used_names.add(server_file_name(upload_name))
     return tuple(targets)
 
 

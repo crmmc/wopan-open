@@ -106,6 +106,7 @@ from openwopan.tasks.upload import (
     resolve_upload_targets,
     scan_folder_tree,
     scan_upload_inputs,
+    server_file_name,
 )
 from openwopan.ui.formatting import format_bytes as _format_bytes
 from openwopan.ui.formatting import format_items_summary as _format_items_summary
@@ -5149,8 +5150,12 @@ class MainWindow(_MainWindowBase):
                     merge=resolution == "merge",
                 )
             else:
-                if resolution == "merge" and target.local_path.name in existing_names:
+                if resolution == "merge" and (
+                    target.local_path.name in existing_names
+                    or server_file_name(target.local_path.name) in existing_names
+                ):
                     # 合并模式：同名顶层文件已存在，跳过（不创建任务）。
+                    # 名字按服务端存储形态匹配，长名文件上传后被截断存储。
                     continue
                 self.upload_file_to_current_directory(
                     target.local_path,

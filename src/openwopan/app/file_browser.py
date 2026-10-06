@@ -40,6 +40,7 @@ from openwopan.tasks.upload import (
     make_upload_task_id,
     next_available_name,
     scan_folder_tree,
+    server_file_name,
 )
 from openwopan.wopan.client import (
     ORIGIN,
@@ -227,6 +228,19 @@ class FileBrowserBackend(Protocol):
 
     def empty_recycle_bin(self) -> None:
         """Permanently delete every recycle-bin entry."""
+
+
+def _merge_existing_item(items: dict[str, WopanItem], name: str) -> WopanItem | None:
+    """Find a cloud sibling by local name, tolerating server truncation."""
+    exact = items.get(name)
+    if exact is not None:
+        return exact
+    return items.get(server_file_name(name))
+
+
+def _server_name_taken(taken: set[str], name: str) -> bool:
+    """Whether ``name`` collides with taken cloud names, truncation-aware."""
+    return name in taken or server_file_name(name) in taken
 
 
 class FileBrowserService:
@@ -588,7 +602,7 @@ class FileBrowserService:
         if upload_name is not None:
             if not upload_name:
                 raise FileBrowserError("上传文件名称不能为空")
-            if upload_name in self._existing_names(parent_id):
+            if _server_name_taken(self._existing_names(parent_id), upload_name):
                 raise FileBrowserError("上传目标已存在，请刷新后重试")
         if cancel_requested is not None and cancel_requested():
             raise FileBrowserUploadCancelledError("上传已取消")
@@ -1028,13 +1042,13 @@ class FileBrowserService:
             requested_root = root_name if root_name is not None else plan.root_name
             if not requested_root:
                 raise FileBrowserError("上传文件夹名称不能为空")
-            root_existing = existing_root_items.get(requested_root)
+            root_existing = _merge_existing_item(existing_root_items, requested_root)
             if merge and root_existing is not None and root_existing.kind is WopanItemKind.FOLDER:
                 # 合并模式：同名根目录已存在则直接复用，缺的文件补传。
                 resolved_root_name = requested_root
                 root_item = root_existing
             else:
-                if root_name is not None and root_name in existing_root_names and not merge:
+                if root_name is not None and _server_name_taken(existing_root_names, root_name) and not merge:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 resolved_root_name = (
                     root_name
@@ -1064,19 +1078,23 @@ class FileBrowserService:
                     raise FileBrowserUploadCancelledError("上传已取消")
                 rel_parent, _, local_name = rel_path.rpartition("/")
                 parent_names = taken_names(rel_parent)
-                existing = cloud_items_for(rel_parent).get(local_name) if merge else None
+                existing = (
+                    _merge_existing_item(cloud_items_for(rel_parent), local_name)
+                    if merge
+                    else None
+                )
                 if merge and existing is not None and existing.kind is WopanItemKind.FOLDER:
                     # 合并模式：同名子目录复用，不再创建副本。
-                    parent_names.add(local_name)
+                    parent_names.add(server_file_name(local_name))
                     dir_ids[rel_path] = existing.item_id
                     continue
-                if root_name is not None and local_name in parent_names and not merge:
+                if root_name is not None and _server_name_taken(parent_names, local_name) and not merge:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 folder_name = next_available_name(local_name, parent_names)
                 if cancel_requested is not None and cancel_requested():
                     raise FileBrowserUploadCancelledError("上传已取消")
                 created = self.create_folder(dir_ids[rel_parent], folder_name)
-                parent_names.add(folder_name)
+                parent_names.add(server_file_name(folder_name))
                 dir_ids[rel_path] = created.item_id
 
             planned_files: list[PlannedUploadFile] = []
@@ -1085,7 +1103,9 @@ class FileBrowserService:
                     raise FileBrowserUploadCancelledError("上传已取消")
                 names = taken_names(planned.rel_dir)
                 existing = (
-                    cloud_items_for(planned.rel_dir).get(planned.name) if merge else None
+                    _merge_existing_item(cloud_items_for(planned.rel_dir), planned.name)
+                    if merge
+                    else None
                 )
                 if (
                     merge
@@ -1093,13 +1113,14 @@ class FileBrowserService:
                     and existing.kind is WopanItemKind.FILE
                     and existing.size == planned.size
                 ):
-                    # 合并模式：同名同大小视为已上传完成，跳过。
-                    names.add(planned.name)
+                    # 合并模式：同名同大小视为已上传完成，跳过（名字按服务端
+                    # 存储形态匹配，长名文件上传后被截断存储，仍能识别为已存在）。
+                    names.add(server_file_name(planned.name))
                     continue
-                if root_name is not None and planned.name in names and not merge:
+                if root_name is not None and _server_name_taken(names, planned.name) and not merge:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 upload_name = next_available_name(planned.name, names)
-                names.add(upload_name)
+                names.add(server_file_name(upload_name))
                 planned_files.append(
                     PlannedUploadFile(
                         local_path=planned.local_path,
@@ -1158,7 +1179,7 @@ class FileBrowserService:
         """
         plan = scan_folder_tree(local_root)
         requested_root = root_name if root_name is not None else plan.root_name
-        root_existing = self._existing_items(parent_id).get(requested_root)
+        root_existing = _merge_existing_item(self._existing_items(parent_id), requested_root)
         if root_existing is None or root_existing.kind is not WopanItemKind.FOLDER:
             return MergeUploadEstimate(files_to_upload=len(plan.files), files_skipped=0)
 
@@ -1177,7 +1198,9 @@ class FileBrowserService:
         for rel_path in plan.folders:  # 父目录先于子目录（scan 保证）
             rel_parent, _, local_name = rel_path.rpartition("/")
             items = items_for(rel_parent)
-            existing = items.get(local_name) if items is not None else None
+            existing = (
+                _merge_existing_item(items, local_name) if items is not None else None
+            )
             if existing is not None and existing.kind is WopanItemKind.FOLDER:
                 dir_ids[rel_path] = existing.item_id
             else:
@@ -1187,7 +1210,9 @@ class FileBrowserService:
         files_skipped = 0
         for planned in plan.files:
             items = items_for(planned.rel_dir)
-            existing = items.get(planned.name) if items is not None else None
+            existing = (
+                _merge_existing_item(items, planned.name) if items is not None else None
+            )
             if (
                 existing is not None
                 and existing.kind is WopanItemKind.FILE
