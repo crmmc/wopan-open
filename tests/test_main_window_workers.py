@@ -1319,6 +1319,61 @@ def test_close_window_abandons_live_upload_workers(
     )
 
 
+def test_close_window_does_not_finish_folder_batch_midway(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """关闭途中不收尾批次：closeEvent 清空注册表后收尾门全空，会把仍在
+    暂停中的批次误判为完成（根行写成误导性汇总、销毁途中再起刷新线程）。
+
+    回归：真实会话中 94 文件批次暂停 64 个后关闭，根行被写成
+    「失败：成功 28 个，失败 2 个」。
+    """
+    window = MainWindow(WorkerFileBrowser())
+    root = tmp_path / "batch"
+    root.mkdir()
+    child = root / "ep01.mkv"
+    child.write_bytes(b"x")
+    root_id = window._create_upload_record(root)
+    child_id = window._create_upload_record(child, parent_id="cloud-1", retryable=True)
+    window._folder_upload_record_id = root_id
+    window._folder_upload_child_ids = {child_id}
+    window._folder_children_registered = True
+    window._folder_upload_failure_count = 2
+    window._paused_uploads[child_id] = PendingUploadTask(
+        "cloud-1", child, child_id, child.name, False
+    )
+    window.transfer_interface.update_record("upload", child_id, status="已暂停")
+    window.transfer_interface.update_record("upload", root_id, status="上传中")
+
+    window.closeEvent(QCloseEvent())
+    # 关闭途中 worker 退出会触发收尾门与收尾本体：都应被 _closing 拦截。
+    window._maybe_finish_folder_upload()
+    window._finish_folder_upload()
+
+    root_record = window.transfer_interface._find_record("upload", root_id)
+    assert root_record is not None and root_record.status == "已取消"
+    child_record = window.transfer_interface._find_record("upload", child_id)
+    assert child_record is not None and child_record.status == "已暂停"
+
+
+def test_closing_window_does_not_backfill_upload_queue(qapp: QApplication, tmp_path: Path) -> None:
+    """关闭途中不回填上传队列：abandon 退出的 worker 触发回填会在销毁途中
+    启动新上传线程（不在 join 名单里，退出时被销毁仍在运行）。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_path = tmp_path / "next.txt"
+    local_path.write_bytes(b"x")
+    window._upload_pending = [
+        PendingUploadTask("cloud-1", local_path, "upload-next", "next.txt", False)
+    ]
+    window._closing = True
+
+    window._start_next_upload_task()
+
+    assert [item.task_id for item in window._upload_pending] == ["upload-next"]
+    assert window._upload_threads == {}
+    window._closing = False
+
+
 def test_upload_worker_abandon_exits_paused_upload_without_cancel_event(
     qapp: QApplication, tmp_path: Path
 ) -> None:

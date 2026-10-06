@@ -5366,6 +5366,12 @@ class MainWindow(_MainWindowBase):
 
     def _maybe_finish_folder_upload(self) -> None:
         """Finish the folder batch once every child left the unified pipeline."""
+        if self._closing:
+            # 关闭途中不收尾批次：closeEvent 已清空 worker/pending/paused
+            # 注册表，此刻的门永远「全空」，会把还在暂停中的批次误判为
+            # 完成——根行写成误导性汇总、且在销毁途中再起刷新线程
+            # （QThread destroyed while running 的来源）。批次随进程消亡。
+            return
         if self._folder_upload_record_id is None or not self._folder_children_registered:
             # prepare 未完成（子任务未登记，含空集）时不能据此收尾批次。
             return
@@ -5379,6 +5385,10 @@ class MainWindow(_MainWindowBase):
         self._finish_folder_upload()
 
     def _finish_folder_upload(self) -> None:
+        if self._closing:
+            # 与 _maybe_finish_folder_upload 同因：关闭途中不收尾、不写汇总、
+            # 不起收尾刷新线程。
+            return
         success_count = self._folder_upload_success_count
         failure_count = self._folder_upload_failure_count
         cancel_count = self._folder_upload_cancel_count
@@ -5938,6 +5948,11 @@ class MainWindow(_MainWindowBase):
         thread.start()
 
     def _start_next_upload_task(self) -> None:
+        if self._closing:
+            # 关闭途中不回填：abandon 退出的 worker 触发本函数会在销毁途中
+            # 启动新上传线程（不在 closeEvent 的 join 名单里，进程退出时
+            # 被销毁还在运行）。
+            return
         while self._upload_pending:
             active_count = len(self._upload_threads)
             if active_count == 0 and self._upload_thread is not None:
