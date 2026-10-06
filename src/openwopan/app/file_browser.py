@@ -657,8 +657,19 @@ class FileBrowserService:
                 resume=resume,
             )
         except FileBrowserUploadCancelledError:
+            # 「暂停中关闭」的退出不丢会话：cancel 回调携带 preserve_session
+            # 标志（见 UploadWorker.request_abandon），分片留给下次启动续传，
+            # 会话状态归一为「已暂停」（was_active=False，重启后手动继续）；
+            # 普通用户取消仍删除会话。
             if store is not None:
-                store.delete(upload_task_id)
+                if getattr(cancel_requested, "preserve_session", False):
+                    try:
+                        store.update(upload_task_id, _mark_upload_interrupted)
+                    except KeyError:
+                        # 会话已被并发清理（保留期清理竞态）：无可保留内容。
+                        pass
+                else:
+                    store.delete(upload_task_id)
             raise
         except Exception as exc:
             if store is not None and self._should_restart_rejected_session(
@@ -882,7 +893,13 @@ class FileBrowserService:
                 resume=resume,
             )
         except FileBrowserUploadCancelledError:
-            store.delete(task_id)
+            if getattr(cancel_requested, "preserve_session", False):
+                try:
+                    store.update(task_id, _mark_upload_interrupted)
+                except KeyError:
+                    pass
+            else:
+                store.delete(task_id)
             raise
         except Exception as exc:
             message = str(exc)

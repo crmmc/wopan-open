@@ -1609,6 +1609,40 @@ def test_service_upload_retry_reuses_session_and_skips_completed_parts(
     assert _state(store, task_id) is None
 
 
+def test_service_upload_cancel_preserves_session_when_abandon_flagged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """关闭退出的取消（cancel 回调带 preserve_session）保留会话分片；
+    普通用户取消仍删除会话。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1"), (2, "fid-2")]
+    client.upload_failure = WopanUploadCancelledError("client cancelled")
+    local_path = _three_part_file(tmp_path)
+
+    def abandon_cancel() -> bool:
+        return False
+
+    abandon_cancel.preserve_session = True  # type: ignore[attr-defined]
+
+    with pytest.raises(FileBrowserUploadCancelledError):
+        service.upload_file("folder-1", local_path, cancel_requested=abandon_cancel)
+
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    state = _state(store, task_id)
+    assert state is not None
+    assert state.completed_indexes == [1, 2]
+    # 关闭退出 ≠ 取消：会话归一为「已暂停（中断）」而非删除，重启后
+    # was_active=False，由用户手动继续而非自动续传。
+    assert state.status == "已暂停"
+    assert "应用中断" in state.error and "2/3" in state.error
+
+    with pytest.raises(FileBrowserUploadCancelledError):
+        service.upload_file("folder-1", local_path, cancel_requested=lambda: False)
+
+    assert _state(store, task_id) is None
+
+
 def test_service_upload_restarts_fresh_when_session_rejected_with_5xx(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

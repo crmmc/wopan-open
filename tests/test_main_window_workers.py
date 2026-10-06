@@ -29,7 +29,11 @@ from PySide6.QtWidgets import (
 )
 
 import openwopan.ui.main_window as main_window_module
-from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError
+from openwopan.app.file_browser import (
+    FileBrowserError,
+    FileBrowserLoginRequiredError,
+    FileBrowserUploadCancelledError,
+)
 from openwopan.app.transfer_history import TransferHistoryAdapter
 from openwopan.storage.settings import AppSettings
 from openwopan.storage.transfer_records import TransferRecordStore
@@ -42,6 +46,7 @@ from openwopan.tasks.upload import (
     UploadTaskRecord,
     UploadTaskState,
     UploadTaskStore,
+    make_upload_task_id,
     scan_folder_tree,
 )
 from openwopan.ui.main_window import (
@@ -1204,9 +1209,11 @@ def test_close_window_joins_every_task_keyed_upload_thread(qapp: QApplication) -
     assert second.wait_timeouts == [main_window_module.THREAD_JOIN_TIMEOUT_MS]
 
 
-def test_close_window_cancels_waiting_folder_records(
+def test_close_window_cancels_batch_rows_but_preserves_waiting_tasks(
     qapp: QApplication, tmp_path: Path
 ) -> None:
+    """关闭时批次调度消亡：汇总/准备中的文件夹行落已取消；等待中的子文件
+    行保持原状态落盘，重启后由历史加载归一为「已暂停」并可手动继续。"""
     window = MainWindow(WorkerFileBrowser())
     root = tmp_path / "active"
     waiting = tmp_path / "waiting"
@@ -1231,9 +1238,10 @@ def test_close_window_cancels_waiting_folder_records(
 
     window.closeEvent(QCloseEvent())
 
-    assert [window.transfer_interface._find_record("upload", task_id).status for task_id in (
-        root_id, next_id, waiting_id
-    )] == ["已取消", "已取消", "已取消"]
+    assert [
+        window.transfer_interface._find_record("upload", task_id).status
+        for task_id in (root_id, next_id, waiting_id)
+    ] == ["已取消", "等待中", "已取消"]
     assert window._upload_pending == []
     assert window._folder_prepare_pending == []
     assert window.transfer_interface._find_record("upload", child_id).status == "上传中"
@@ -1242,22 +1250,229 @@ def test_close_window_cancels_waiting_folder_records(
     assert window.transfer_interface._find_record("upload", root_id).status == "已取消"
 
 
-def test_close_window_cancels_paused_upload_records(
+def test_close_window_preserves_paused_upload_records(
     qapp: QApplication, tmp_path: Path
 ) -> None:
+    """用户暂停的任务关闭时保持「已暂停」：重启后可手动继续断点续传，
+    而不是被收尾清扫改写成终态「已取消」（恢复侧本就保留已暂停）。"""
     window = MainWindow(WorkerFileBrowser())
     local_path = tmp_path / "paused.txt"
     task_id = window._create_upload_record(local_path)
     window._paused_uploads[task_id] = PendingUploadTask(
         ROOT_DIRECTORY_ID, local_path, task_id, local_path.name, False
     )
-    window.transfer_interface.update_record("upload", task_id, status="已暂停")
+    window.transfer_interface.update_record(
+        "upload", task_id, status="已暂停", can_resume=True
+    )
 
     window.closeEvent(QCloseEvent())
 
     record = window.transfer_interface._find_record("upload", task_id)
-    assert record is not None and record.status == "已取消"
+    assert record is not None and record.status == "已暂停" and record.can_resume
     assert window._paused_uploads == {}
+
+
+def test_close_window_abandons_live_upload_workers(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """关闭 ≠ 取消：暂停中与正在上传的存活 worker 都走 abandon（会话标记
+    「已暂停（中断）」保留分片），行保持原状态供下次启动断点续传。"""
+    window = MainWindow(WorkerFileBrowser())
+    paused_path = tmp_path / "paused-upload.txt"
+    active_path = tmp_path / "active-upload.txt"
+    paused_id = window._create_upload_record(paused_path)
+    active_id = window._create_upload_record(active_path)
+    cancelled: list[str] = []
+    abandoned: list[str] = []
+
+    class _StubWorker:
+        def __init__(self, task_id: str) -> None:
+            self._task_id = task_id
+
+        def request_cancel(self) -> None:
+            cancelled.append(self._task_id)
+
+        def request_abandon(self) -> None:
+            abandoned.append(self._task_id)
+
+    window._upload_workers[paused_id] = _StubWorker(paused_id)  # type: ignore[assignment]
+    window._upload_threads[paused_id] = _RefusingThread()  # type: ignore[assignment]
+    window._upload_workers[active_id] = _StubWorker(active_id)  # type: ignore[assignment]
+    window._upload_threads[active_id] = _RefusingThread()  # type: ignore[assignment]
+    window._paused_uploads[paused_id] = PendingUploadTask(
+        ROOT_DIRECTORY_ID, paused_path, paused_id, paused_path.name, False
+    )
+    window.transfer_interface.update_record(
+        "upload", paused_id, status="已暂停", can_resume=True
+    )
+    window.transfer_interface.update_record("upload", active_id, status="上传中")
+
+    window.closeEvent(QCloseEvent())
+
+    assert sorted(abandoned) == sorted([active_id, paused_id])
+    assert cancelled == []
+    assert (
+        window.transfer_interface._find_record("upload", paused_id).status == "已暂停"
+    )
+    assert (
+        window.transfer_interface._find_record("upload", active_id).status == "上传中"
+    )
+
+
+def test_upload_worker_abandon_exits_paused_upload_without_cancel_event(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """worker 级：暂停阻塞中的 upload_file 被 abandon 解除后以取消异常退出，
+    但不发出 cancelled 事件，且 cancel 回调带上 preserve_session 标志。"""
+
+    class _PollingBrowser:
+        def __init__(self) -> None:
+            self.cancel_callbacks: list[object] = []
+            self.poll_count = 0
+
+        def upload_file(
+            self,
+            parent_id: str,
+            local_path: Path,
+            *,
+            upload_name: str | None = None,
+            progress_callback: object = None,
+            cancel_requested: object = None,
+        ) -> WopanItem:
+            self.cancel_callbacks.append(cancel_requested)
+            assert callable(cancel_requested)
+            while True:
+                self.poll_count += 1
+                if cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
+                time.sleep(0.005)
+
+    browser = _PollingBrowser()
+    worker = main_window_module.UploadWorker(browser, "cloud-1", tmp_path / "f.bin", "t1")
+    events: list[tuple[str, str]] = []
+    worker.cancelled.connect(lambda task_id: events.append(("cancelled", task_id)))
+    worker.failed.connect(lambda message, task_id: events.append(("failed", task_id)))
+    worker.succeeded.connect(lambda item, task_id: events.append(("succeeded", task_id)))
+
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(qapp, lambda: browser.poll_count >= 1)
+        worker.request_pause()
+        # 轮询每 5ms 一次；计数停止增长即已阻塞在暂停检查点上。
+        paused = False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            snapshot = browser.poll_count
+            time.sleep(0.15)
+            if browser.poll_count == snapshot:
+                paused = True
+                break
+        assert paused
+        worker.request_abandon()
+        thread.join(timeout=3000)
+    finally:
+        worker.request_abandon()  # 兜底解除可能的阻塞
+        thread.join(timeout=3000)
+
+    assert not thread.is_alive()
+    assert events == []
+    assert browser.cancel_callbacks[0].preserve_session is True  # type: ignore[attr-defined]
+
+
+def test_upload_worker_abandon_suppresses_error_event_race(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """关闭 abandon 与网络错误的竞态：FileBrowserError 也不发 failed/
+    cancelled——会话已由服务层按 preserve 语义标记，行保持原状态。"""
+
+    class _FailingBrowser:
+        def upload_file(
+            self,
+            parent_id: str,
+            local_path: Path,
+            *,
+            upload_name: str | None = None,
+            progress_callback: object = None,
+            cancel_requested: object = None,
+        ) -> WopanItem:
+            assert callable(cancel_requested)
+            while not cancel_requested():
+                time.sleep(0.005)
+            raise FileBrowserError("网络异常")
+
+    worker = main_window_module.UploadWorker(
+        _FailingBrowser(), "cloud-1", tmp_path / "f.bin", "t1"
+    )
+    events: list[tuple[str, str]] = []
+    worker.cancelled.connect(lambda task_id: events.append(("cancelled", task_id)))
+    worker.failed.connect(lambda message, task_id: events.append(("failed", task_id)))
+    worker.succeeded.connect(lambda item, task_id: events.append(("succeeded", task_id)))
+
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not any(
+            cb is not None for cb in (worker._cancel_hook,)
+        ):
+            time.sleep(0.005)
+        worker.request_abandon()
+        thread.join(timeout=3000)
+    finally:
+        worker.request_abandon()
+        thread.join(timeout=3000)
+
+    assert not thread.is_alive()
+    assert events == []
+
+
+def test_upload_worker_abandon_suppresses_login_required_race(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """关闭 abandon 与登录过期的竞态：不发 login_required——行保持原状态，
+    重启后续传时服务层会再次报登录过期。"""
+
+    class _LoginExpiredBrowser:
+        def upload_file(
+            self,
+            parent_id: str,
+            local_path: Path,
+            *,
+            upload_name: str | None = None,
+            progress_callback: object = None,
+            cancel_requested: object = None,
+        ) -> WopanItem:
+            assert callable(cancel_requested)
+            while not cancel_requested():
+                time.sleep(0.005)
+            raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    worker = main_window_module.UploadWorker(
+        _LoginExpiredBrowser(), "cloud-1", tmp_path / "f.bin", "t1"
+    )
+    login_events: list[str] = []
+    worker.login_required.connect(
+        lambda message, task_id: login_events.append(message)
+    )
+    cancelled: list[str] = []
+    worker.cancelled.connect(cancelled.append)
+
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and worker._cancel_hook is None:
+            time.sleep(0.005)
+        worker.request_abandon()
+        thread.join(timeout=3000)
+    finally:
+        worker.request_abandon()
+        thread.join(timeout=3000)
+
+    assert not thread.is_alive()
+    assert login_events == []
+    assert cancelled == []
 
 
 def test_close_window_closes_scheduler_without_waiting_on_gui_thread(
@@ -3941,6 +4156,139 @@ def test_history_ghost_row_dropped_when_session_row_already_present(
     ]
     assert len(rows) == 1 and rows[0].task_id == "hash1"
     assert "upload-9" not in {r.task_id for r in window.transfer_interface.upload_records}
+
+
+def test_history_failed_row_folded_when_failed_session_row_already_present(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """失败会话行先到时（装载顺序不定），同文件的失败历史行折叠进会话行，
+    不产生第二行失败；错误去重拼接。
+
+    回归：Trinity_14 在会话恢复先到时出现「upload-39 + 哈希 id」双失败行，
+    根因是 _find_upload_row_by_target 只匹配非终态行。
+    """
+    window = MainWindow(WorkerFileBrowser())
+    local_path = tmp_path / "ep14.mkv"
+    local_path.write_bytes(b"x" * 10)
+    session = UploadTaskRecord(
+        task_id="hash14",
+        name="ep14.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="失败",
+        completed_parts=40,
+        total_parts=41,
+        file_size=10,
+        upload_name="ep14.mkv",
+        error="HTTP 500",
+        resumable=True,
+    )
+    window._on_upload_recovery_succeeded((session,))
+
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-39",
+                direction="upload",
+                name="ep14.mkv",
+                size=10,
+                target_path=local_path,
+                status="失败",
+                error="HTTP 500",
+                upload_parent_id="cloud-1",
+                upload_name="ep14.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+
+    rows = [
+        r
+        for r in window.transfer_interface.upload_records
+        if r.target_path == local_path
+    ]
+    assert len(rows) == 1 and rows[0].task_id == "hash14"
+    assert rows[0].status == "失败" and rows[0].error == "HTTP 500"
+    assert "upload-39" not in {r.task_id for r in window.transfer_interface.upload_records}
+
+
+def test_history_download_rows_normalized_when_recovery_failed(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """离线启动（下载恢复已失败）后到达的历史下载行：非终态归一为
+    可恢复的「已暂停」，与 _on_download_recovery_failed 顺序无关。"""
+    window = MainWindow(WorkerFileBrowser())
+    window._download_recovery_failed = True
+
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="download-3",
+                direction="download",
+                name="a.bin",
+                size=10,
+                target_path=tmp_path / "a.bin",
+                status="下载中",
+            ),
+            TransferRecord(
+                task_id="download-4",
+                direction="download",
+                name="b.bin",
+                size=10,
+                target_path=tmp_path / "b.bin",
+                status="已完成",
+            ),
+        )
+    )
+
+    live = window.transfer_interface._find_record("download", "download-3")
+    assert live is not None and live.status == "已暂停" and live.can_resume
+    assert "恢复下载任务失败" in live.error
+    done = window.transfer_interface._find_record("download", "download-4")
+    assert done is not None and done.status == "已完成"
+
+
+def test_relogin_resets_download_recovery_guard(
+    qapp: QApplication, sync_threads: None
+) -> None:
+    """重新登录（更换 backend）重置下载恢复守卫：新调度器不认识旧持久化
+    任务，必须重跑恢复，否则暂停/继续/取消全部 KeyError 直到重启。"""
+    window = MainWindow(WorkerFileBrowser())
+    window._download_recovery_done = True
+    same_browser = WorkerFileBrowser()
+    window._file_browser = same_browser
+
+    window.set_file_browser(same_browser)
+    window.set_file_browser(same_browser)
+    assert window._download_recovery_done is True
+
+    window.set_file_browser(WorkerFileBrowser())
+    assert window._download_recovery_done is False
+
+
+def test_download_recovery_reruns_when_relogin_beats_inflight_thread(
+    qapp: QApplication, sync_threads: None
+) -> None:
+    """恢复线程飞行途中重新登录（守卫已重置、旧线程刚收尾）：补跑恢复，
+    让新调度器认领持久化任务；关闭途中不补跑。"""
+
+    class RecoverDownloadsBrowser(WorkerFileBrowser):
+        def recover_downloads(self) -> tuple[object, ...]:
+            return ()
+
+    window = MainWindow(RecoverDownloadsBrowser())
+    window._download_recovery_done = False  # set_file_browser 重置过
+
+    window._clear_download_recovery()
+
+    assert window._download_recovery_done is True
+    assert window._download_recovery_thread is None
+
+    window._download_recovery_done = False
+    window._closing = True
+    window._clear_download_recovery()
+    assert window._download_recovery_done is False
+    window._closing = False
 
 
 def test_active_upload_session_auto_resumes_after_restart(
@@ -8367,7 +8715,11 @@ def test_resume_recovered_paused_row_without_target_info_notifies(
 def test_remove_recovered_paused_upload_row_discards_session(
     qapp: QApplication, sync_threads: None
 ) -> None:
-    """B5 回归：删除重启恢复的「已暂停」行直接移除并丢弃会话（防复活）。"""
+    """B5 回归：删除重启恢复的「已暂停」行直接移除并丢弃会话（防复活）。
+
+    恢复行的 task_id 即会话 id，但同样按 (parent, path, name) 派生一次——
+    两个 id 都丢弃，覆盖「行 id 与会话 id 分属两套体系」的来源。
+    """
     discarded: list[list[str]] = []
 
     class DiscardBrowser(WorkerFileBrowser):
@@ -8376,12 +8728,47 @@ def test_remove_recovered_paused_upload_row_discards_session(
 
     browser = DiscardBrowser()
     window = MainWindow(browser)
-    window._on_upload_recovery_succeeded((_upload_recovery_record("upload-9"),))
+    record = _upload_recovery_record("upload-9")
+    window._on_upload_recovery_succeeded((record,))
 
     window._remove_transfer_records("upload", {"upload-9"})
 
     assert window.transfer_interface._find_record("upload", "upload-9") is None
-    assert discarded == [["upload-9"]]
+    derived = make_upload_task_id(
+        "0", Path("/tmp/upload-9.bin"), "persisted.bin"
+    )
+    assert discarded == [["upload-9", derived]]
+
+
+def test_remove_failed_upload_row_discards_derived_session(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """失败行按重试语义保留会话；删除该行 = 放弃任务，须丢弃按
+    (parent, path, name) 派生的会话 id，否则 recover_uploads 每次
+    重启都为已删除任务重建一行（复活循环）。
+
+    回归：Trinity_14 删除失败行后重启仍复活。
+    """
+    discarded: list[list[str]] = []
+
+    class DiscardBrowser(WorkerFileBrowser):
+        def discard_upload_sessions(self, task_ids: Sequence[str]) -> None:
+            discarded.append(list(task_ids))
+
+    window = MainWindow(DiscardBrowser())
+    local_path = tmp_path / "ep14.mkv"
+    task_id = window._create_upload_record(
+        local_path, parent_id="cloud-1", upload_name="ep14.mkv", retryable=True
+    )
+    window.transfer_interface.update_record(
+        "upload", task_id, status="失败", error="HTTP 500"
+    )
+
+    window._remove_transfer_records("upload", {task_id})
+
+    assert window.transfer_interface._find_record("upload", task_id) is None
+    derived = make_upload_task_id("cloud-1", local_path, "ep14.mkv")
+    assert discarded == [[task_id, derived]]
 
 
 # ---------------------------------------------------------------------------

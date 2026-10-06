@@ -101,6 +101,7 @@ from openwopan.tasks.upload import (
     UploadTaskRecord,
     find_upload_conflicts,
     format_upload_summary,
+    make_upload_task_id,
     resolve_upload_targets,
     scan_upload_inputs,
 )
@@ -130,6 +131,16 @@ from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, Wo
 
 MAIN_WINDOW_DEFAULT_SIZE = (900, 600)
 MAIN_WINDOW_MINIMUM_SIZE = (800, 600)
+
+
+def _join_distinct_errors(*errors: str | None) -> str:
+    """Merge error texts from rows describing the same upload (dedup, keep order)."""
+    joined: list[str] = []
+    for error in errors:
+        text = (error or "").strip()
+        if text and text not in joined:
+            joined.append(text)
+    return "；".join(joined)
 FILE_SPLITTER_STRETCH_FACTORS = (1, 6)
 ROOT_DISPLAY_NAME = "/"
 TRANSFER_TABLE_HEADERS = ("名称", "大小", "进度", "速度", "状态", "操作")
@@ -632,7 +643,9 @@ class UploadWorker(QObject):
         self._cancel_requested = threading.Event()
         self._pause_requested = threading.Event()
         self._resume_requested = threading.Event()
+        self._abandon_requested = threading.Event()
         self._resume_requested.set()
+        self._cancel_hook: Callable[[], bool] | None = None
 
     def request_pause(self) -> None:
         """Pause after the current upload request reaches a safe check."""
@@ -648,6 +661,20 @@ class UploadWorker(QObject):
         self._cancel_requested.set()
         self._resume_requested.set()
 
+    def request_abandon(self) -> None:
+        """Stop a paused upload at application close, keeping its session.
+
+        Unlike cancel, the persisted session (completed parts) is preserved
+        and no terminal event is emitted: the row keeps its「已暂停」status
+        so the next start resumes from the stored parts.
+        """
+        self._abandon_requested.set()
+        self._cancel_requested.set()
+        self._resume_requested.set()
+        hook = self._cancel_hook
+        if hook is not None:
+            hook.preserve_session = True
+
     def _upload_stop_requested(self) -> bool:
         while self._pause_requested.is_set() and not self._cancel_requested.is_set():
             self._resume_requested.wait()
@@ -657,8 +684,19 @@ class UploadWorker(QObject):
         self._upload_stop_requested()
         self.progress.emit(bytes_done, total_bytes, self._task_id)
 
+    def _make_cancel_hook(self) -> Callable[[], bool]:
+        # 独立函数对象而非绑定方法：request_abandon 通过 preserve_session
+        # 属性告知服务层「关闭退出，保留会话分片」（绑定方法无法挂属性）。
+        def cancel_requested() -> bool:
+            return self._upload_stop_requested()
+
+        cancel_requested.preserve_session = False  # type: ignore[attr-defined]
+        return cancel_requested
+
     def run(self) -> None:
         """Run the blocking upload in a worker thread."""
+        cancel_hook = self._make_cancel_hook()
+        self._cancel_hook = cancel_hook
         try:
             if self._upload_stop_requested():
                 raise FileBrowserUploadCancelledError("上传已取消")
@@ -673,7 +711,7 @@ class UploadWorker(QObject):
                             self._parent_id,
                             self._local_path,
                             progress_callback=progress_callback,
-                            cancel_requested=self._upload_stop_requested,
+                            cancel_requested=cancel_hook,
                         )
                     else:
                         item = self._file_browser.upload_file(
@@ -681,7 +719,7 @@ class UploadWorker(QObject):
                             self._local_path,
                             upload_name=self._upload_name,
                             progress_callback=progress_callback,
-                            cancel_requested=self._upload_stop_requested,
+                            cancel_requested=cancel_hook,
                         )
                 except TypeError as exc:
                     if "unexpected keyword argument 'cancel_requested'" not in str(exc):
@@ -709,16 +747,29 @@ class UploadWorker(QObject):
             if self._upload_stop_requested():
                 raise FileBrowserUploadCancelledError("上传已取消")
         except FileBrowserUploadCancelledError:
+            if self._abandon_requested.is_set():
+                # 关闭退出：保留已暂停状态与持久化会话，不发终态事件。
+                return
             self.cancelled.emit(self._task_id)
         except FileBrowserLoginRequiredError as exc:
+            if self._abandon_requested.is_set():
+                # 关闭退出与登录过期的竞态：行保持原状态（重启后续传时
+                # 服务层会再次报登录过期），不在关闭途中改写状态。
+                return
             self.login_required.emit(str(exc), self._task_id)
         except FileBrowserError as exc:
+            if self._abandon_requested.is_set():
+                # 关闭退出与网络错误的竞态：会话已由服务层按 preserve 语义
+                # 标记（失败时保留分片），行保持原状态，不发终态事件。
+                return
             if self._upload_stop_requested():
                 self.cancelled.emit(self._task_id)
             else:
                 self.failed.emit(str(exc), self._task_id)
         except Exception as exc:
             LOGGER.exception("main_window.upload.unexpected_error")
+            if self._abandon_requested.is_set():
+                return
             self.failed.emit(str(exc), self._task_id)
         else:
             self.succeeded.emit(item, self._task_id)
@@ -2891,6 +2942,7 @@ class MainWindow(_MainWindowBase):
         self._download_reserved_targets: set[Path] = set()
         self._download_recovery_thread: QThread | None = None
         self._download_recovery_done = False
+        self._download_recovery_failed = False
         self._upload_recovery_thread: QThread | None = None
         self._upload_recovery_worker: BrowserOperationWorker | None = None
         self._upload_recovery_done = False
@@ -3032,20 +3084,16 @@ class MainWindow(_MainWindowBase):
                 self.transfer_interface.update_record(
                     "upload", folder_pending.record_id, status="已取消"
                 )
-            for paused_task_id in self._paused_uploads:
-                self.transfer_interface.update_record(
-                    "upload", paused_task_id, status="已取消"
-                )
-            self._paused_uploads.clear()
             self._folder_prepare_pending.clear()
             if self._folder_upload_record_id is not None:
+                # 批次调度随进程消亡，汇总行落终态；其子文件行与独立任务的
+                # 「已暂停/等待中」保持原状态落盘——重启后由历史加载归一为
+                # 「已暂停」并可手动继续，服务层按持久化会话断点续传。
                 self.transfer_interface.update_record(
                     "upload", self._folder_upload_record_id, status="已取消"
                 )
-            for pending in self._upload_pending:
-                self.transfer_interface.update_record(
-                    "upload", pending.task_id, status="已取消"
-                )
+            # 只清内存结构不写状态：关闭不应把用户暂停/排队的任务变成已取消。
+            self._paused_uploads.clear()
             self._upload_pending.clear()
         thread_entries: list[tuple[QThread | None, str, str | None]] = [
             (self._directory_thread, "directory", None),
@@ -3095,7 +3143,10 @@ class MainWindow(_MainWindowBase):
                 task_id = upload_task_id
                 worker = self._upload_workers.get(task_id) if task_id is not None else None
                 if worker is not None:
-                    worker.request_cancel()
+                    # 关闭 ≠ 取消：存活的上传 worker 一律 abandon 退出——
+                    # 会话标记「已暂停（中断）」保留分片，行保持原状态，
+                    # 下次启动手动继续断点续传（与下载侧关闭即暂停对齐）。
+                    worker.request_abandon()
             else:
                 task_id = None
             thread.quit()
@@ -3264,6 +3315,11 @@ class MainWindow(_MainWindowBase):
                     close_downloads(wait=False)
                 except Exception:  # pragma: no cover - docs/testing-exemptions.md
                     LOGGER.exception("main_window.set_file_browser.close_old_failed")
+            # 下载恢复是按 backend 一次性守卫的：新调度器不认识旧持久化
+            # 任务，不重跑恢复会让暂停/继续/取消全部 KeyError，直到重启。
+            # （上传恢复仍一次性：行未离开表格，重跑只会重复建行。）
+            self._download_recovery_done = False
+            self._download_recovery_failed = False
         self._file_browser = file_browser
         set_callback = getattr(file_browser, "set_download_event_callback", None)
         if callable(set_callback):
@@ -3341,6 +3397,31 @@ class MainWindow(_MainWindowBase):
                         record.task_id,
                     )
                     continue
+                if record.status == "失败":
+                    failed_row = self._find_failed_upload_row_by_target(
+                        record.target_path, record.upload_parent_id, record.upload_name
+                    )
+                    if failed_row is not None:
+                        # 失败会话行先到时 _find_upload_row_by_target 匹配不上
+                        # （只查非终态）：同一文件的失败历史行折叠其错误信息
+                        # 进会话行后删除，避免同一文件出现两行失败——与
+                        # _add_persisted_upload_record 的失败折叠互为镜像。
+                        self.transfer_interface.update_record(
+                            "upload",
+                            failed_row.task_id,
+                            error=_join_distinct_errors(failed_row.error, record.error),
+                        )
+                        if self._transfer_history is not None:
+                            self._transfer_history.delete_records(
+                                "upload", [record.task_id]
+                            )
+                        LOGGER.info(
+                            "main_window.transfer_history.failed_ghost_folded "
+                            "task_id=%s into=%s",
+                            record.task_id,
+                            failed_row.task_id,
+                        )
+                        continue
                 if record.status not in TERMINAL_TRANSFER_STATUSES:
                     # 上传侧没有调度器认领恢复行：非终态历史行重启后没有
                     # 任何执行体，原样恢复会显示成僵尸「上传中/等待中」。
@@ -3354,6 +3435,17 @@ class MainWindow(_MainWindowBase):
                     self.transfer_interface._save_record(record)
                 uploads.append(record)
             else:
+                if (
+                    self._download_recovery_failed
+                    and record.status not in TERMINAL_TRANSFER_STATUSES
+                ):
+                    # 下载恢复已失败（如离线启动）而后到达的历史行：调度器
+                    # 不会认领它们，与 _on_download_recovery_failed 同法归一
+                    # 为可恢复的暂停态，避免僵尸「下载中」。
+                    record.status = "已暂停"
+                    record.can_resume = True
+                    record.error = "恢复下载任务失败：调度器不可用"
+                    self.transfer_interface._save_record(record)
                 downloads.append(record)
         for record in uploads:
             self.transfer_interface.add_upload_record(record, render=False, persist=False)
@@ -6474,12 +6566,35 @@ class MainWindow(_MainWindowBase):
             self._download_items_by_task.pop(task_id, None)
             self._download_controls.pop(task_id, None)
 
+    def _discard_upload_sessions_for_record(self, record: TransferRecord) -> None:
+        """删除上传行时丢弃其持久化会话，避免下次重启复活已删除的任务。
+
+        会话 id 由 (parent, 本地路径, upload_name) 哈希派生，与本会话行的
+        顺序 id（upload-N）不同；两个 id 都尝试丢弃，覆盖「失败行保留会话」
+        与「恢复行即会话行」两种来源（已完成/已取消行的会话本就不存在，
+        丢弃为无害空操作）。
+        """
+        discard_sessions = getattr(self._file_browser, "discard_upload_sessions", None)
+        if not callable(discard_sessions):
+            return
+        task_ids = [record.task_id]
+        if record.target_path is not None and record.upload_parent_id:
+            task_ids.append(
+                make_upload_task_id(
+                    record.upload_parent_id, record.target_path, record.upload_name
+                )
+            )
+        discard_sessions(task_ids)
+
     def _remove_upload_task(self, task_id: str) -> None:
         record = self.transfer_interface._find_record("upload", task_id)
         if record is None or task_id in self._upload_removal_requested:
             return
         if record.status in TERMINAL_TRANSFER_STATUSES:
+            # 失败行按重试语义保留会话；用户删除行即放弃任务，须一并丢弃，
+            # 否则 recover_uploads 每次重启都会为它重建一行（复活循环）。
             self._paused_uploads.pop(task_id, None)
+            self._discard_upload_sessions_for_record(record)
             self.transfer_interface.remove_records("upload", {task_id})
             return
         if task_id == self._folder_upload_record_id:
@@ -6495,6 +6610,7 @@ class MainWindow(_MainWindowBase):
                 return
             if task_id in self._folder_upload_child_ids:
                 self._folder_upload_cancel_count += 1
+            self._discard_upload_sessions_for_record(record)
             self.transfer_interface.remove_records("upload", {task_id})
             self._maybe_finish_folder_upload()
             return
@@ -6513,6 +6629,7 @@ class MainWindow(_MainWindowBase):
                     # 失败后重试又被删除：回滚失败计数，避免双重计数
                     self._folder_upload_failed_ids.remove(task_id)
                     self._folder_upload_failure_count -= 1
+            self._discard_upload_sessions_for_record(record)
             self.transfer_interface.remove_records("upload", {task_id})
             self._maybe_finish_folder_upload()
             self._start_next_pending_folder()
@@ -6525,9 +6642,7 @@ class MainWindow(_MainWindowBase):
             return
         # 重启恢复的非终态行（如「已暂停」）：本会话没有存活 worker/队列，
         # 无需等待退出，直接移除；同时丢弃其持久化会话，避免下次重启复活。
-        discard_sessions = getattr(self._file_browser, "discard_upload_sessions", None)
-        if callable(discard_sessions):
-            discard_sessions([task_id])
+        self._discard_upload_sessions_for_record(record)
         self.transfer_interface.remove_records("upload", {task_id})
 
     def _cancel_folder_upload(self) -> None:
@@ -6553,6 +6668,12 @@ class MainWindow(_MainWindowBase):
             pending for pending in self._upload_pending if pending.task_id not in child_ids
         ]
         if pending_ids:
+            # 无 worker 的子行（排队/暂停/失败）直接移除；失败子行同样按
+            # 「放弃任务」丢弃其保留会话，避免重启复活。
+            for child_id in pending_ids:
+                child_record = self.transfer_interface._find_record("upload", child_id)
+                if child_record is not None:
+                    self._discard_upload_sessions_for_record(child_record)
             self.transfer_interface.remove_records("upload", pending_ids)
         self._set_status("正在停止文件夹上传；已创建的云端内容不会自动删除")
         if self._folder_prepare_thread is None and not any(
@@ -6709,7 +6830,10 @@ class MainWindow(_MainWindowBase):
         self._set_status(f"恢复下载任务失败：{message}")
         # 调度器缺席时历史里的非终态下载行没有任何执行体（上传侧在历史
         # 加载时归一）；不归一会保留僵尸「下载中」，且暂停会触发调度器
-        # KeyError 弹费解错误。统一标注为可恢复的暂停态。
+        # KeyError 弹费解错误。统一标注为可恢复的暂停态。历史加载与本
+        # 恢复是两个并发装载器：此处只归一已到达的行，随后到达的行由
+        # _on_transfer_history_loaded 按本标志补归一（顺序无关）。
+        self._download_recovery_failed = True
         with self.transfer_interface.batch_updates():
             for record in list(self.transfer_interface.download_records):
                 if record.status not in TERMINAL_TRANSFER_STATUSES:
@@ -6725,6 +6849,10 @@ class MainWindow(_MainWindowBase):
         self._delete_finished_thread()
         self._download_recovery_thread = None
         self._download_recovery_worker = None
+        if not self._download_recovery_done and not self._closing:
+            # 恢复线程飞行途中更换了 backend（重新登录）：守卫标志已被
+            # set_file_browser 重置，此处补跑一次让新调度器认领持久化任务。
+            self._recover_downloads()
 
     def _recover_uploads(self) -> None:
         if (
@@ -6847,7 +6975,7 @@ class MainWindow(_MainWindowBase):
             self.transfer_interface.update_record(
                 "upload",
                 failed_row.task_id,
-                error=f"{failed_row.error}；{session_error}".strip("；"),
+                error=_join_distinct_errors(failed_row.error, session_error),
             )
             return None
         record = TransferRecord(
