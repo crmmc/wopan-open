@@ -966,6 +966,7 @@ class FileBrowserService:
         *,
         root_name: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        merge: bool = False,
     ) -> FolderUploadJob:
         """Create the cloud directory tree for a local folder upload.
 
@@ -974,6 +975,11 @@ class FileBrowserService:
         and returns the per-file upload plan. On any failure the whole
         preparation fails without partial results; directories already
         created stay on the cloud (no rollback).
+
+        ``merge`` continues into an existing tree instead of duplicating it:
+        same-name directories (root included) are reused, and same-name
+        same-size files are treated as already uploaded and skipped; only
+        the missing files are planned.
         """
         if not parent_id:
             raise FileBrowserError("目标文件夹不能为空")
@@ -999,24 +1005,40 @@ class FileBrowserService:
         try:
             if cancel_requested is not None and cancel_requested():
                 raise FileBrowserUploadCancelledError("上传已取消")
-            existing_root_names = self._existing_names(parent_id)
-            if root_name is None:
-                resolved_root_name = next_available_name(plan.root_name, existing_root_names)
+            existing_root_items = self._existing_items(parent_id)
+            existing_root_names = set(existing_root_items)
+            requested_root = root_name if root_name is not None else plan.root_name
+            if not requested_root:
+                raise FileBrowserError("上传文件夹名称不能为空")
+            root_existing = existing_root_items.get(requested_root)
+            if merge and root_existing is not None and root_existing.kind is WopanItemKind.FOLDER:
+                # 合并模式：同名根目录已存在则直接复用，缺的文件补传。
+                resolved_root_name = requested_root
+                root_item = root_existing
             else:
-                if not root_name:
-                    raise FileBrowserError("上传文件夹名称不能为空")
-                if root_name in existing_root_names:
+                if root_name is not None and root_name in existing_root_names and not merge:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
-                resolved_root_name = root_name
-            if cancel_requested is not None and cancel_requested():
-                raise FileBrowserUploadCancelledError("上传已取消")
-            root_item = self.create_folder(parent_id, resolved_root_name)
+                resolved_root_name = (
+                    root_name
+                    if root_name is not None
+                    else next_available_name(plan.root_name, existing_root_names)
+                )
+                if cancel_requested is not None and cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
+                root_item = self.create_folder(parent_id, resolved_root_name)
             dir_ids = {"": root_item.item_id}
             used_names: dict[str, set[str]] = {}
+            cloud_items: dict[str, dict[str, WopanItem]] = {}
+
+            def cloud_items_for(rel_dir: str) -> dict[str, WopanItem]:
+                """One listing per directory serves both name-dedup and merge."""
+                if rel_dir not in cloud_items:
+                    cloud_items[rel_dir] = self._existing_items(dir_ids[rel_dir])
+                return cloud_items[rel_dir]
 
             def taken_names(rel_dir: str) -> set[str]:
                 if rel_dir not in used_names:
-                    used_names[rel_dir] = self._existing_names(dir_ids[rel_dir])
+                    used_names[rel_dir] = set(cloud_items_for(rel_dir))
                 return used_names[rel_dir]
 
             for rel_path in plan.folders:
@@ -1024,7 +1046,13 @@ class FileBrowserService:
                     raise FileBrowserUploadCancelledError("上传已取消")
                 rel_parent, _, local_name = rel_path.rpartition("/")
                 parent_names = taken_names(rel_parent)
-                if root_name is not None and local_name in parent_names:
+                existing = cloud_items_for(rel_parent).get(local_name) if merge else None
+                if merge and existing is not None and existing.kind is WopanItemKind.FOLDER:
+                    # 合并模式：同名子目录复用，不再创建副本。
+                    parent_names.add(local_name)
+                    dir_ids[rel_path] = existing.item_id
+                    continue
+                if root_name is not None and local_name in parent_names and not merge:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 folder_name = next_available_name(local_name, parent_names)
                 if cancel_requested is not None and cancel_requested():
@@ -1038,7 +1066,19 @@ class FileBrowserService:
                 if cancel_requested is not None and cancel_requested():
                     raise FileBrowserUploadCancelledError("上传已取消")
                 names = taken_names(planned.rel_dir)
-                if root_name is not None and planned.name in names:
+                existing = (
+                    cloud_items_for(planned.rel_dir).get(planned.name) if merge else None
+                )
+                if (
+                    merge
+                    and existing is not None
+                    and existing.kind is WopanItemKind.FILE
+                    and existing.size == planned.size
+                ):
+                    # 合并模式：同名同大小视为已上传完成，跳过。
+                    names.add(planned.name)
+                    continue
+                if root_name is not None and planned.name in names and not merge:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 upload_name = next_available_name(planned.name, names)
                 names.add(upload_name)
@@ -1081,6 +1121,10 @@ class FileBrowserService:
 
     def _existing_names(self, directory_id: str) -> set[str]:
         return {item.name for item in self.list_directory(directory_id)}
+
+    def _existing_items(self, directory_id: str) -> dict[str, WopanItem]:
+        """Map one cloud directory's entries by name (merge-mode lookups)."""
+        return {item.name: item for item in self.list_directory(directory_id)}
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""

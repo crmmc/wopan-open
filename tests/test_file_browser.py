@@ -1068,6 +1068,102 @@ def _make_local_tree(tmp_path: Path) -> Path:
     return root
 
 
+class _MergeCloudClient(FakeClient):
+    """Cloud double whose listings carry folders and sized files (merge tests)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entries: dict[str, list[WopanItem]] = {}
+        self.created: list[tuple[str, str]] = []
+
+    def list_files(self, parent_id: str) -> list[WopanItem]:
+        return list(self.entries.get(parent_id, []))
+
+    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+        self.created.append((parent_id, name))
+        item = WopanItem(
+            item_id=f"new-dir-{len(self.created)}",
+            name=name,
+            kind=WopanItemKind.FOLDER,
+            parent_id=parent_id,
+        )
+        self.entries.setdefault(parent_id, []).append(item)
+        return item
+
+
+def test_prepare_folder_upload_merge_reuses_dirs_and_skips_completed_files(
+    tmp_path: Path,
+) -> None:
+    """合并模式：同名根/子目录复用不重建，同名同大小文件跳过，只补缺失。"""
+    client = _MergeCloudClient()
+    cloud_root = WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
+    cloud_s1 = WopanItem(
+        item_id="cloud-s1", name="season1", kind=WopanItemKind.FOLDER, parent_id="cloud-photos"
+    )
+    cloud_s2 = WopanItem(
+        item_id="cloud-s2", name="season2", kind=WopanItemKind.FOLDER, parent_id="cloud-photos"
+    )
+    done_ep1 = WopanItem(
+        item_id="f1",
+        name="ep1.mkv",
+        kind=WopanItemKind.FILE,
+        parent_id="cloud-s1",
+        size=100,
+        download_id="fid-1",
+    )
+    different_ep3 = WopanItem(
+        item_id="f2",
+        name="ep3.mkv",
+        kind=WopanItemKind.FILE,
+        parent_id="cloud-s1",
+        size=999,
+        download_id="fid-2",
+    )
+    client.entries["0"] = [cloud_root]
+    client.entries["cloud-photos"] = [cloud_s1, cloud_s2]
+    client.entries["cloud-s1"] = [done_ep1, different_ep3]
+
+    local_root = tmp_path / "photos"
+    (local_root / "season1").mkdir(parents=True)
+    (local_root / "season2").mkdir()
+    (local_root / "season3").mkdir()
+    (local_root / "season1" / "ep1.mkv").write_bytes(b"a" * 100)
+    (local_root / "season1" / "ep2.mkv").write_bytes(b"b" * 200)
+    (local_root / "season1" / "ep3.mkv").write_bytes(b"c" * 300)
+    (local_root / "season2" / "new.mkv").write_bytes(b"d" * 50)
+    (local_root / "season3" / "x.mkv").write_bytes(b"e" * 10)
+
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+
+    assert job.root_item_id == "cloud-photos"  # 根目录复用
+    # 只新建了缺失的 season3；photos/season1/season2 都未重建
+    assert client.created == [("cloud-photos", "season3")]
+
+    planned = {(f.target_dir_id, f.name): f.size for f in job.files}
+    assert ("cloud-s1", "ep2.mkv") in planned  # 缺失文件补传
+    assert ("cloud-s2", "new.mkv") in planned  # 上传进复用目录
+    assert any(dir_id.startswith("new-dir-") and name == "x.mkv" for (dir_id, name) in planned)
+    assert all(name != "ep1.mkv" for (_dir_id, name) in planned)  # 同名同大小跳过
+    # 同名不同大小 → 副本名补传
+    assert any(name.startswith("ep3") and "copy" in name for (_dir_id, name) in planned)
+
+
+def test_prepare_folder_upload_without_merge_rejects_existing_root(tmp_path: Path) -> None:
+    """非合并模式保持原语义：根目录同名直接报错。"""
+    client = _MergeCloudClient()
+    client.entries["0"] = [
+        WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
+    ]
+    local_root = tmp_path / "photos"
+    local_root.mkdir()
+    (local_root / "a.mkv").write_bytes(b"x")
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserError, match="上传目标已存在"):
+        service.prepare_folder_upload("0", local_root, root_name="photos")
+
+
 def test_prepare_folder_upload_stops_between_cloud_creates(tmp_path: Path) -> None:
     client = FolderUploadFakeClient()
     service = FileBrowserService(client)  # type: ignore[arg-type]

@@ -289,6 +289,7 @@ class WorkerFileBrowser:
         *,
         root_name: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        merge: bool = False,
     ) -> FolderUploadJob:
         self.prepared_uploads.append((parent_id, local_root))
         self.prepared_upload_names.append(root_name)
@@ -4265,6 +4266,90 @@ def test_download_recovery_replays_pending_events(qapp: QApplication) -> None:
     assert "dl-1" not in window._pending_download_events
 
 
+def test_resolve_upload_paths_merge_threads_merge_and_skips_conflicting_files(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """合并策略：文件夹以 merge=True 续传，同名顶层文件跳过不建任务。"""
+    window = MainWindow(WorkerFileBrowser())
+    folder = tmp_path / "已看完"
+    folder.mkdir()
+    (folder / "a.mkv").write_bytes(b"x")
+    same_file = tmp_path / "same.txt"
+    same_file.write_bytes(b"y")
+    folder_calls: list[dict[str, object]] = []
+    file_calls: list[Path] = []
+    monkeypatch.setattr(
+        window,
+        "upload_folder_to_current_directory",
+        lambda path, **kwargs: folder_calls.append({"path": path, **kwargs}),
+    )
+    monkeypatch.setattr(
+        window,
+        "upload_file_to_current_directory",
+        lambda path, **kwargs: file_calls.append(path),
+    )
+
+    window._resolve_upload_paths(
+        (folder, same_file),
+        {"已看完", "same.txt"},
+        parent_id="0",
+        run_in_background=True,
+        resolution="merge",
+    )
+
+    assert len(folder_calls) == 1
+    assert folder_calls[0]["path"] == folder
+    assert folder_calls[0]["merge"] is True
+    assert file_calls == []  # 同名顶层文件跳过
+
+
+def test_upload_summary_dialog_merge_resolution(qapp: QApplication, tmp_path: Path) -> None:
+    """确认对话框提供「合并」第三选项并正确返回策略。"""
+    from openwopan.tasks.upload import UploadBatchSummary, UploadSummaryEntry
+
+    folder = tmp_path / "已看完"
+    folder.mkdir()
+    summary = UploadBatchSummary(
+        top_paths=(folder,),
+        file_count=1,
+        folder_count=1,
+        total_bytes=1,
+        preview=(UploadSummaryEntry(folder, "已看完", "文件夹", 0),),
+        omitted_count=0,
+    )
+    dialog = UploadSummaryDialog(summary, "目标目录", None, conflicts=(folder,))
+    assert dialog._merge_conflicts_button is not None
+    dialog._merge_conflicts_button.setChecked(True)
+    assert dialog.resolution() == "merge"
+    dialog._skip_conflicts_button.setChecked(True)
+    assert dialog.resolution() == "skip"
+
+
+def test_remove_records_writes_audit_log(
+    qapp: QApplication, caplog: pytest.LogCaptureFixture
+) -> None:
+    """删除审计：所有删除入口留痕（方向/数量/样本 id）。"""
+    import logging as _logging
+
+    transfer = TransferInterface()
+    transfer.add_upload_record(
+        TransferRecord(
+            task_id="upload-1",
+            direction="upload",
+            name="a.mkv",
+            size=1,
+            target_path=Path("/tmp/a.mkv"),
+            status="已完成",
+        ),
+        render=False,
+        persist=False,
+    )
+    with caplog.at_level(_logging.INFO, logger="openwopan.ui.main_window"):
+        transfer.remove_records("upload", {"upload-1"})
+    assert "transfer.records.remove" in caplog.text
+    assert "count=1" in caplog.text
+
+
 def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6886,6 +6971,7 @@ def test_folder_upload_starts_next_pending_folder_after_queue_finishes(
                 "_conflict_checked": True,
                 "_parent_id": "pinned-second",
                 "_record_id": "second-task",
+                "merge": False,
             },
         )
     ]
@@ -6952,15 +7038,23 @@ def test_folder_prepare_login_failure_runs_next_independent_folder(
     attempts = 0
 
     def prepare_once_failed(
-        parent_id: str, root: Path, *, root_name: str | None = None,
+        parent_id: str,
+        root: Path,
+        *,
+        root_name: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        merge: bool = False,
     ) -> FolderUploadJob:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
         return prepare(
-            parent_id, root, root_name=root_name, cancel_requested=cancel_requested
+            parent_id,
+            root,
+            root_name=root_name,
+            cancel_requested=cancel_requested,
+            merge=merge,
         )
 
     monkeypatch.setattr(browser, "prepare_folder_upload", prepare_once_failed)
@@ -7498,7 +7592,7 @@ def test_upload_summary_dialog_keeps_labels_compact_when_enlarged(qapp: QApplica
     assert preview is not None and buttons is not None
     assert len(dialog.findChildren(QListWidget)) == 1
     assert dialog.findChildren(QCheckBox) == []
-    assert len(choices) == 2
+    assert len(choices) == 3  # 跳过 / 合并 / 保留副本
     assert "1 个同名" in " ".join(label.text() for label in labels)
     assert preview.item(0).text().startswith("（重复）conflict.txt")
     assert preview.isVisibleTo(dialog) and preview.height() > 200

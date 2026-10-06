@@ -20,7 +20,7 @@ from openwopan.storage.settings import APP_AUTHOR, APP_NAME
 LOGGER = logging.getLogger(__name__)
 
 JUNK_FILE_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
-UploadConflictResolution = Literal["skip", "copy"]
+UploadConflictResolution = Literal["skip", "copy", "merge"]
 UPLOAD_SESSION_MAX_AGE_SECONDS = 24 * 3600
 
 
@@ -123,7 +123,13 @@ def resolve_upload_targets(
     existing_names: set[str],
     resolution: UploadConflictResolution,
 ) -> tuple[UploadTarget, ...]:
-    """Resolve a batch by skipping conflicts or assigning unique copy names."""
+    """Resolve a batch by skipping/copying conflicts, or merging into existing.
+
+    ``merge`` keeps the original name for conflicts so folders can continue
+    uploading into the existing cloud directory (``prepare_folder_upload``
+    reuses directories and skips same-name files); conflicting top-level
+    files are dropped by the caller, which knows path kinds.
+    """
     used_names = set(existing_names)
     targets: list[UploadTarget] = []
     for path in paths:
@@ -133,6 +139,9 @@ def resolve_upload_targets(
             used_names.add(requested_name)
             continue
         if resolution == "skip":
+            continue
+        if resolution == "merge":
+            targets.append(UploadTarget(path, None))
             continue
         if resolution != "copy":
             raise ValueError(f"不支持的上传冲突策略：{resolution}")

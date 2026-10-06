@@ -191,6 +191,24 @@ def test_resolve_upload_targets_appends_copy_for_repeated_conflicts(tmp_path: Pa
     ]
 
 
+def test_resolve_upload_targets_merge_keeps_original_names(tmp_path: Path) -> None:
+    """合并策略：冲突项保留原名（文件夹据此续传合并），不再改副本名。"""
+    folder = tmp_path / "已看完"
+    folder.mkdir()
+    conflicting_file = _write(tmp_path / "same.txt", b"one")
+    fresh_file = _write(tmp_path / "new.txt", b"two")
+
+    targets = resolve_upload_targets(
+        (folder, conflicting_file, fresh_file), {"已看完", "same.txt"}, "merge"
+    )
+
+    assert [(target.local_path, target.upload_name) for target in targets] == [
+        (folder, None),
+        (conflicting_file, None),
+        (fresh_file, None),
+    ]
+
+
 def test_resolve_upload_targets_rejects_unknown_resolution(tmp_path: Path) -> None:
     path = _write(tmp_path / "report.txt")
 

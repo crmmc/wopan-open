@@ -420,6 +420,7 @@ class UploadSummaryDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._skip_conflicts_button: QRadioButton | None = None
+        self._merge_conflicts_button: QRadioButton | None = None
         self.setWindowTitle("确认上传")
         self.resize(640, 420)
         layout = QVBoxLayout(self)
@@ -442,9 +443,12 @@ class UploadSummaryDialog(QDialog):
             layout.addWidget(BodyLabel(f"发现 {len(conflicts)} 个同名项目", self))
             skip_button = QRadioButton("跳过冲突", self)
             self._skip_conflicts_button = skip_button
+            merge_button = QRadioButton("合并（跳过已存在的文件，补传缺失文件）", self)
+            self._merge_conflicts_button = merge_button
             copy_button = QRadioButton("保留副本", self)
             skip_button.setChecked(True)
             layout.addWidget(skip_button)
+            layout.addWidget(merge_button)
             layout.addWidget(copy_button)
             decision_label = BodyLabel("", self)
             layout.addWidget(decision_label)
@@ -458,15 +462,31 @@ class UploadSummaryDialog(QDialog):
         if conflicts:
             confirm_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
 
-            def update_choice(skip: bool) -> None:
-                count = len(summary.top_paths) - len(conflicts) if skip else len(summary.top_paths)
-                decision_label.setText(f"将添加 {count} 个上传任务")
-                confirm_button.setEnabled(count > 0)
+            def update_choice() -> None:
+                resolution = self.resolution()
+                if resolution == "skip":
+                    count = len(summary.top_paths) - len(conflicts)
+                    decision_label.setText(f"将添加 {count} 个上传任务")
+                    confirm_button.setEnabled(count > 0)
+                elif resolution == "merge":
+                    decision_label.setText(
+                        "同名文件夹将合并续传：只补传缺失文件，已存在的同名文件跳过"
+                    )
+                    confirm_button.setEnabled(True)
+                else:
+                    decision_label.setText(
+                        f"将添加 {len(summary.top_paths)} 个上传任务（同名的按副本重命名）"
+                    )
+                    confirm_button.setEnabled(True)
 
-            skip_button.toggled.connect(update_choice)
-            update_choice(True)
+            skip_button.toggled.connect(lambda _checked: update_choice())
+            merge_button.toggled.connect(lambda _checked: update_choice())
+            update_choice()
 
     def resolution(self) -> UploadConflictResolution:
+        merge_button = getattr(self, "_merge_conflicts_button", None)
+        if merge_button is not None and merge_button.isChecked():
+            return "merge"
         if self._skip_conflicts_button is not None and self._skip_conflicts_button.isChecked():
             return "skip"
         return "copy"
@@ -877,6 +897,7 @@ class PendingFolderUpload:
     parent_id: str
     root_name: str | None
     record_id: str
+    merge: bool = False
 
 
 class TransferInterface(QWidget):
@@ -1198,6 +1219,15 @@ class TransferInterface(QWidget):
 
     def remove_records(self, direction: str, task_ids: set[str]) -> None:
         """Remove task rows by id."""
+        if task_ids:
+            # 审计日志：历史上传输列表曾出现整表行无端消失且无法溯源，
+            # 所有删除入口现在都留痕（方向/数量/样本 id）。
+            LOGGER.info(
+                "transfer.records.remove direction=%s count=%s ids_sample=%s",
+                direction,
+                len(task_ids),
+                sorted(task_ids)[:5],
+            )
         if direction == "upload":
             self.upload_records = [
                 record for record in self.upload_records if record.task_id not in task_ids
@@ -1761,6 +1791,15 @@ class TransferInterface(QWidget):
                 parent=self,
             )
             return
+        if len(task_ids) > 5:
+            # 批量删除确认：一次误操作不应静默清空整个传输列表。
+            confirm = MessageBox(
+                "确认删除",
+                f"将删除 {len(task_ids)} 条传输记录，删除后无法恢复。确定继续吗？",
+                self,
+            )
+            if not confirm.exec():
+                return
         self._request_delete_ids(direction, task_ids)
 
     def _request_delete_ids(self, direction: str, task_ids: set[str]) -> None:
@@ -4858,7 +4897,9 @@ class MainWindow(_MainWindowBase):
             return
         targets = resolve_upload_targets(paths, existing_names, resolution)
         skipped_count = len(paths) - len(targets)
-        if skipped_count:
+        if resolution == "merge":
+            self._set_status("合并上传：同名文件夹续传，已存在的同名文件将跳过")
+        elif skipped_count:
             self._set_status(f"已跳过 {skipped_count} 个冲突项目，已添加 {len(targets)} 个上传任务")
         else:
             self._set_status(f"已添加 {len(targets)} 个上传任务")
@@ -4873,8 +4914,12 @@ class MainWindow(_MainWindowBase):
                     ),
                     _parent_id=parent_id,
                     _conflict_checked=True,
+                    merge=resolution == "merge",
                 )
             else:
+                if resolution == "merge" and target.local_path.name in existing_names:
+                    # 合并模式：同名顶层文件已存在，跳过（不创建任务）。
+                    continue
                 self.upload_file_to_current_directory(
                     target.local_path,
                     run_in_background=run_in_background,
@@ -4972,6 +5017,7 @@ class MainWindow(_MainWindowBase):
         _conflict_checked: bool = False,
         _parent_id: str | None = None,
         _record_id: str | None = None,
+        merge: bool = False,
     ) -> None:
         """Upload one local folder tree to the current directory (two phases)."""
         if self._file_browser is None:
@@ -5002,6 +5048,7 @@ class MainWindow(_MainWindowBase):
                     ),
                     root_name=root_name,
                     record_id=record_id,
+                    merge=merge,
                 )
             )
             self._set_status(f"已添加「{local_root.name}」上传任务")
@@ -5009,9 +5056,10 @@ class MainWindow(_MainWindowBase):
 
         parent_id = _parent_id if _parent_id is not None else self.current_directory_id()
         LOGGER.info(
-            "main_window.folder_upload.prepare.start parent_id=%s root_name_length=%s",
+            "main_window.folder_upload.prepare.start parent_id=%s root_name_length=%s merge=%s",
             parent_id,
             len(local_root.name),
+            merge,
         )
         if _record_id is None:
             record_id = self._create_upload_record(
@@ -5030,7 +5078,10 @@ class MainWindow(_MainWindowBase):
 
             def operation() -> FolderUploadJob:
                 return file_browser.prepare_folder_upload(
-                    parent_id, local_root, cancel_requested=prepare_cancel.is_set
+                    parent_id,
+                    local_root,
+                    cancel_requested=prepare_cancel.is_set,
+                    merge=merge,
                 )
         else:
             resolved_root_name = root_name
@@ -5041,6 +5092,7 @@ class MainWindow(_MainWindowBase):
                     local_root,
                     root_name=resolved_root_name,
                     cancel_requested=prepare_cancel.is_set,
+                    merge=merge,
                 )
 
         worker = BrowserOperationWorker(operation)
@@ -5149,6 +5201,7 @@ class MainWindow(_MainWindowBase):
             _conflict_checked=True,
             _parent_id=pending.parent_id,
             _record_id=pending.record_id,
+            merge=pending.merge,
         )
 
     def _take_pending_folder(self) -> PendingFolderUpload:
