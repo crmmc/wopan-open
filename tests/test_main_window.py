@@ -394,12 +394,13 @@ def test_transfer_interface_matches_sibling_layout_invariants(qapp: QApplication
     assert transfer.top_bar_frame.objectName() == "frame"
     assert transfer.title_label.text() == "传输管理"
     assert transfer._active_direction == "download"
+    # 过滤键在 itemData 里：显示文本带实时计数（"全部 (0)"），不能当键比较。
     assert tuple(
-        transfer.upload_filter_combo.itemText(index)
+        transfer.upload_filter_combo.itemData(index)
         for index in range(len(UPLOAD_STATUS_FILTERS))
     ) == UPLOAD_STATUS_FILTERS
     assert tuple(
-        transfer.download_filter_combo.itemText(index)
+        transfer.download_filter_combo.itemData(index)
         for index in range(len(DOWNLOAD_STATUS_FILTERS))
     ) == DOWNLOAD_STATUS_FILTERS
     assert transfer.upload_frame.isHidden()
@@ -990,7 +991,9 @@ def test_transfer_filter_change_clears_stale_selection(qapp: QApplication) -> No
     # Filtering to another status shrinks the visible set; the selected row
     # number stays in range and would otherwise silently repoint at the
     # never-selected "上传中" record.
-    interface._on_upload_filter_changed("上传中")
+    interface.upload_filter_combo.setCurrentIndex(
+        UPLOAD_STATUS_FILTERS.index("进行中")
+    )
 
     assert [record.name for record in interface._filtered_upload_records()] == ["active.txt"]
     assert table.selectionModel().selectedRows() == []
@@ -2106,13 +2109,98 @@ def test_transfer_status_filter_and_sort_stacked(qapp: QApplication) -> None:
         _upload_record("t-3", "big-done.txt", size=1_000_000, status="已完成")
     )
 
-    transfer.upload_filter_combo.setCurrentText("已完成")
+    transfer.upload_filter_combo.setCurrentIndex(
+        UPLOAD_STATUS_FILTERS.index("已完成")
+    )
     transfer._on_table_header_clicked("upload", TRANSFER_COL_SIZE)
     transfer._on_table_header_clicked("upload", TRANSFER_COL_SIZE)  # descending
 
     assert _transfer_row_names(transfer, transfer.upload_table) == [
         "big-done.txt",
         "small-done.txt",
+    ]
+
+
+def test_transfer_status_filter_in_progress_aggregates_pipeline_statuses(
+    qapp: QApplication,
+) -> None:
+    """「进行中」聚合管线阶段（等待中/上传中/创建目录中），qB 风格：
+    过滤项只暴露用户心智状态；细粒度状态仍在表格状态列。"""
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-1", "queued.txt", status="等待中"))
+    transfer.add_upload_record(_upload_record("t-2", "active.txt", status="上传中"))
+    transfer.add_upload_record(
+        _upload_record("t-3", "preparing.txt", status="创建目录中")
+    )
+    transfer.add_upload_record(_upload_record("t-4", "done.txt", status="已完成"))
+
+    transfer.upload_filter_combo.setCurrentIndex(
+        UPLOAD_STATUS_FILTERS.index("进行中")
+    )
+
+    assert _transfer_row_names(transfer, transfer.upload_table) == [
+        "queued.txt",
+        "active.txt",
+        "preparing.txt",
+    ]
+
+
+def test_transfer_filter_counts_refresh_on_status_change(qapp: QApplication) -> None:
+    """下拉项带实时计数（"失败 (1)"），状态变化后随渲染刷新；
+    计数文本变化不触发过滤重入（过滤键走 itemData）。"""
+    transfer = TransferInterface()
+    transfer.add_upload_record(_upload_record("t-1", "active.txt", status="上传中"))
+    transfer.add_upload_record(_upload_record("t-2", "done.txt", status="已完成"))
+
+    def combo_texts() -> dict[str, str]:
+        combo = transfer.upload_filter_combo
+        return {
+            combo.itemData(index): combo.itemText(index)
+            for index in range(combo.count())
+        }
+
+    texts = combo_texts()
+    assert texts["全部"] == "全部 (2)"
+    assert texts["进行中"] == "进行中 (1)"
+    assert texts["已完成"] == "已完成 (1)"
+    assert texts["失败"] == "失败 (0)"
+    assert transfer.upload_status_filter == "全部"
+
+    transfer.update_record("upload", "t-1", status="失败", error="HTTP 500")
+    texts = combo_texts()
+    assert texts["进行中"] == "进行中 (0)"
+    assert texts["失败"] == "失败 (1)"
+    assert texts["已完成"] == "已完成 (1)"
+    # 计数刷新（setItemText）不改变当前选中过滤
+    assert transfer.upload_status_filter == "全部"
+
+
+def test_transfer_download_filter_in_progress_aggregates_pipeline_statuses(
+    qapp: QApplication,
+) -> None:
+    """下载侧「进行中」聚合 等待中/校验中/下载中/合并中。"""
+    transfer = TransferInterface()
+    transfer.add_download_record(
+        _upload_record("d-1", "queued.bin", direction="download", status="等待中")
+    )
+    transfer.add_download_record(
+        _upload_record("d-2", "active.bin", direction="download", status="下载中")
+    )
+    transfer.add_download_record(
+        _upload_record("d-3", "merging.bin", direction="download", status="合并中")
+    )
+    transfer.add_download_record(
+        _upload_record("d-4", "done.bin", direction="download", status="已完成")
+    )
+
+    transfer.download_filter_combo.setCurrentIndex(
+        DOWNLOAD_STATUS_FILTERS.index("进行中")
+    )
+
+    assert _transfer_row_names(transfer, transfer.download_table) == [
+        "queued.bin",
+        "active.bin",
+        "merging.bin",
     ]
 
 

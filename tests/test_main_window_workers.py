@@ -3595,12 +3595,16 @@ def test_transfer_filters_narrow_visible_records(qapp: QApplication) -> None:
     transfer.add_download_record(_make_record("d-2", status="失败"))
     transfer.add_download_record(_make_record("d-3", status="下载中"))
 
-    transfer._on_download_filter_changed("已完成")
+    transfer.download_filter_combo.setCurrentIndex(
+        main_window_module.DOWNLOAD_STATUS_FILTERS.index("已完成")
+    )
 
     assert transfer.download_table.rowCount() == 1
     assert transfer.download_table.item(0, 0).text() == "d-1.txt"
 
-    transfer._on_upload_filter_changed("失败")
+    transfer.upload_filter_combo.setCurrentIndex(
+        main_window_module.UPLOAD_STATUS_FILTERS.index("失败")
+    )
     assert transfer.upload_table.rowCount() == 0
 
 

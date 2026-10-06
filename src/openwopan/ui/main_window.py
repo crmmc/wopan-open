@@ -178,11 +178,13 @@ FILE_TYPE_FILTERS = (FILE_TYPE_FILTER_ALL, FILE_TYPE_FILTER_FOLDERS, FILE_TYPE_F
 THREAD_JOIN_TIMEOUT_MS = 3000
 # B24：已访问目录 LRU 缓存上限（目录数）；写操作成功后整体失效。
 DIRECTORY_CACHE_MAX_ENTRIES = 128
+# 过滤项对齐 qBittorrent 的状态栏设计：只暴露用户心智状态，内部管线
+# 阶段（等待中/上传中/创建目录中/校验中/合并中）聚合为「进行中」，
+# 细粒度状态仍显示在表格状态列。选中值经 itemData 传递——显示文本
+# 带实时计数（"失败 (1)"），不能直接当过滤键比较。
 UPLOAD_STATUS_FILTERS = (
     "全部",
-    "等待中",
-    "上传中",
-    "创建目录中",
+    "进行中",
     "已暂停",
     "已完成",
     "失败",
@@ -190,15 +192,13 @@ UPLOAD_STATUS_FILTERS = (
 )
 DOWNLOAD_STATUS_FILTERS = (
     "全部",
-    "等待中",
-    "校验中",
-    "下载中",
-    "合并中",
+    "进行中",
     "已暂停",
     "已完成",
     "失败",
     "已取消",
 )
+UPLOAD_ACTIVE_FILTER_STATUSES = frozenset({"等待中", "上传中", "创建目录中"})
 TERMINAL_TRANSFER_STATUSES = frozenset({"已完成", "失败", "已取消"})
 ACTIVE_DOWNLOAD_STATUSES = frozenset({"等待中", "校验中", "下载中", "合并中"})
 ACTIVE_UPLOAD_STATUSES = frozenset({"等待中", "上传中"})
@@ -1316,14 +1316,16 @@ class TransferInterface(QWidget):
         self.upload_filter_label = BodyLabel("状态", top_bar)
         self.upload_filter_combo = ComboBox(top_bar)
         self.upload_filter_combo.addItems(list(UPLOAD_STATUS_FILTERS))
-        self.upload_filter_combo.setCurrentText(self.upload_status_filter)
-        self.upload_filter_combo.setMinimumWidth(120)
+        for index, name in enumerate(UPLOAD_STATUS_FILTERS):
+            self.upload_filter_combo.setItemData(index, name)
+        self.upload_filter_combo.setMinimumWidth(140)
 
         self.download_filter_label = BodyLabel("状态", top_bar)
         self.download_filter_combo = ComboBox(top_bar)
         self.download_filter_combo.addItems(list(DOWNLOAD_STATUS_FILTERS))
-        self.download_filter_combo.setCurrentText(self.download_status_filter)
-        self.download_filter_combo.setMinimumWidth(120)
+        for index, name in enumerate(DOWNLOAD_STATUS_FILTERS):
+            self.download_filter_combo.setItemData(index, name)
+        self.download_filter_combo.setMinimumWidth(140)
         self.open_download_folder_button = PushButton(
             FIF.FOLDER.icon(),
             "打开下载文件夹",
@@ -1444,8 +1446,8 @@ class TransferInterface(QWidget):
 
     def _connect_signals(self) -> None:
         self.segmented_widget.currentItemChanged.connect(self._on_segment_changed)
-        self.upload_filter_combo.currentTextChanged.connect(self._on_upload_filter_changed)
-        self.download_filter_combo.currentTextChanged.connect(self._on_download_filter_changed)
+        self.upload_filter_combo.currentIndexChanged.connect(self._on_upload_filter_changed)
+        self.download_filter_combo.currentIndexChanged.connect(self._on_download_filter_changed)
         self.open_download_folder_button.clicked.connect(self._request_open_download_folder)
         self.upload_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("upload"))
         self.download_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("download"))
@@ -1511,17 +1513,21 @@ class TransferInterface(QWidget):
         # hidden, so the visible window's widgets need one render.
         self._schedule_progress_render(self._active_direction)
 
-    def _on_upload_filter_changed(self, status: str) -> None:
-        self.upload_status_filter = status
+    def _on_upload_filter_changed(self, index: int) -> None:
+        data = self.upload_filter_combo.itemData(index)
+        # 文本带计数后缀（"已完成 (5)"），过滤键必须是 itemData 里的规范名。
+        self.upload_status_filter = data if isinstance(data, str) else "全部"
         self.flush_progress_render()
         self._render_upload_table()
 
-    def _on_download_filter_changed(self, status: str) -> None:
-        self.download_status_filter = status
+    def _on_download_filter_changed(self, index: int) -> None:
+        data = self.download_filter_combo.itemData(index)
+        self.download_status_filter = data if isinstance(data, str) else "全部"
         self.flush_progress_render()
         self._render_download_table()
 
     def _render_upload_table(self) -> None:
+        self._refresh_upload_filter_counts()
         self._render_table(
             self.upload_table,
             self._filtered_upload_records(),
@@ -1530,6 +1536,7 @@ class TransferInterface(QWidget):
         self._update_batch_bar("upload")
 
     def _render_download_table(self) -> None:
+        self._refresh_download_filter_counts()
         self._render_table(
             self.download_table,
             self._filtered_download_records(),
@@ -1766,6 +1773,12 @@ class TransferInterface(QWidget):
         """Upload render sequence: status filter, then the active column sort."""
         if self.upload_status_filter == "全部":
             visible = list(self.upload_records)
+        elif self.upload_status_filter == "进行中":
+            visible = [
+                record
+                for record in self.upload_records
+                if record.status in UPLOAD_ACTIVE_FILTER_STATUSES
+            ]
         else:
             visible = [
                 record
@@ -1778,6 +1791,12 @@ class TransferInterface(QWidget):
         """Download render sequence: status filter, then the active column sort."""
         if self.download_status_filter == "全部":
             visible = list(self.download_records)
+        elif self.download_status_filter == "进行中":
+            visible = [
+                record
+                for record in self.download_records
+                if record.status in ACTIVE_DOWNLOAD_STATUSES
+            ]
         else:
             visible = [
                 record
@@ -1785,6 +1804,48 @@ class TransferInterface(QWidget):
                 if record.status == self.download_status_filter
             ]
         return sorted_view(visible, self._download_sort_state, TRANSFER_TABLE_SORT_KEYS)
+
+    def _filter_count_key_upload(self, status: str) -> str | None:
+        if status in UPLOAD_ACTIVE_FILTER_STATUSES:
+            return "进行中"
+        if status in ("已暂停", "已完成", "失败", "已取消"):
+            return status
+        return None
+
+    def _filter_count_key_download(self, status: str) -> str | None:
+        if status in ACTIVE_DOWNLOAD_STATUSES:
+            return "进行中"
+        if status in ("已暂停", "已完成", "失败", "已取消"):
+            return status
+        return None
+
+    def _refresh_upload_filter_counts(self) -> None:
+        """qB 风格计数：下拉项显示「失败 (2)」，每次表格渲染时同步。
+
+        setItemText 只改显示文本不动索引，不会触发选择变化。
+        """
+        counts = {"全部": len(self.upload_records)}
+        for record in self.upload_records:
+            key = self._filter_count_key_upload(record.status)
+            if key is not None:
+                counts[key] = counts.get(key, 0) + 1
+        combo = self.upload_filter_combo
+        for index in range(combo.count()):
+            name = combo.itemData(index)
+            if isinstance(name, str):
+                combo.setItemText(index, f"{name} ({counts.get(name, 0)})")
+
+    def _refresh_download_filter_counts(self) -> None:
+        counts = {"全部": len(self.download_records)}
+        for record in self.download_records:
+            key = self._filter_count_key_download(record.status)
+            if key is not None:
+                counts[key] = counts.get(key, 0) + 1
+        combo = self.download_filter_combo
+        for index in range(combo.count()):
+            name = combo.itemData(index)
+            if isinstance(name, str):
+                combo.setItemText(index, f"{name} ({counts.get(name, 0)})")
 
     def _on_table_header_clicked(self, direction: str, column: int) -> None:
         """Cycle one table's sort state; progress/speed/action never react."""
