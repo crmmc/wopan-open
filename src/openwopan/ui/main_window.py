@@ -2950,6 +2950,9 @@ class MainWindow(_MainWindowBase):
         self.setWindowTitle("OpenWoPan")
         self.resize(*MAIN_WINDOW_DEFAULT_SIZE)
         self.setMinimumSize(*MAIN_WINDOW_MINIMUM_SIZE)
+        # 构造期设置而非在 show() 处切换：首次显示即最大化，之后 hide/show
+        # （如登录流程）沿用用户手动还原的窗口状态。
+        self.setWindowState(Qt.WindowMaximized)
 
         self.file_interface = FileInterface(self)
         if transfer_record_store is not None:

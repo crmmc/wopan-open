@@ -376,6 +376,17 @@ def test_main_window_matches_sibling_file_layout_invariants(qapp: QApplication) 
     assert "background: transparent" in window.setting_interface.styleSheet()
 
 
+def test_main_window_starts_maximized(qapp: QApplication) -> None:
+    """首次显示即最大化：三栏+多列表格在默认 900x600 下会挤成一团。
+
+    构造期设置状态（而非在 controller 的 show() 处切换），登录流程的
+    hide/show 不会重新强制最大化。
+    """
+    window = MainWindow()
+
+    assert window.windowState() & Qt.WindowState.WindowMaximized
+
+
 def test_transfer_interface_matches_sibling_layout_invariants(qapp: QApplication) -> None:
     window = MainWindow()
     transfer = window.transfer_interface
