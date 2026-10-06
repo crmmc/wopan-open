@@ -6239,6 +6239,25 @@ class MainWindow(_MainWindowBase):
         else:
             self._upload_pending.remove(pending)
         if pending is None:
+            # 重启恢复的「等待中」行不在任何内存队列（worker/pending/folder
+            # queue）里；此前这里静默返回，暂停按钮看似无效。仍然允许暂停：
+            # 从记录字段重建启动参数登记为已暂停，继续时走单文件恢复路径。
+            if (
+                record.target_path is not None
+                and record.upload_parent_id
+                and record.status in ACTIVE_UPLOAD_STATUSES
+                and task_id not in self._paused_uploads
+            ):
+                self._paused_uploads[task_id] = PendingUploadTask(
+                    parent_id=record.upload_parent_id,
+                    local_path=record.target_path,
+                    task_id=task_id,
+                    upload_name=record.upload_name,
+                    show_enqueue_status=False,
+                )
+                self.transfer_interface.update_record(
+                    "upload", task_id, status="已暂停", can_resume=True
+                )
             return
         if task_id in self._paused_uploads or record.status not in ACTIVE_UPLOAD_STATUSES:
             return

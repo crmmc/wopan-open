@@ -3758,6 +3758,38 @@ def test_main_window_batch_upload_controls_active_worker(qapp: QApplication) -> 
     assert record.status == "上传中" and not record.can_resume
 
 
+def test_pause_restored_waiting_upload_row_without_queue_entry(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """重启恢复的「等待中」行不在任何内存队列：暂停仍生效并可继续。
+
+    回归（UAT 2026-10-06）：崩溃恢复后 158 个等待行无 worker/pending/
+    folder-queue 归属，暂停按钮此前静默无效果。
+    """
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "restored.txt"
+    local_path.write_text("data")
+    task_id = window._create_upload_record(
+        local_path,
+        parent_id="cloud-root",
+        upload_name="restored.txt",
+        retryable=True,
+    )
+
+    window._pause_selected_uploads({task_id})
+
+    record = window.transfer_interface._find_record("upload", task_id)
+    assert record is not None
+    assert record.status == "已暂停" and record.can_resume
+    assert task_id in window._paused_uploads
+
+    # sync_threads 使 worker 同步跑完：断言行为结果而非 worker 存活
+    window._resume_selected_uploads({task_id})
+    assert record.status == "已完成"
+    assert ("cloud-root", local_path) in browser.uploaded_files
+
+
 def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -856,9 +856,25 @@ class WopanClient:
                 file_size=file_size,
                 fid=fid,
             )
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             LOGGER.warning("wopan.upload_file.http_error parent_id=%s", parent_id)
-            raise
+            # Resumable uploads: a 5xx on the final part can still mean the
+            # server assembled the file, so check the listing before giving
+            # up — same recovery as the generic handler below. Fresh uploads
+            # (resume is None) never spend an extra request here.
+            if resume is None:
+                raise
+            recovered = self._recover_upload_item_on_error(
+                original_error=exc,
+                parent_id=parent_id,
+                file_name=file_name,
+                file_size=file_size,
+            )
+            if recovered is None:
+                raise
+            if progress_callback is not None:
+                progress_callback(file_size, file_size)
+            return recovered
         except (OSError, ValueError) as exc:
             LOGGER.warning("wopan.upload_file.response_error parent_id=%s", parent_id)
             raise WopanResponseError("upload2C response cannot be decoded") from exc

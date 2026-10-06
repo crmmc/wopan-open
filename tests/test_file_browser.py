@@ -1513,6 +1513,96 @@ def test_service_upload_retry_reuses_session_and_skips_completed_parts(
     assert _state(store, task_id) is None
 
 
+def test_service_upload_restarts_fresh_when_session_rejected_with_5xx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """服务端拒绝续传会话（5xx 且零新分片）：丢弃旧会话整文件重传一次。
+
+    UAT 2026-10-06：130/131 分片的会话续传最后一片时服务端持续回
+    HTTP 500，原路径反复用同一会话重试永远失败。
+    """
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+
+    class _RejectResumeClient(ResumeAwareUploadClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject_resumes = False
+            self._request = httpx.Request(
+                "POST", "https://upload.example/openapi/client/upload2C"
+            )
+            self._response = httpx.Response(500, request=self._request)
+
+        def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
+            resume = kwargs.get("resume")
+            if (
+                self.reject_resumes
+                and isinstance(resume, UploadResumeContext)
+                and resume.completed_indexes
+            ):
+                self.uploaded_files.append((parent_id, local_path))
+                self.upload_kwargs.append(kwargs)
+                raise httpx.HTTPStatusError(
+                    "Server Error", request=self._request, response=self._response
+                )
+            return super().upload_file(parent_id, local_path, **kwargs)
+
+    client = _RejectResumeClient()
+    service, client, store = _resume_service(tmp_path, client=client)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+
+    client.upload_failure = None
+    client.reject_resumes = True
+    client.part_results = []  # 本次尝试零新分片确认
+    item = service.upload_file("folder-1", local_path)
+
+    assert item.item_id == "uploaded-file"
+    assert len(client.upload_kwargs) == 3
+    second_resume = client.upload_kwargs[1]["resume"]
+    third_resume = client.upload_kwargs[2]["resume"]
+    assert isinstance(second_resume, UploadResumeContext)
+    assert isinstance(third_resume, UploadResumeContext)
+    assert second_resume.completed_indexes == frozenset({1})
+    assert third_resume.completed_indexes == frozenset()
+    assert third_resume.unique_id != second_resume.unique_id
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    assert _state(store, task_id) is None
+
+
+def test_service_upload_keeps_session_when_new_parts_confirmed_before_5xx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """5xx 前已确认新分片：保留会话走正常失败-续传，不整文件重传。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+
+    request = httpx.Request("POST", "https://upload.example/openapi/client/upload2C")
+    response = httpx.Response(503, request=request)
+    client.upload_failure = httpx.HTTPStatusError(
+        "Service Unavailable", request=request, response=response
+    )
+    client.part_results = [(2, "fid-2")]  # 本次尝试确认了新分片
+    with pytest.raises(FileBrowserError, match="503"):
+        service.upload_file("folder-1", local_path)
+
+    assert len(client.upload_kwargs) == 2  # 没有第三次整文件重传
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    state = _state(store, task_id)
+    assert state is not None
+    assert state.completed_indexes == [1, 2]
+    assert state.status == "失败"
+
+
 def test_service_upload_discards_state_on_file_size_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

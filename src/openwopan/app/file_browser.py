@@ -661,6 +661,23 @@ class FileBrowserService:
                 store.delete(upload_task_id)
             raise
         except Exception as exc:
+            if store is not None and self._should_restart_rejected_session(
+                store, upload_task_id, resume=resume, error=exc
+            ):
+                # The server rejected the reused session outright (e.g. HTTP
+                # 500 on the one remaining part, UAT 2026-10-06: retrying the
+                # same session hits the same wall forever). Discard it and
+                # re-upload the whole file once under a fresh session.
+                item = self._restart_rejected_upload_session(
+                    store,
+                    upload_task_id,
+                    parent_id=parent_id,
+                    local_path=local_path,
+                    upload_name=upload_name,
+                    progress_callback=progress_callback,
+                    cancel_requested=cancel_requested,
+                )
+                return item
             if store is not None:
                 message = str(exc)
                 try:
@@ -761,21 +778,118 @@ class FileBrowserService:
             return store.update(task_id, _reset_upload_session)
         if state is not None:
             store.delete(task_id)
-        fresh = UploadTaskState(
+        fresh = _new_upload_state(
             task_id=task_id,
-            file_name=upload_name if upload_name is not None else local_path.name,
-            local_path=local_path,
             parent_id=parent_id,
+            local_path=local_path,
             upload_name=upload_name,
             file_size=file_size,
             file_mtime=file_mtime,
             part_size=part_size,
             total_parts=total_parts,
-            unique_id=str(int(time.time() * 1000)),
-            batch_no=time.strftime("%Y%m%d%H%M%S"),
         )
         store.save(fresh)
         return fresh
+
+    def _should_restart_rejected_session(
+        self,
+        store: UploadTaskStore,
+        task_id: str,
+        *,
+        resume: UploadResumeContext | None,
+        error: Exception,
+    ) -> bool:
+        """Whether a failed resume should be retried once with a fresh session.
+
+        Only when the server rejected the REUSED session outright — an HTTP
+        5xx from the upload endpoint with zero newly confirmed parts — is a
+        full re-upload worthwhile; the same session would keep hitting the
+        same wall (UAT 2026-10-06: last remaining part of a 130/131 session
+        answered HTTP 500 on every retry). Mid-transfer network failures
+        still keep their parts and follow the normal fail-then-resume path.
+        """
+        if resume is None or not resume.completed_indexes:
+            return False
+        cause = error.__cause__
+        if not (
+            isinstance(error, FileBrowserError)
+            and isinstance(cause, httpx.HTTPStatusError)
+            and 500 <= cause.response.status_code < 600
+        ):
+            return False
+        state = store.load(task_id)
+        if state is None:
+            return False
+        return frozenset(state.completed_indexes) == frozenset(resume.completed_indexes)
+
+    def _restart_rejected_upload_session(
+        self,
+        store: UploadTaskStore,
+        task_id: str,
+        *,
+        parent_id: str,
+        local_path: Path,
+        upload_name: str | None,
+        progress_callback: UploadProgressCallback | None,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> WopanItem:
+        """Discard a server-rejected session and re-upload the file once."""
+        LOGGER.warning(
+            "file_browser.upload_file.session_rejected_restart parent_id=%s "
+            "file_name_length=%s",
+            parent_id,
+            len(local_path.name),
+        )
+        store.delete(task_id)
+        stat_result = local_path.stat()
+        part_size, total_parts = resolve_upload_part_plan(
+            stat_result.st_size, self._settings.upload_part_size_mb
+        )
+        fresh = _new_upload_state(
+            task_id=task_id,
+            parent_id=parent_id,
+            local_path=local_path,
+            upload_name=upload_name,
+            file_size=stat_result.st_size,
+            file_mtime=stat_result.st_mtime,
+            part_size=part_size,
+            total_parts=total_parts,
+        )
+        store.save(fresh)
+        resume = UploadResumeContext(
+            unique_id=fresh.unique_id,
+            batch_no=fresh.batch_no,
+            completed_indexes=frozenset(),
+            known_fid="",
+            on_part_result=self._make_upload_part_recorder(store, task_id),
+        )
+        try:
+            item = self._invoke_upload_client(
+                parent_id,
+                local_path,
+                upload_name=upload_name,
+                progress_callback=progress_callback,
+                cancel_requested=cancel_requested,
+                resume=resume,
+            )
+        except FileBrowserUploadCancelledError:
+            store.delete(task_id)
+            raise
+        except Exception as exc:
+            message = str(exc)
+            try:
+                store.update(task_id, lambda state: _mark_upload_failed(state, message))
+            except KeyError:
+                LOGGER.debug("file_browser.upload_file.record_after_delete")
+            raise
+        store.delete(task_id)
+        LOGGER.info(
+            "file_browser.upload_file.success parent_id=%s item_id=%s file_name_length=%s",
+            parent_id,
+            item.item_id,
+            len(item.name),
+        )
+        return item
 
     def _make_upload_part_recorder(
         self, store: UploadTaskStore, task_id: str
@@ -1053,6 +1167,33 @@ def _reset_upload_session(state: UploadTaskState) -> None:
     """Mark a reused upload session as active again."""
     state.status = "进行中"
     state.error = ""
+
+
+def _new_upload_state(
+    *,
+    task_id: str,
+    parent_id: str,
+    local_path: Path,
+    upload_name: str | None,
+    file_size: int,
+    file_mtime: float,
+    part_size: int,
+    total_parts: int,
+) -> UploadTaskState:
+    """Build a fresh session with new server-side aggregation identifiers."""
+    return UploadTaskState(
+        task_id=task_id,
+        file_name=upload_name if upload_name is not None else local_path.name,
+        local_path=local_path,
+        parent_id=parent_id,
+        upload_name=upload_name,
+        file_size=file_size,
+        file_mtime=file_mtime,
+        part_size=part_size,
+        total_parts=total_parts,
+        unique_id=str(int(time.time() * 1000)),
+        batch_no=time.strftime("%Y%m%d%H%M%S"),
+    )
 
 
 def _record_upload_part(state: UploadTaskState, part_index: int, fid: str) -> None:
