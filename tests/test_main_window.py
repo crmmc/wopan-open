@@ -1893,6 +1893,149 @@ def test_transfer_batch_updates_renders_once_per_direction(
     assert counts["upload"] == 3
 
 
+def test_progress_callback_fields_stay_coalesced(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """total_bytes/active_connections 是进度类字段，走渲染与落盘合并管道。
+
+    回归：此前这些字段被判定为结构性变更，每条分片进度回调都立即全表
+    渲染并同步写 SQLite（py-spy 实测 GUI 线程持续卡在该路径，
+    4.24ms/信号 vs 合并后 0.004ms）。
+    """
+    saves = [0]
+
+    class _Persistence:
+        def save_record(self, record: TransferRecord) -> None:
+            saves[0] += 1
+
+        def update_record_progress(self, *args: object, **kwargs: object) -> None: ...
+
+        def delete_records(self, *args: object, **kwargs: object) -> None: ...
+
+        def load_history(self) -> tuple[TransferRecord, ...]:
+            return ()
+
+        def purge_stale_records(self, max_age_days: int = 30) -> tuple[tuple[str, str], ...]:
+            return ()
+
+    transfer = TransferInterface(persistence=_Persistence())
+    renders = [0]
+    original_render = transfer._render_upload_table
+
+    def counting_render() -> None:
+        renders[0] += 1
+        original_render()
+
+    monkeypatch.setattr(transfer, "_render_upload_table", counting_render)
+    transfer.add_upload_record(_upload_record("u-1", "a.mkv", status="上传中"))
+    transfer.add_upload_record(_upload_record("u-2", "b.mkv", status="上传中"))
+    renders[0] = 0
+    saves[0] = 0
+
+    for done in range(1, 6):
+        transfer.update_record(
+            "upload", "u-1", bytes_done=done, total_bytes=100, active_connections=8
+        )
+
+    assert renders[0] == 0
+    assert saves[0] == 0
+    record = transfer._find_record("upload", "u-1")
+    assert record is not None
+    assert record.bytes_done == 5
+    assert record.total_bytes == 100
+
+    transfer.flush_progress_render()
+    assert renders[0] == 1
+    assert transfer.upload_table.item(0, TRANSFER_COL_PROGRESS).text().startswith("5%")
+
+    # 状态/终态变更仍然立即渲染并整行落盘。
+    transfer.update_record("upload", "u-2", status="已完成")
+    assert renders[0] == 2
+    assert saves[0] == 1
+
+
+def test_render_fast_path_diffs_without_item_reallocation(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """行序不变的刷新走 diff 快路径：不新建 item、保留选中、只更新变化文本。"""
+    transfer = TransferInterface()
+    for index in range(30):
+        transfer.add_upload_record(
+            _upload_record(f"u-{index}", f"ep{index:02d}.mkv", status="上传中"),
+            render=False,
+        )
+    transfer._render_upload_table()
+    transfer.upload_table.selectRow(3)
+    assert len(transfer.upload_table.selectionModel().selectedRows()) == 1
+
+    created = [0]
+    original_item = main_window_module.QTableWidgetItem
+
+    class _CountingItem(original_item):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: object) -> None:
+            created[0] += 1
+            super().__init__(*args)
+
+    monkeypatch.setattr(main_window_module, "QTableWidgetItem", _CountingItem)
+
+    transfer.update_record("upload", "u-5", bytes_done=50, total_bytes=100)
+    transfer.update_record("upload", "u-6", status="已暂停", can_resume=True)
+    transfer.flush_progress_render()
+
+    assert created[0] == 0
+    assert len(transfer.upload_table.selectionModel().selectedRows()) == 1
+    assert transfer.upload_table.item(5, TRANSFER_COL_PROGRESS).text().startswith("50%")
+    assert transfer.upload_table.item(6, TRANSFER_COL_STATUS).text() == "已暂停"
+
+
+def test_action_widgets_windowed_when_shown(qapp: QApplication) -> None:
+    """显示状态下操作控件只为可视区±冗余行安装；未显示时全量安装（测试语义）。"""
+    transfer = TransferInterface()
+    for index in range(60):
+        transfer.add_upload_record(
+            _upload_record(f"u-{index}", f"ep{index:02d}.mkv", status="等待中"),
+            render=False,
+        )
+    transfer._render_upload_table()
+    table = transfer.upload_table
+    assert all(table.cellWidget(row, TRANSFER_COL_ACTION) is not None for row in range(60))
+
+    transfer._on_segment_changed("upload")  # 上传表在分段页内，切段后才可见
+    transfer.resize(600, 400)
+    transfer.show()
+    qapp.processEvents()
+    bar = table.verticalScrollBar()
+    bar.setValue(bar.maximum())
+    transfer.flush_progress_render()
+    qapp.processEvents()
+
+    assert table.cellWidget(59, TRANSFER_COL_ACTION) is not None
+    # 60 行、可视约 4 行、冗余 20 行：滚动到底后顶部行已出窗，不再持有控件。
+    assert table.cellWidget(0, TRANSFER_COL_ACTION) is None
+
+
+def test_hidden_large_table_skips_widgets_until_shown(qapp: QApplication) -> None:
+    """隐藏表超过阈值不建操作控件（500 行历史恢复曾因建控件耗时 1.9s）。"""
+    transfer = TransferInterface()
+    for index in range(250):
+        transfer.add_upload_record(
+            _upload_record(f"u-{index}", f"ep{index:03d}.mkv", status="等待中"),
+            render=False,
+        )
+    transfer._render_upload_table()
+    table = transfer.upload_table
+    assert table.cellWidget(0, TRANSFER_COL_ACTION) is None
+
+    transfer._on_segment_changed("upload")
+    transfer.resize(600, 400)
+    transfer.show()
+    qapp.processEvents()
+    transfer.flush_progress_render()
+    qapp.processEvents()
+
+    assert table.cellWidget(0, TRANSFER_COL_ACTION) is not None
+
+
 def test_file_page_unknown_column_click_is_ignored(qapp: QApplication) -> None:
     browser = FakeFileBrowser()
     window = MainWindow(browser)

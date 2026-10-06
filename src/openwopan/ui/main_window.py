@@ -24,7 +24,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -141,6 +141,22 @@ TRANSFER_COL_STATUS = 4
 TRANSFER_COL_ACTION = 5
 TRANSFER_ACTION_COLUMN_WIDTH = 156
 TRANSFER_ACTION_BUTTON_SIZE = (32, 24)
+# Precomputed once: per-item flag ORs cost ~25% of a full-table render
+# (cProfile on 157-row renders).
+_TRANSFER_RIGHT_COLUMNS = frozenset(
+    {TRANSFER_COL_SIZE, TRANSFER_COL_PROGRESS, TRANSFER_COL_SPEED, TRANSFER_COL_STATUS}
+)
+_TRANSFER_RIGHT_ALIGNMENT = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
+# Action widgets (4 styled ToolButtons each, ~3.8ms/row with QSS rendering)
+# are only installed for rows near the viewport; scrolling re-installs them
+# via the coalesced progress render.
+ACTION_WIDGET_WINDOW_OVERHANG_ROWS = 20
+# A hidden table (background page / offscreen tests) has no viewport, so
+# small row counts keep the old install-everything semantics for direct
+# cellWidget reads; larger hidden tables skip widgets entirely — building
+# 157-500 of them took 0.6-1.9s at startup — and the show/segment hooks
+# install the visible window when the page appears.
+HIDDEN_TABLE_FULL_WIDGET_ROW_LIMIT = 100
 FILE_COL_NAME = 0
 FILE_COL_KIND = 1
 FILE_COL_SIZE = 2
@@ -979,9 +995,14 @@ class TransferInterface(QWidget):
             return
         previous_status = record.status
         now = time.monotonic()
+        # Progress-class fields (bytes/total/connections) display in the
+        # progress and speed columns only; classifying them as structural
+        # made every per-part progress callback render the whole table and
+        # commit sqlite synchronously (py-spy: GUI thread pegged in
+        # _render_table from _on_upload_progress; 4.24ms/signal vs 0.004ms
+        # coalesced). Status/error/resume/max-connections still render now.
         progress_only = (
             status is None
-            and total_bytes is None
             and max_connections is None
             and can_resume is None
             and error is None
@@ -1292,6 +1313,12 @@ class TransferInterface(QWidget):
             # sentinel; clear it to -1 so "no sort" is always observable.
             sync_sort_indicator(header, TableSortState())
             header.sectionClicked.connect(partial(self._on_table_header_clicked, direction))
+        # Rows scrolled into view need their texts diffed and their action
+        # widgets installed (widgets are viewport-windowed); the coalesced
+        # 150ms progress render does both without a per-scroll storm.
+        table.verticalScrollBar().valueChanged.connect(
+            lambda _value, direction=direction: self._schedule_progress_render(direction)
+        )
 
         layout.addWidget(batch_bar)
         layout.addWidget(table)
@@ -1400,6 +1427,18 @@ class TransferInterface(QWidget):
         self.download_filter_label.setVisible(not is_upload)
         self.download_filter_combo.setVisible(not is_upload)
         self.open_download_folder_button.setVisible(not is_upload)
+        # The freshly shown table may have skipped widgets while hidden
+        # (large-row windowing); install the visible window soon. Skip when
+        # this page is not visible (e.g. the __init__-time segment setup) so
+        # no stale render request waits around.
+        if self.isVisible():
+            self._schedule_progress_render(route_key)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        # Same reason as the segment hook: rows changed while this page was
+        # hidden, so the visible window's widgets need one render.
+        self._schedule_progress_render(self._active_direction)
 
     def _on_upload_filter_changed(self, status: str) -> None:
         self.upload_status_filter = status
@@ -1444,11 +1483,18 @@ class TransferInterface(QWidget):
         for row in range(table.rowCount()):
             item = table.item(row, 0)
             rendered_ids.append(item.data(Qt.ItemDataRole.UserRole) if item is not None else None)
-        if rendered_ids != [record.task_id for record in records]:
-            table.clearSelection()
-        if table.rowCount() != len(records):
-            self._clear_action_widgets(table)
-        table.setRowCount(len(records))
+        expected_ids = [record.task_id for record in records]
+        structural = rendered_ids != expected_ids or table.rowCount() != len(records)
+        if structural:
+            if rendered_ids != expected_ids:
+                table.clearSelection()
+            if table.rowCount() != len(records):
+                self._clear_action_widgets(table)
+            table.setRowCount(len(records))
+        # Fast path: an unchanged id sequence only diffs cell texts in place
+        # (no 5N QTableWidgetItem reallocation, no selection touch); a full
+        # rebuild also diffs because the items above were recreated.
+        first_window_row, last_window_row = self._action_widget_window(table, len(records))
         for row, record in enumerate(records):
             values = (
                 record.name,
@@ -1457,32 +1503,82 @@ class TransferInterface(QWidget):
                 _format_speed(record.speed_bps),
                 record.status,
             )
+            in_window = first_window_row <= row <= last_window_row
             for column, value in enumerate(values):
-                table_item = QTableWidgetItem(value)
-                table_item.setData(Qt.ItemDataRole.UserRole, record.task_id)
-                if column in (
-                    TRANSFER_COL_SIZE,
-                    TRANSFER_COL_PROGRESS,
-                    TRANSFER_COL_SPEED,
-                    TRANSFER_COL_STATUS,
-                ):
-                    table_item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
-                    )
-                table.setItem(row, column, table_item)
-            action_key = (record.task_id, record.status, record.can_resume, record.upload_retryable)
-            widget = table.cellWidget(row, TRANSFER_COL_ACTION)
-            if widget is not None and widget.property("action_key") == action_key:
-                continue
+                table_item = table.item(row, column)
+                if structural or table_item is None:
+                    # Structural rebuilds must recreate items: after a
+                    # reorder the item at this row belongs to another task,
+                    # so its UserRole id would poison the sequence compare.
+                    table_item = QTableWidgetItem(value)
+                    table_item.setData(Qt.ItemDataRole.UserRole, record.task_id)
+                    if column in _TRANSFER_RIGHT_COLUMNS:
+                        table_item.setTextAlignment(_TRANSFER_RIGHT_ALIGNMENT)
+                    table.setItem(row, column, table_item)
+                    continue
+                if table_item.text() != value:
+                    table_item.setText(value)
+            self._ensure_row_action_widget(table, row, record, direction, in_window)
+        self._update_total_speed(direction)
+
+    def _action_widget_window(self, table: TableWidget, row_count: int) -> tuple[int, int]:
+        """Return the inclusive row range that keeps live action widgets.
+
+        A shown table materializes widgets only for the viewport plus an
+        overhang, because each row's 4 styled buttons cost ~3.8ms to build
+        and reinstall (measured: 68% of a 1.9s / 500-row history restore was
+        setCellWidget alone). Hidden tables follow
+        HIDDEN_TABLE_FULL_WIDGET_ROW_LIMIT.
+        """
+        if row_count <= 0:
+            return (0, -1)
+        if not table.isVisible():
+            if row_count <= HIDDEN_TABLE_FULL_WIDGET_ROW_LIMIT:
+                return (0, row_count - 1)
+            return (0, -1)
+        viewport = table.viewport()
+        first_row = table.indexAt(QPoint(0, 1)).row()
+        last_row = table.indexAt(QPoint(0, max(1, viewport.height() - 1))).row()
+        if first_row < 0:
+            first_row = 0
+        if last_row < 0:
+            last_row = row_count - 1
+        return (
+            max(0, first_row - ACTION_WIDGET_WINDOW_OVERHANG_ROWS),
+            min(row_count - 1, last_row + ACTION_WIDGET_WINDOW_OVERHANG_ROWS),
+        )
+
+    def _ensure_row_action_widget(
+        self,
+        table: TableWidget,
+        row: int,
+        record: TransferRecord,
+        direction: str,
+        in_window: bool,
+    ) -> None:
+        action_key = (record.task_id, record.status, record.can_resume, record.upload_retryable)
+        widget = table.cellWidget(row, TRANSFER_COL_ACTION)
+        if not in_window:
+            # Strict window: rows outside the viewport+overhang hold no
+            # action widgets — bounded memory, and scroll re-installs via the
+            # coalesced render. A kept widget would also survive row reorders
+            # pointing at another task's handlers.
             if widget is not None:
                 widget.hide()
                 table.removeCellWidget(row, TRANSFER_COL_ACTION)
                 widget.setParent(None)
                 widget.deleteLater()
-            widget = self._build_row_action_widget(record, direction, table)
-            widget.setProperty("action_key", action_key)
-            table.setCellWidget(row, TRANSFER_COL_ACTION, widget)
-        self._update_total_speed(direction)
+            return
+        if widget is not None and widget.property("action_key") == action_key:
+            return
+        if widget is not None:
+            widget.hide()
+            table.removeCellWidget(row, TRANSFER_COL_ACTION)
+            widget.setParent(None)
+            widget.deleteLater()
+        widget = self._build_row_action_widget(record, direction, table)
+        widget.setProperty("action_key", action_key)
+        table.setCellWidget(row, TRANSFER_COL_ACTION, widget)
 
     def _build_row_action_widget(
         self,
