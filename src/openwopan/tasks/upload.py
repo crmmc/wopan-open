@@ -74,6 +74,18 @@ class UploadSummaryEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class MergeUploadEstimate:
+    """Read-only estimate of what a merge upload would add.
+
+    Same skip rules as the merge branch of folder preparation: same-name
+    directories are reused, same-name same-size files count as uploaded.
+    """
+
+    files_to_upload: int
+    files_skipped: int
+
+
+@dataclass(frozen=True, slots=True)
 class UploadBatchSummary:
     """Safe, bounded summary of local upload inputs."""
 

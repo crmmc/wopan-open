@@ -40,6 +40,7 @@ from openwopan.storage.transfer_records import TransferRecordStore
 from openwopan.tasks.download import DownloadTaskControl, DownloadTaskState, DownloadTaskStore
 from openwopan.tasks.upload import (
     FolderUploadJob,
+    MergeUploadEstimate,
     PlannedUploadFile,
     UploadBatchSummary,
     UploadSummaryEntry,
@@ -8115,6 +8116,168 @@ def test_upload_summary_dialog_bounds_conflict_preview(qapp: QApplication) -> No
     assert not confirm.isEnabled()
 
 
+def test_upload_summary_dialog_shows_merge_task_estimate(qapp: QApplication) -> None:
+    """合并选项旁显示预计新增任务数；选中后决策行给出去重明细。"""
+    parent = QWidget()
+    folder = Path("/tmp/folder")
+    summary = UploadBatchSummary(
+        (folder,), 0, 1, 0, (UploadSummaryEntry(folder, "folder", "文件夹", 0),), 0
+    )
+    dialog = UploadSummaryDialog(
+        summary,
+        "云端目录",
+        parent,
+        conflicts=(folder,),
+        merge_estimate=MergeUploadEstimate(files_to_upload=38, files_skipped=119),
+    )
+
+    assert "预计新增 38 个任务" in dialog._merge_conflicts_button.text()
+    dialog._merge_conflicts_button.setChecked(True)
+    decision = dialog.findChild(main_window_module.BodyLabel, "uploadDecisionLabel")
+    assert decision is not None
+    assert "预计新增 38 个上传任务" in decision.text()
+    assert "跳过 119 个已存在文件" in decision.text()
+
+
+def test_upload_summary_dialog_without_estimate_keeps_static_hint(
+    qapp: QApplication,
+) -> None:
+    """估算不可用（后端不支持/估算失败）时回退静态提示，不显示数字。"""
+    parent = QWidget()
+    folder = Path("/tmp/folder")
+    summary = UploadBatchSummary(
+        (folder,), 0, 1, 0, (UploadSummaryEntry(folder, "folder", "文件夹", 0),), 0
+    )
+    dialog = UploadSummaryDialog(summary, "云端目录", parent, conflicts=(folder,))
+
+    assert "预计新增" not in dialog._merge_conflicts_button.text()
+    dialog._merge_conflicts_button.setChecked(True)
+    decision = dialog.findChild(main_window_module.BodyLabel, "uploadDecisionLabel")
+    assert decision is not None
+    assert "只补传缺失文件" in decision.text()
+
+
+def test_upload_conflict_check_computes_merge_estimate(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """冲突检查顺带估算合并新增数：同名文件夹走云端比对、非冲突文件夹
+    按本地扫描全量计、同名顶层文件计为跳过。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_folder = tmp_path / "已看完"
+    local_folder.mkdir()
+    (local_folder / "ep01.mkv").write_bytes(b"a")
+    (local_folder / "ep02.mkv").write_bytes(b"b")
+    fresh_folder = tmp_path / "新剧"
+    fresh_folder.mkdir()
+    (fresh_folder / "n1.mkv").write_bytes(b"c")
+    (fresh_folder / "n2.mkv").write_bytes(b"d")
+    duplicate_file = tmp_path / "同名.txt"
+    duplicate_file.write_text("x")
+    paths = (local_folder, fresh_folder, duplicate_file)
+    summary = main_window_module.scan_upload_inputs(paths)
+
+    estimates: list[tuple[Path, str | None]] = []
+
+    class EstimateBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            # 云端已有同名「已看完」文件夹与「同名.txt」文件
+            if parent_id == ROOT_DIRECTORY_ID:
+                return [
+                    WopanItem(
+                        item_id="cloud-watched",
+                        name="已看完",
+                        kind=WopanItemKind.FOLDER,
+                        parent_id=parent_id,
+                    ),
+                    WopanItem(
+                        item_id="cloud-dup",
+                        name="同名.txt",
+                        kind=WopanItemKind.FILE,
+                        parent_id=parent_id,
+                        size=1,
+                        download_id="fid",
+                    ),
+                ]
+            return []
+
+        def estimate_merge_uploads(self, parent_id: str, local_root: Path, root_name=None):
+            estimates.append((local_root, root_name))
+            return MergeUploadEstimate(files_to_upload=1, files_skipped=1)
+
+    browser = EstimateBrowser()
+    result = window._run_upload_conflict_check(browser, ROOT_DIRECTORY_ID, paths, summary)
+
+    items, estimate = result
+    assert {item.name for item in items} == {"已看完", "同名.txt"}
+    assert estimates == [(local_folder, "已看完")]
+    # 已看完：1 新增 + 1 跳过；新剧全量 2；同名顶层文件跳过 1
+    assert estimate == MergeUploadEstimate(files_to_upload=3, files_skipped=2)
+
+
+def test_upload_conflict_check_estimate_failure_degrades_to_none(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """估算只是展示增强：后端报错降级为 None，不阻塞对话框（登录过期除外）。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_folder = tmp_path / "已看完"
+    local_folder.mkdir()
+    (local_folder / "ep01.mkv").write_bytes(b"a")
+    summary = main_window_module.scan_upload_inputs((local_folder,))
+
+    class BrokenEstimateBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            return [
+                WopanItem(
+                    item_id="cloud-watched",
+                    name="已看完",
+                    kind=WopanItemKind.FOLDER,
+                    parent_id=parent_id,
+                )
+            ]
+
+        def estimate_merge_uploads(self, *args: object, **kwargs: object) -> object:
+            raise FileBrowserError("listing failed")
+
+    browser = BrokenEstimateBrowser()
+    result = window._run_upload_conflict_check(
+        browser, ROOT_DIRECTORY_ID, (local_folder,), summary
+    )
+
+    _items, estimate = result
+    assert estimate is None
+
+
+def test_upload_conflict_check_estimate_oserror_degrades_to_none(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """本地目录扫描的 OSError（权限/网络盘失效）同样降级，不炸掉冲突检查。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_folder = tmp_path / "已看完"
+    local_folder.mkdir()
+    (local_folder / "ep01.mkv").write_bytes(b"a")
+    summary = main_window_module.scan_upload_inputs((local_folder,))
+
+    class OSErrorEstimateBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            return [
+                WopanItem(
+                    item_id="cloud-watched",
+                    name="已看完",
+                    kind=WopanItemKind.FOLDER,
+                    parent_id=parent_id,
+                )
+            ]
+
+        def estimate_merge_uploads(self, *args: object, **kwargs: object) -> object:
+            raise OSError("permission denied")
+
+    result = window._run_upload_conflict_check(
+        OSErrorEstimateBrowser(), ROOT_DIRECTORY_ID, (local_folder,), summary
+    )
+
+    assert result[1] is None
+
+
 def test_upload_summary_marks_only_conflicting_top_level_entry(qapp: QApplication) -> None:
     parent = QWidget()
     folder = Path("/tmp/folder")
@@ -8199,6 +8362,7 @@ def test_upload_drop_uses_one_summary_for_conflict_decision(
         def __init__(
             self, summary: UploadBatchSummary, _target: str, _parent: QWidget, *,
             conflicts: tuple[Path, ...],
+            merge_estimate: object = None,
         ) -> None:
             dialogs.append((summary.file_count, conflicts))
 

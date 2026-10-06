@@ -1095,6 +1095,40 @@ def test_prepare_folder_upload_merge_reuses_dirs_and_skips_completed_files(
     tmp_path: Path,
 ) -> None:
     """合并模式：同名根/子目录复用不重建，同名同大小文件跳过，只补缺失。"""
+    client, local_root = _merge_tree_fixture(tmp_path)
+
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+
+    assert job.root_item_id == "cloud-photos"  # 根目录复用
+    # 只新建了缺失的 season3；photos/season1/season2 都未重建
+    assert client.created == [("cloud-photos", "season3")]
+
+    planned = {(f.target_dir_id, f.name): f.size for f in job.files}
+    assert ("cloud-s1", "ep2.mkv") in planned  # 缺失文件补传
+    assert ("cloud-s2", "new.mkv") in planned  # 上传进复用目录
+    assert any(dir_id.startswith("new-dir-") and name == "x.mkv" for (dir_id, name) in planned)
+    assert all(name != "ep1.mkv" for (_dir_id, name) in planned)  # 同名同大小跳过
+    # 同名不同大小 → 副本名补传
+    assert any(name.startswith("ep3") and "copy" in name for (_dir_id, name) in planned)
+
+
+def test_prepare_folder_upload_without_merge_rejects_existing_root(tmp_path: Path) -> None:
+    """非合并模式保持原语义：根目录同名直接报错。"""
+    client = _MergeCloudClient()
+    client.entries["0"] = [
+        WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
+    ]
+    local_root = tmp_path / "photos"
+    local_root.mkdir()
+    (local_root / "a.mkv").write_bytes(b"x")
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserError, match="上传目标已存在"):
+        service.prepare_folder_upload("0", local_root, root_name="photos")
+
+
+def _merge_tree_fixture(tmp_path: Path) -> tuple[_MergeCloudClient, Path]:
     client = _MergeCloudClient()
     cloud_root = WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
     cloud_s1 = WopanItem(
@@ -1132,36 +1166,37 @@ def test_prepare_folder_upload_merge_reuses_dirs_and_skips_completed_files(
     (local_root / "season1" / "ep3.mkv").write_bytes(b"c" * 300)
     (local_root / "season2" / "new.mkv").write_bytes(b"d" * 50)
     (local_root / "season3" / "x.mkv").write_bytes(b"e" * 10)
+    return client, local_root
 
+
+def test_estimate_merge_uploads_matches_prepare_skip_rules(tmp_path: Path) -> None:
+    """估算与 prepare(merge) 的跳过判定同源：同名同大小跳过、其余新增，
+    且完全只读（不创建任何云端内容）。"""
+    client, local_root = _merge_tree_fixture(tmp_path)
     service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    estimate = service.estimate_merge_uploads("0", local_root, root_name="photos")
+
+    # ep1 同名同大小跳过；ep2 缺失、ep3 大小不同、season2/new、season3/x 新增
+    assert estimate.files_to_upload == 4
+    assert estimate.files_skipped == 1
+    assert client.created == []  # 只读：不建目录
+
+    # 估算数与真实 prepare 的计划一致
     job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
-
-    assert job.root_item_id == "cloud-photos"  # 根目录复用
-    # 只新建了缺失的 season3；photos/season1/season2 都未重建
-    assert client.created == [("cloud-photos", "season3")]
-
-    planned = {(f.target_dir_id, f.name): f.size for f in job.files}
-    assert ("cloud-s1", "ep2.mkv") in planned  # 缺失文件补传
-    assert ("cloud-s2", "new.mkv") in planned  # 上传进复用目录
-    assert any(dir_id.startswith("new-dir-") and name == "x.mkv" for (dir_id, name) in planned)
-    assert all(name != "ep1.mkv" for (_dir_id, name) in planned)  # 同名同大小跳过
-    # 同名不同大小 → 副本名补传
-    assert any(name.startswith("ep3") and "copy" in name for (_dir_id, name) in planned)
+    assert len(job.files) == estimate.files_to_upload
 
 
-def test_prepare_folder_upload_without_merge_rejects_existing_root(tmp_path: Path) -> None:
-    """非合并模式保持原语义：根目录同名直接报错。"""
-    client = _MergeCloudClient()
-    client.entries["0"] = [
-        WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
-    ]
-    local_root = tmp_path / "photos"
-    local_root.mkdir()
-    (local_root / "a.mkv").write_bytes(b"x")
+def test_estimate_merge_uploads_root_missing_counts_everything(tmp_path: Path) -> None:
+    """同名根目录不存在：整棵树全量新增。"""
+    client, local_root = _merge_tree_fixture(tmp_path)
+    client.entries["0"] = []  # 云端没有 photos
     service = FileBrowserService(client)  # type: ignore[arg-type]
 
-    with pytest.raises(FileBrowserError, match="上传目标已存在"):
-        service.prepare_folder_upload("0", local_root, root_name="photos")
+    estimate = service.estimate_merge_uploads("0", local_root, root_name="photos")
+
+    assert estimate.files_to_upload == 5
+    assert estimate.files_skipped == 0
 
 
 def test_prepare_folder_upload_stops_between_cloud_creates(tmp_path: Path) -> None:

@@ -96,6 +96,7 @@ from openwopan.tasks.scheduler import DownloadTaskEvent
 from openwopan.tasks.transfer_rate import TransferRateEstimator
 from openwopan.tasks.upload import (
     FolderUploadJob,
+    MergeUploadEstimate,
     UploadBatchSummary,
     UploadConflictResolution,
     UploadTaskRecord,
@@ -103,6 +104,7 @@ from openwopan.tasks.upload import (
     format_upload_summary,
     make_upload_task_id,
     resolve_upload_targets,
+    scan_folder_tree,
     scan_upload_inputs,
 )
 from openwopan.ui.formatting import format_bytes as _format_bytes
@@ -428,6 +430,7 @@ class UploadSummaryDialog(QDialog):
         parent: QWidget,
         *,
         conflicts: tuple[Path, ...] = (),
+        merge_estimate: MergeUploadEstimate | None = None,
     ) -> None:
         super().__init__(parent)
         self._skip_conflicts_button: QRadioButton | None = None
@@ -454,7 +457,14 @@ class UploadSummaryDialog(QDialog):
             layout.addWidget(BodyLabel(f"发现 {len(conflicts)} 个同名项目", self))
             skip_button = QRadioButton("跳过冲突", self)
             self._skip_conflicts_button = skip_button
-            merge_button = QRadioButton("合并（跳过已存在的文件，补传缺失文件）", self)
+            if merge_estimate is not None:
+                merge_button = QRadioButton(
+                    f"合并（跳过已存在的文件，补传缺失文件）——预计新增 "
+                    f"{merge_estimate.files_to_upload} 个任务",
+                    self,
+                )
+            else:
+                merge_button = QRadioButton("合并（跳过已存在的文件，补传缺失文件）", self)
             self._merge_conflicts_button = merge_button
             copy_button = QRadioButton("保留副本", self)
             skip_button.setChecked(True)
@@ -462,6 +472,7 @@ class UploadSummaryDialog(QDialog):
             layout.addWidget(merge_button)
             layout.addWidget(copy_button)
             decision_label = BodyLabel("", self)
+            decision_label.setObjectName("uploadDecisionLabel")
             layout.addWidget(decision_label)
 
         buttons = QDialogButtonBox(
@@ -477,16 +488,23 @@ class UploadSummaryDialog(QDialog):
                 resolution = self.resolution()
                 if resolution == "skip":
                     count = len(summary.top_paths) - len(conflicts)
-                    decision_label.setText(f"将添加 {count} 个上传任务")
+                    # 文件夹批次按文件展开为多个任务，此计数以顶层项目为单位。
+                    decision_label.setText(f"将添加 {count} 个上传项目（同名跳过）")
                     confirm_button.setEnabled(count > 0)
                 elif resolution == "merge":
-                    decision_label.setText(
-                        "同名文件夹将合并续传：只补传缺失文件，已存在的同名文件跳过"
-                    )
+                    if merge_estimate is not None:
+                        detail = f"合并：预计新增 {merge_estimate.files_to_upload} 个上传任务"
+                        if merge_estimate.files_skipped:
+                            detail += f"（跳过 {merge_estimate.files_skipped} 个已存在文件）"
+                        decision_label.setText(detail)
+                    else:
+                        decision_label.setText(
+                            "同名文件夹将合并续传：只补传缺失文件，已存在的同名文件跳过"
+                        )
                     confirm_button.setEnabled(True)
                 else:
                     decision_label.setText(
-                        f"将添加 {len(summary.top_paths)} 个上传任务（同名的按副本重命名）"
+                        f"将添加 {len(summary.top_paths)} 个上传项目（同名的按副本重命名）"
                     )
                     confirm_button.setEnabled(True)
 
@@ -4931,13 +4949,15 @@ class MainWindow(_MainWindowBase):
             return
         request = self._upload_conflict_pending.pop(0)
         self._upload_conflict_current = request
-        paths, parent_id, _run_in_background, _summary = request
+        paths, parent_id, _run_in_background, summary = request
         file_browser = self._file_browser
         if file_browser is None:
             self._upload_conflict_current = None
             return
         thread = QThread(self)
-        worker = BrowserOperationWorker(lambda: file_browser.list_directory(parent_id))
+        worker = BrowserOperationWorker(
+            lambda: self._run_upload_conflict_check(file_browser, parent_id, paths, summary)
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._on_upload_conflict_check_succeeded)
@@ -4953,25 +4973,83 @@ class MainWindow(_MainWindowBase):
         LOGGER.info("main_window.upload_conflict_check.start top_count=%s", len(paths))
         thread.start()
 
+    def _run_upload_conflict_check(
+        self,
+        file_browser: FileBrowserBackend,
+        parent_id: str,
+        paths: tuple[Path, ...],
+        summary: UploadBatchSummary | None,
+    ) -> tuple[list[WopanItem], MergeUploadEstimate | None]:
+        """List the target directory and, when a summary dialog is coming,
+        estimate what a merge resolution would add (one cloud walk)."""
+
+        def estimate_merge(conflicts: tuple[Path, ...]) -> MergeUploadEstimate | None:
+            estimate = getattr(file_browser, "estimate_merge_uploads", None)
+            if not callable(estimate) or not conflicts:
+                return None
+            conflict_names = {path.name for path in conflicts}
+            to_upload = 0
+            skipped = 0
+            for path in paths:
+                if path.name in conflict_names:
+                    if path.is_dir():
+                        result = estimate(parent_id, path, path.name)
+                        to_upload += result.files_to_upload
+                        skipped += result.files_skipped
+                    else:
+                        # 合并模式下同名顶层文件跳过（与 resolve 线程一致）
+                        skipped += 1
+                elif path.is_dir():
+                    to_upload += len(scan_folder_tree(path).files)
+                else:
+                    to_upload += 1
+            return MergeUploadEstimate(files_to_upload=to_upload, files_skipped=skipped)
+
+        items = file_browser.list_directory(parent_id)
+        merge_estimate: MergeUploadEstimate | None = None
+        if summary is not None:
+            existing_names = {item.name for item in items}
+            conflicts = find_upload_conflicts(paths, existing_names)
+            if conflicts:
+                try:
+                    merge_estimate = estimate_merge(conflicts)
+                except FileBrowserLoginRequiredError:
+                    raise
+                except (FileBrowserError, OSError, ValueError):
+                    # 估算只是展示增强：失败降级为静态提示，不阻塞对话框。
+                    # OSError/ValueError 来自本地目录扫描（权限/网络盘失效）。
+                    LOGGER.info("main_window.upload_conflict_check.estimate_failed")
+                    merge_estimate = None
+        return (items, merge_estimate)
+
     def _on_upload_conflict_check_succeeded(self, result: object) -> None:
         if self._closing:
             return
         request = self._upload_conflict_current
-        if request is None or not isinstance(result, list):
+        if (
+            request is None
+            or not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], list)
+        ):
             self._on_upload_conflict_check_failed("上传目录检查结果无效")
             return
-        if not all(isinstance(item, WopanItem) for item in result):
+        cloud_items, merge_estimate = result
+        if not isinstance(merge_estimate, (MergeUploadEstimate, type(None))):
+            self._on_upload_conflict_check_failed("上传目录检查结果无效")
+            return
+        if not all(isinstance(item, WopanItem) for item in cloud_items):
             self._on_upload_conflict_check_failed("上传目录检查结果无效")
             return
         paths, parent_id, run_in_background, summary = request
         if self.current_directory_id() != parent_id:
             self._set_status("目录已变化，请重新提交上传任务")
             return
-        existing_names = {item.name for item in result}
+        existing_names = {item.name for item in cloud_items}
         LOGGER.info(
             "main_window.upload_conflict_check.success top_count=%s cloud_count=%s",
             len(paths),
-            len(result),
+            len(cloud_items),
         )
         self._upload_conflict_dialog_open = True
         try:
@@ -4979,7 +5057,11 @@ class MainWindow(_MainWindowBase):
             if summary is not None:
                 conflicts = find_upload_conflicts(paths, existing_names)
                 dialog = UploadSummaryDialog(
-                    summary, self.breadcrumb_names()[-1], self, conflicts=conflicts
+                    summary,
+                    self.breadcrumb_names()[-1],
+                    self,
+                    conflicts=conflicts,
+                    merge_estimate=merge_estimate,
                 )
                 accepted = dialog.exec() == QDialog.DialogCode.Accepted
                 if self._closing:

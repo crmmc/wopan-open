@@ -32,6 +32,7 @@ from openwopan.tasks.scheduler import (
 from openwopan.tasks.upload import (
     UPLOAD_SESSION_MAX_AGE_SECONDS,
     FolderUploadJob,
+    MergeUploadEstimate,
     PlannedUploadFile,
     UploadTaskRecord,
     UploadTaskState,
@@ -1142,6 +1143,62 @@ class FileBrowserService:
     def _existing_items(self, directory_id: str) -> dict[str, WopanItem]:
         """Map one cloud directory's entries by name (merge-mode lookups)."""
         return {item.name: item for item in self.list_directory(directory_id)}
+
+    def estimate_merge_uploads(
+        self,
+        parent_id: str,
+        local_root: Path,
+        root_name: str | None = None,
+    ) -> MergeUploadEstimate:
+        """Read-only estimate of what merging ``local_root`` would add.
+
+        跳过判定与 prepare_folder_upload 的 merge 分支同源：同名目录复用并
+        递归比对、同名同大小文件视为已上传；本地独有的子树整树计为新增。
+        不创建任何云端内容，只做列表读取；同名根目录不存在时全量新增。
+        """
+        plan = scan_folder_tree(local_root)
+        requested_root = root_name if root_name is not None else plan.root_name
+        root_existing = self._existing_items(parent_id).get(requested_root)
+        if root_existing is None or root_existing.kind is not WopanItemKind.FOLDER:
+            return MergeUploadEstimate(files_to_upload=len(plan.files), files_skipped=0)
+
+        # rel_dir -> 云端目录 id；None 表示云端没有对应目录（整棵子树全量）。
+        dir_ids: dict[str, str | None] = {"": root_existing.item_id}
+        cloud_items: dict[str, dict[str, WopanItem]] = {}
+
+        def items_for(rel_dir: str) -> dict[str, WopanItem] | None:
+            dir_id = dir_ids.get(rel_dir)
+            if dir_id is None:
+                return None
+            if rel_dir not in cloud_items:
+                cloud_items[rel_dir] = self._existing_items(dir_id)
+            return cloud_items[rel_dir]
+
+        for rel_path in plan.folders:  # 父目录先于子目录（scan 保证）
+            rel_parent, _, local_name = rel_path.rpartition("/")
+            items = items_for(rel_parent)
+            existing = items.get(local_name) if items is not None else None
+            if existing is not None and existing.kind is WopanItemKind.FOLDER:
+                dir_ids[rel_path] = existing.item_id
+            else:
+                dir_ids[rel_path] = None
+
+        files_to_upload = 0
+        files_skipped = 0
+        for planned in plan.files:
+            items = items_for(planned.rel_dir)
+            existing = items.get(planned.name) if items is not None else None
+            if (
+                existing is not None
+                and existing.kind is WopanItemKind.FILE
+                and existing.size == planned.size
+            ):
+                files_skipped += 1
+            else:
+                files_to_upload += 1
+        return MergeUploadEstimate(
+            files_to_upload=files_to_upload, files_skipped=files_skipped
+        )
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""
