@@ -840,8 +840,17 @@ class FileBrowserService:
             parent_id,
             len(local_path.name),
         )
+        # stat before delete: an unreadable file must keep the old session's
+        # confirmed parts instead of losing them to an unwrapped OSError.
+        try:
+            stat_result = local_path.stat()
+        except OSError as exc:
+            LOGGER.warning(
+                "file_browser.upload_file.restart_stat_failed error_type=%s",
+                type(exc).__name__,
+            )
+            raise FileBrowserError(f"无法读取本地文件：{exc}") from exc
         store.delete(task_id)
-        stat_result = local_path.stat()
         part_size, total_parts = resolve_upload_part_plan(
             stat_result.st_size, self._settings.upload_part_size_mb
         )
@@ -922,7 +931,12 @@ class FileBrowserService:
                 continue
             was_active = state.status == "进行中"
             try:
-                updated = store.update(state.task_id, _mark_upload_interrupted)
+                if was_active:
+                    # 只有「进行中」是被打断的；「失败」保留原状态与错误
+                    # 原因（重试语义不变），「已暂停」本就是用户意图。
+                    updated = store.update(state.task_id, _mark_upload_interrupted)
+                else:
+                    updated = state
             except KeyError:
                 # The session was deleted concurrently (retention purge racing
                 # this recovery loop); nothing left to recover for it.

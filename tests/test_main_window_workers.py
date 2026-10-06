@@ -3796,6 +3796,9 @@ def test_history_restore_normalizes_non_terminal_upload_rows(
 ) -> None:
     """重启恢复：非终态上传历史行归一为「已暂停」，不再显示僵尸状态。"""
     window = MainWindow(WorkerFileBrowser())
+    (tmp_path / "ep01.mkv").write_bytes(b"x" * 10)
+    (tmp_path / "ep02.mkv").write_bytes(b"x" * 10)
+    (tmp_path / "done.mkv").write_bytes(b"x" * 10)
     window._on_transfer_history_loaded(
         (
             TransferRecord(
@@ -4002,6 +4005,162 @@ def test_resume_folder_summary_row_is_guarded(
     record = window.transfer_interface._find_record("upload", task_id)
     assert record is not None and record.status == "已暂停"
     assert "文件夹汇总" in window.status_message()
+
+
+def test_upload_session_recovery_folds_into_failed_history_row(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """失败历史行 × 残留会话（历史先到）：折叠进失败行，不产生双行。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=local_path,
+                status="失败",
+                error="HTTP 500",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+    session = UploadTaskRecord(
+        task_id="hash1",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="失败",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="HTTP 500",
+        resumable=True,
+    )
+
+    window._on_upload_recovery_succeeded((session,))
+
+    rows = [
+        r
+        for r in window.transfer_interface.upload_records
+        if r.target_path == local_path
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.task_id == "upload-1"
+    assert row.status == "失败" and row.upload_retryable  # 保留失败态与重试按钮
+
+
+def test_upload_session_recovery_skips_user_active_row(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """用户本会话正在上传同一目标时，会话恢复不覆盖活动行、不新增行。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    task_id = window._create_upload_record(
+        local_path, parent_id="cloud-1", upload_name="ep01.mkv", retryable=True
+    )
+    window.transfer_interface.update_record("upload", task_id, status="上传中")
+    session = UploadTaskRecord(
+        task_id="hash1",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="已暂停",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="应用中断，已暂停（已完成 3/5 分片）",
+        resumable=True,
+        was_active=True,
+    )
+
+    window._on_upload_recovery_succeeded((session,))
+
+    rows = [
+        r
+        for r in window.transfer_interface.upload_records
+        if r.target_path == local_path
+    ]
+    assert len(rows) == 1
+    assert rows[0].task_id == task_id
+    assert rows[0].status == "上传中"  # 活动行未被改写成已暂停
+
+
+def test_history_normalization_marks_file_rows_resumable_only(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """归一化：文件行补 upload_retryable 可续传；文件夹汇总行保持不可续传。"""
+    window = MainWindow(WorkerFileBrowser())
+    file_path = tmp_path / "a.mkv"
+    file_path.write_bytes(b"x")
+    folder = tmp_path / "汇总"
+    folder.mkdir()
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="a.mkv",
+                size=1,
+                target_path=file_path,
+                status="等待中",
+                upload_parent_id="cloud-1",
+                upload_name="a.mkv",
+                upload_retryable=False,
+            ),
+            TransferRecord(
+                task_id="upload-2",
+                direction="upload",
+                name="汇总",
+                size=0,
+                target_path=folder,
+                status="创建目录中",
+                upload_parent_id="cloud-root",
+            ),
+        )
+    )
+
+    file_row = window.transfer_interface._find_record("upload", "upload-1")
+    dir_row = window.transfer_interface._find_record("upload", "upload-2")
+    assert file_row is not None
+    assert file_row.status == "已暂停"
+    assert file_row.upload_retryable and file_row.can_resume
+    assert dir_row is not None
+    assert dir_row.status == "已暂停"
+    assert not dir_row.upload_retryable and not dir_row.can_resume
+
+
+def test_upload_recovery_runs_once_per_session(qapp: QApplication) -> None:
+    """重新登录会再次触发恢复入口：一次性守卫防二次改写与重复建行。"""
+
+    class _RecoverBrowser(WorkerFileBrowser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recover_calls = 0
+
+        def recover_uploads(self) -> tuple[UploadTaskRecord, ...]:
+            self.recover_calls += 1
+            return ()
+
+    browser = _RecoverBrowser()
+    window = MainWindow(browser)
+
+    window._recover_uploads()
+    window._upload_recovery_thread = None  # 同步线程已清理，模拟回到空闲
+    window._recover_uploads()
+
+    assert browser.recover_calls == 1
+    assert window._upload_recovery_done
 
 
 def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(

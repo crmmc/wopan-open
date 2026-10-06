@@ -2843,6 +2843,7 @@ class MainWindow(_MainWindowBase):
         self._download_recovery_thread: QThread | None = None
         self._upload_recovery_thread: QThread | None = None
         self._upload_recovery_worker: BrowserOperationWorker | None = None
+        self._upload_recovery_done = False
         self._download_recovery_worker: BrowserOperationWorker | None = None
         self._download_close_thread: QThread | None = None
         self._download_close_worker: BrowserOperationWorker | None = None
@@ -3275,9 +3276,12 @@ class MainWindow(_MainWindowBase):
                     # 上传侧没有调度器认领恢复行：非终态历史行重启后没有
                     # 任何执行体，原样恢复会显示成僵尸「上传中/等待中」。
                     # 统一归一为「已暂停」——有会话的行随后被上传恢复合并
-                    # 修正为断点续传，其余行可单个/批量继续重传。
+                    # 修正为断点续传，文件行可单个/批量继续重传；文件夹
+                    # 汇总行保持不可续传（本身没有可上传的内容）。
                     record.status = "已暂停"
-                    record.can_resume = True
+                    if record.target_path is not None and record.target_path.is_file():
+                        record.upload_retryable = True
+                        record.can_resume = True
                     self.transfer_interface._save_record(record)
                 uploads.append(record)
             else:
@@ -6291,11 +6295,6 @@ class MainWindow(_MainWindowBase):
         record = self.transfer_interface._find_record("upload", task_id)
         if record is None or record.status != "已暂停":
             return
-        if record.target_path is not None and record.target_path.is_dir():
-            # 文件夹汇总行（重启后归一为已暂停）：无可续传内容，批量继续
-            # 时被选中也不应报错或标失败。
-            self._set_status("该行为文件夹汇总：请选择其中的子文件继续上传")
-            return
         worker = self._upload_workers.get(task_id)
         if worker is not None:
             worker.request_resume()
@@ -6303,6 +6302,12 @@ class MainWindow(_MainWindowBase):
             self.transfer_interface.update_record(
                 "upload", task_id, status="上传中", can_resume=False
             )
+            return
+        if record.target_path is not None and record.target_path.is_dir():
+            # 文件夹汇总行（重启后归一为已暂停）：无可续传内容，批量继续
+            # 时被选中也不应报错或标失败。置于 worker 检查之后，避免未来
+            # 可暂停汇总行时拦截真实的 worker 恢复。
+            self._set_status("该行为文件夹汇总：请选择其中的子文件继续上传")
             return
         pending = self._paused_uploads.pop(task_id, None)
         if pending is None:
@@ -6670,11 +6675,18 @@ class MainWindow(_MainWindowBase):
         self._download_recovery_worker = None
 
     def _recover_uploads(self) -> None:
-        if self._file_browser is None:
+        if (
+            self._file_browser is None
+            or self._upload_recovery_done
+            or self._upload_recovery_thread is not None
+        ):
             return
         recover = getattr(self._file_browser, "recover_uploads", None)
         if not callable(recover):
             return
+        # 一次性守卫（与 _load_transfer_history 对等）：重新登录会再次触发
+        # set_file_browser，二次恢复会把失败会话改写并重复建行。
+        self._upload_recovery_done = True
         thread = QThread(self)
         worker = BrowserOperationWorker(recover)
         worker.moveToThread(thread)
@@ -6703,9 +6715,10 @@ class MainWindow(_MainWindowBase):
             if record is None or record.status != "已暂停" or not record.upload_retryable:
                 continue
             # 死前正在传输的会话自动续传（与下载侧恢复语义对齐）；死前已
-            # 暂停/失败的会话保持手动继续。
+            # 暂停/失败的会话保持手动继续。批处理避免逐行立即全表渲染。
             LOGGER.info("main_window.upload.recovery.auto_resume task_id=%s", task_id)
-            self._resume_upload_task(task_id)
+            with self.transfer_interface.batch_updates():
+                self._resume_upload_task(task_id)
 
     def _on_upload_recovery_failed(self, message: str) -> None:
         LOGGER.warning("main_window.upload.recovery.failed error=%s", message)
@@ -6743,11 +6756,22 @@ class MainWindow(_MainWindowBase):
         if not all(hasattr(persisted, attribute) for attribute in required):
             return None
         persisted_record = cast(UploadTaskRecord, persisted)
+        session_error = str(getattr(persisted_record, "error", "") or "")
+        upload_name = getattr(persisted_record, "upload_name", None)
         existing = self._find_upload_row_by_target(
             persisted_record.local_path,
             persisted_record.target_parent_id,
-            getattr(persisted_record, "upload_name", None),
+            upload_name,
         )
+        if existing is not None and existing.status != "已暂停":
+            # 用户本会话正在上传/排队同一目标：该活动上传调用服务层时会按
+            # 会话 task_id 自动复用持久化分片，恢复行成为冗余，不添加也
+            # 不覆盖活动行（覆盖会把「上传中」误写成「已暂停」）。
+            LOGGER.info(
+                "main_window.upload.recovery.skipped_active_row task_id=%s",
+                existing.task_id,
+            )
+            return None
         if existing is not None:
             # 会话行与已归一化的历史行指向同一文件：合并进现有行，保留其
             # 序列 task_id，避免同一文件出现两行。
@@ -6757,9 +6781,23 @@ class MainWindow(_MainWindowBase):
                 status=persisted_record.status,
                 total_bytes=getattr(persisted_record, "file_size", None),
                 can_resume=True,
-                error=str(getattr(persisted_record, "error", "") or ""),
+                error=session_error,
             )
             return existing.task_id
+        failed_row = self._find_failed_upload_row_by_target(
+            persisted_record.local_path,
+            persisted_record.target_parent_id,
+            upload_name,
+        )
+        if failed_row is not None:
+            # 失败历史行 + 残留会话（失败时会话保留）：折叠断点信息、保留
+            # 失败状态与重试按钮，不新增第二行。
+            self.transfer_interface.update_record(
+                "upload",
+                failed_row.task_id,
+                error=f"{failed_row.error}；{session_error}".strip("；"),
+            )
+            return None
         record = TransferRecord(
             task_id=persisted_record.task_id,
             direction="upload",
@@ -6767,13 +6805,29 @@ class MainWindow(_MainWindowBase):
             size=getattr(persisted_record, "file_size", None),
             target_path=persisted_record.local_path,
             status=persisted_record.status,
-            error=str(getattr(persisted_record, "error", "") or ""),
+            error=session_error,
             upload_parent_id=persisted_record.target_parent_id,
-            upload_name=getattr(persisted_record, "upload_name", None),
+            upload_name=upload_name,
             upload_retryable=bool(getattr(persisted_record, "resumable", False)),
         )
         self.transfer_interface.add_upload_record(record)
         return record.task_id
+
+    def _find_failed_upload_row_by_target(
+        self,
+        target_path: Path | None,
+        upload_parent_id: str | None,
+        upload_name: str | None,
+    ) -> TransferRecord | None:
+        for record in self.transfer_interface.upload_records:
+            if (
+                record.target_path == target_path
+                and record.upload_parent_id == upload_parent_id
+                and record.upload_name == upload_name
+                and record.status == "失败"
+            ):
+                return record
+        return None
 
     def _load_persisted_download_records(self) -> None:
         if self._file_browser is None:

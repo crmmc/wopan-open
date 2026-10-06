@@ -1573,6 +1573,52 @@ def test_service_upload_restarts_fresh_when_session_rejected_with_5xx(
     assert _state(store, task_id) is None
 
 
+def test_restart_rejected_session_keeps_parts_when_stat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """会话重传启动前文件消失：报可读错误且旧会话分片保留（不被删除）。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+
+    class _RejectAndVanishClient(ResumeAwareUploadClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject = False
+            self._request = httpx.Request("POST", "https://upload.example/x")
+            self._response = httpx.Response(500, request=self._request)
+
+        def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
+            resume = kwargs.get("resume")
+            if (
+                self.reject
+                and isinstance(resume, UploadResumeContext)
+                and resume.completed_indexes
+            ):
+                local_path.unlink()
+                raise httpx.HTTPStatusError(
+                    "Server Error", request=self._request, response=self._response
+                )
+            return super().upload_file(parent_id, local_path, **kwargs)
+
+    client = _RejectAndVanishClient()
+    service, client, store = _resume_service(tmp_path, client=client)
+    local_path = tmp_path / "report.bin"
+    local_path.write_bytes(b"012345678901234")
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+
+    client.upload_failure = None
+    client.reject = True
+    client.part_results = []
+    with pytest.raises(FileBrowserError, match="无法读取本地文件"):
+        service.upload_file("folder-1", local_path)
+
+    state = store.load(make_upload_task_id("folder-1", local_path, None))
+    assert state is not None
+    assert state.completed_indexes == [1]  # 旧会话断点未丢
+
+
 def test_service_upload_keeps_session_when_new_parts_confirmed_before_5xx(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
