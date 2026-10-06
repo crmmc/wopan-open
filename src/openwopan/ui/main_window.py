@@ -6043,6 +6043,8 @@ class MainWindow(_MainWindowBase):
         )
 
     def _on_upload_cancelled(self, task_id: str) -> None:
+        # 终态即离开暂停表（防暂停竞态残留卡住批次收尾三态门）
+        self._paused_uploads.pop(task_id, None)
         folder_child = task_id in self._folder_upload_child_ids
         if folder_child:
             self._folder_upload_cancel_count += 1
@@ -6071,6 +6073,7 @@ class MainWindow(_MainWindowBase):
         )
         record_id = task_id or self._upload_task_id
         if record_id is not None:
+            self._paused_uploads.pop(record_id, None)
             total = item.size if item.size is not None else None
             self.transfer_interface.update_record(
                 "upload",
@@ -6113,6 +6116,8 @@ class MainWindow(_MainWindowBase):
             return
         LOGGER.warning("main_window.upload.failed error=%s", message)
         record_id = task_id or self._upload_task_id
+        if record_id is not None:
+            self._paused_uploads.pop(record_id, None)
         if record_id is not None and record_id in self._folder_upload_child_ids:
             if record_id not in self._folder_upload_failed_ids:
                 self._folder_upload_failed_ids.add(record_id)
@@ -6127,6 +6132,8 @@ class MainWindow(_MainWindowBase):
             self._show_login_required_error(message)
             return
         failed_task_id = task_id or self._upload_task_id
+        if failed_task_id is not None:
+            self._paused_uploads.pop(failed_task_id, None)
         self._mark_transfer_failed("upload", failed_task_id, message)
         self._show_login_required_error(message)
         if failed_task_id not in self._folder_upload_child_ids:
@@ -6295,6 +6302,10 @@ class MainWindow(_MainWindowBase):
             return
         worker = self._upload_workers.get(task_id)
         if worker is not None:
+            if record.status not in ACTIVE_UPLOAD_STATUSES:
+                # 终态已送达但线程清理未完成的窗口：此时登记暂停表会让
+                # 批次收尾三态门永远看到该表项，根行卡死「上传中」。
+                return
             # 暂停的 worker 线程阻塞在下一个分片检查点，仍占着一个并发槽
             # （取消会丢会话分片，见 file_browser.upload_file 的取消路径），
             # 恢复时原线程继续。同时登记暂停表供批次收尾判定与重建用。
@@ -6465,6 +6476,7 @@ class MainWindow(_MainWindowBase):
         if record is None or task_id in self._upload_removal_requested:
             return
         if record.status in TERMINAL_TRANSFER_STATUSES:
+            self._paused_uploads.pop(task_id, None)
             self.transfer_interface.remove_records("upload", {task_id})
             return
         if task_id == self._folder_upload_record_id:
@@ -6494,6 +6506,10 @@ class MainWindow(_MainWindowBase):
         if pending is not None or folder_pending is not None:
             if task_id in self._folder_upload_child_ids:
                 self._folder_upload_cancel_count += 1
+                if task_id in self._folder_upload_failed_ids:
+                    # 失败后重试又被删除：回滚失败计数，避免双重计数
+                    self._folder_upload_failed_ids.remove(task_id)
+                    self._folder_upload_failure_count -= 1
             self.transfer_interface.remove_records("upload", {task_id})
             self._maybe_finish_folder_upload()
             self._start_next_pending_folder()
