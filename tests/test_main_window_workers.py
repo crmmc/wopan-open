@@ -53,7 +53,6 @@ from openwopan.ui.main_window import (
     PendingFolderUpload,
     PendingUploadTask,
     PlaceholderInterface,
-    QueuedUploadFile,
     TransferInterface,
     TransferRecord,
     UploadConflictDialog,
@@ -1221,10 +1220,10 @@ def test_close_window_cancels_waiting_folder_records(
     waiting_id = window._create_upload_record(waiting)
     window.transfer_interface.update_record("upload", child_id, status="上传中")
     window._folder_upload_record_id = root_id
+    window._folder_upload_child_ids = {child_id, next_id}
 
-    window._folder_upload_active = QueuedUploadFile(child_id, child, "cloud-root", "child.txt")
-    window._folder_upload_queue = [
-        QueuedUploadFile(next_id, next_child, "cloud-root", "next.txt")
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", next_child, next_id, "next.txt", False)
     ]
     window._folder_prepare_pending = [
         PendingFolderUpload(waiting, ROOT_DIRECTORY_ID, "waiting", waiting_id)
@@ -1235,7 +1234,7 @@ def test_close_window_cancels_waiting_folder_records(
     assert [window.transfer_interface._find_record("upload", task_id).status for task_id in (
         root_id, next_id, waiting_id
     )] == ["已取消", "已取消", "已取消"]
-    assert window._folder_upload_queue == []
+    assert window._upload_pending == []
     assert window._folder_prepare_pending == []
     assert window.transfer_interface._find_record("upload", child_id).status == "上传中"
     window._on_folder_upload_prepare_failed("关闭后的失败")
@@ -1639,8 +1638,8 @@ def test_folder_prepare_updates_ui_on_gui_thread(
     assert _wait_until(
         qapp,
         lambda: window._folder_prepare_thread is None
-        and window._folder_upload_active is None
-        and window._folder_upload_queue == []
+        and window._folder_upload_record_id is None
+        and not window._upload_pending
         and len(observed) >= 3,
     )
     assert observed == [gui_thread_id] * len(observed)
@@ -4375,11 +4374,8 @@ def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(
     )
     window._folder_upload_record_id = root_id
     window._folder_upload_child_ids = {active_id, next_id}
-    window._folder_upload_active = QueuedUploadFile(
-        active_id, active_path, "cloud-root", "active.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile(next_id, next_path, "cloud-root", "next.txt")
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", next_path, next_id, "next.txt", False)
     ]
     calls: list[str] = []
     worker = SimpleNamespace(
@@ -4388,26 +4384,20 @@ def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(
     )
     window._upload_workers[active_id] = worker  # type: ignore[assignment]
     window._upload_threads[active_id] = QThread(window)
-    monkeypatch.setattr(
-        window,
-        "_start_upload_task",
-        lambda _parent, _path, task_id, **_kwargs: calls.append(task_id),
-    )
 
     window._pause_upload_task(active_id)
 
-    assert calls == ["pause", next_id]
-    assert window._folder_upload_active is not None
-    assert window._folder_upload_active.task_id == next_id
-    assert window._folder_upload_queue == []
+    # 统一管线：暂停的 worker 阻塞占槽，FIFO 不受影响；恢复原线程继续。
+    assert calls == ["pause"]
     assert active_id in window._paused_uploads
+    assert [pending.task_id for pending in window._upload_pending] == [next_id]
     record = window.transfer_interface._find_record("upload", active_id)
     assert record is not None and record.status == "已暂停"
 
     window._resume_upload_task(active_id)
     assert active_id not in window._paused_uploads
     assert window.transfer_interface._find_record("upload", active_id).status == "上传中"
-    assert calls == ["pause", next_id, "resume"]
+    assert calls == ["pause", "resume"]
 
 
 def test_paused_folder_worker_keeps_upload_limit(
@@ -4431,11 +4421,8 @@ def test_paused_folder_worker_keeps_upload_limit(
     )
     window._folder_upload_record_id = root_id
     window._folder_upload_child_ids = {active_id, next_id}
-    window._folder_upload_active = QueuedUploadFile(
-        active_id, active_path, "cloud-root", "active.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile(next_id, next_path, "cloud-root", "next.txt")
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", next_path, next_id, "next.txt", False)
     ]
     window._upload_workers[active_id] = SimpleNamespace(
         request_pause=lambda: None,
@@ -4445,10 +4432,11 @@ def test_paused_folder_worker_keeps_upload_limit(
 
     window._pause_upload_task(active_id)
 
-    assert window._folder_upload_active is not None
-    assert window._folder_upload_active.task_id == next_id
+    # 暂停的 worker 仍占用唯一并发槽：排队的 next 不启动，状态保持等待。
+    assert active_id in window._paused_uploads
     assert [pending.task_id for pending in window._upload_pending] == [next_id]
     assert list(window._upload_threads) == [active_id]
+    assert window.transfer_interface._find_record("upload", next_id).status == "等待中"
 
 
 def test_main_window_batch_upload_controls_waiting_task(
@@ -4541,10 +4529,9 @@ def test_main_window_batch_upload_controls_queued_folder_task(
         retryable=True,
     )
     window._folder_upload_record_id = root_id
-    window._folder_upload_queue = [
-        main_window_module.QueuedUploadFile(
-            child_id, child, "cloud-root", "child.txt"
-        )
+    window._folder_upload_child_ids = {child_id}
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", child, child_id, "child.txt", False)
     ]
     started: list[tuple[object, ...]] = []
     monkeypatch.setattr(
@@ -4557,7 +4544,7 @@ def test_main_window_batch_upload_controls_queued_folder_task(
 
     assert window.transfer_interface._find_record("upload", child_id).status == "已暂停"
     assert child_id in window._paused_uploads
-    assert [item.task_id for item in window._folder_upload_queue] == [child_id]
+    assert window._upload_pending == []
 
     window._resume_selected_uploads({child_id})
 
@@ -6181,8 +6168,8 @@ def test_prompt_upload_folder_uploads_selected_folder(
     assert browser.prepared_uploads == [(ROOT_DIRECTORY_ID, local_root)]
     assert len(browser.uploaded_files) == 2
     assert window._folder_prepare_thread is None
-    assert window._folder_upload_queue == []
-    assert window._folder_upload_active is None
+    assert window._upload_pending == []
+    assert window._folder_upload_record_id is None
 
 
 def test_folder_upload_runs_two_phases_and_updates_records(
@@ -6284,11 +6271,12 @@ def test_ordinary_upload_login_failure_does_not_clear_folder_queue(
     folder_root = tmp_path / "folder"
     folder_root.mkdir()
     ordinary_task_id = window._create_upload_record(ordinary_path)
-    window._folder_upload_active = QueuedUploadFile(
-        "folder-active", folder_root / "child.txt", "cloud-root", "child.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile("folder-pending", folder_root / "next.txt", "cloud-root", "next.txt")
+    root_id = window._create_upload_record(folder_root, name="folder")
+    window._folder_upload_record_id = root_id
+    window._folder_upload_child_ids = {"folder-active", "folder-pending"}
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", folder_root / "child.txt", "folder-active", "child.txt", False),
+        PendingUploadTask("cloud-root", folder_root / "next.txt", "folder-pending", "next.txt", False),
     ]
     window._folder_prepare_pending = [
         PendingFolderUpload(folder_root, "pinned-parent", "folder", "pending-folder")
@@ -6298,52 +6286,55 @@ def test_ordinary_upload_login_failure_does_not_clear_folder_queue(
     window._on_upload_login_required("登录已过期，请重新登录", task_id=ordinary_task_id)
 
     assert window.transfer_interface._find_record("upload", ordinary_task_id).status == "失败"
-    assert window._folder_upload_active is not None
-    assert window._folder_upload_active.task_id == "folder-active"
-    assert [queued.task_id for queued in window._folder_upload_queue] == ["folder-pending"]
+    assert window._folder_upload_record_id == root_id
+    assert [pending.task_id for pending in window._upload_pending] == [
+        "folder-active",
+        "folder-pending",
+    ]
     assert window._folder_prepare_pending == [
         PendingFolderUpload(folder_root, "pinned-parent", "folder", "pending-folder")
     ]
     assert window._folder_upload_target_dir_id == "pinned-parent"
 
 
-def test_folder_upload_joins_shared_fifo_behind_waiting_files(
+def test_folder_children_honor_concurrent_upload_limit(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1))
-    ordinary = tmp_path / "ordinary.txt"
-    child = tmp_path / "child.txt"
-    window._upload_thread = QThread(window)  # type: ignore[assignment]
+    """统一管线：文件夹子任务与单文件共用 FIFO，并发数=max_concurrent_uploads。"""
+    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=3))
+    files = []
+    for index in range(5):
+        path = tmp_path / f"ep{index}.txt"
+        path.write_text("x")
+        files.append(path)
+    root_id = window._create_upload_record(tmp_path, name="batch")
+    task_ids = [
+        window._create_upload_record(
+            path, parent_id="cloud-root", upload_name=path.name, retryable=True
+        )
+        for path in files
+    ]
+    window._folder_upload_record_id = root_id
+    window._folder_upload_child_ids = set(task_ids)
     window._upload_pending = [
-        PendingUploadTask(ROOT_DIRECTORY_ID, ordinary, "ordinary", None, False)
+        PendingUploadTask("cloud-root", path, task_id, path.name, False)
+        for path, task_id in zip(files, task_ids)
     ]
-    window._folder_upload_queue = [
-        QueuedUploadFile("folder-child", child, "cloud-root", "child.txt")
-    ]
-
-    window._continue_folder_upload_queue()
-
-    assert [pending.task_id for pending in window._upload_pending] == [
-        "ordinary", "folder-child"
-    ]
-    assert window._folder_upload_active is not None
-    assert window._folder_upload_active.task_id == "folder-child"
-    window._upload_thread = None
-    started: list[str] = []
+    launched: list[str] = []
 
     def launch(_parent: str, _path: Path, task_id: str, **_kwargs: object) -> None:
-        started.append(task_id)
+        launched.append(task_id)
         window._upload_threads[task_id] = QThread(window)
 
     monkeypatch.setattr(window, "_launch_upload_task", launch)
+
     window._start_next_upload_task()
-    assert started == ["ordinary"]
-    window._upload_threads.pop("ordinary")
+
+    assert launched == task_ids[:3]  # 3 路并发（修复前文件夹批次固定单任务串行）
+    window._upload_threads.pop(task_ids[0])
     window._start_next_upload_task()
-    assert started == ["ordinary", "folder-child"]
+    assert launched == task_ids[:3] + [task_ids[3]]  # 槽位释放后按 FIFO 补位
     window._upload_threads.clear()
-    window._folder_upload_active = None
-    window._folder_upload_queue.clear()
 
 
 def test_folder_prepare_login_failure_preserves_other_pending_folder(
@@ -6383,10 +6374,13 @@ def test_folder_upload_stops_chaining_on_login_required(
     qapp: QApplication,
     tmp_path: Path,
 ) -> None:
-    """AC6：登录态失效停止排队，未开始记录明确失败。"""
+    """AC6：登录态失效停止排队，未开始记录明确失败。
+
+    单并发下保持确定性：第一个成功、第二个登录失效、第三个被拆除标记。
+    """
     browser = WorkerFileBrowser()
     browser.upload_errors = [None, FileBrowserLoginRequiredError("登录已过期，请重新登录")]
-    window = MainWindow(browser)
+    window = MainWindow(browser, settings=AppSettings(max_concurrent_uploads=1))
     window.refresh_current_directory()
     observed_messages: list[str] = []
     window.login_required.connect(observed_messages.append)
@@ -6406,8 +6400,8 @@ def test_folder_upload_stops_chaining_on_login_required(
         (f"cloud-{ROOT_DIRECTORY_ID}-2024", local_root / "2024" / "春节.md"),
         (f"cloud-{ROOT_DIRECTORY_ID}-root", local_root / "结尾.txt"),
     ]
-    assert window._folder_upload_queue == []
-    assert window._folder_upload_active is None
+    assert window._upload_pending == []
+    assert window._folder_upload_record_id is None
 
 
 @pytest.mark.parametrize("terminal", ["success", "failure", "login"])
@@ -6466,23 +6460,30 @@ def test_removed_preparing_folder_ignores_late_failure(
 
 
 def test_remove_waiting_folder_child_preserves_next_and_root(
-    qapp: QApplication, tmp_path: Path,
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
     root_id = window._create_upload_record(tmp_path / "root")
     queued_id = window._create_upload_record(tmp_path / "queued.txt")
     next_id = window._create_upload_record(tmp_path / "next.txt")
     window._folder_upload_record_id = root_id
-    window._folder_upload_active = QueuedUploadFile(
-        "active", tmp_path / "active.txt", "c", "active.txt"
-    )
-    window._upload_threads["active"] = QThread(window)
-    window._folder_upload_queue = [
-        QueuedUploadFile(queued_id, tmp_path / "queued.txt", "c", "queued.txt"),
-        QueuedUploadFile(next_id, tmp_path / "next.txt", "c", "next.txt"),
+    window._folder_upload_child_ids = {queued_id, next_id}
+    window._upload_pending = [
+        PendingUploadTask("c", tmp_path / "queued.txt", queued_id, "queued.txt", False),
+        PendingUploadTask("c", tmp_path / "next.txt", next_id, "next.txt", False),
     ]
+    launched: list[str] = []
+    monkeypatch.setattr(
+        window,
+        "_launch_upload_task",
+        lambda _parent, _path, task_id, **_kwargs: (
+            launched.append(task_id),
+            window._upload_threads.__setitem__(task_id, QThread(window)),
+        ),
+    )
     window._remove_transfer_records("upload", {queued_id})
-    assert [queued.task_id for queued in window._folder_upload_queue] == [next_id]
+    # 统一管线：删除等待中的子任务后，剩余子任务按 FIFO 自动补位启动
+    assert launched == [next_id]
     assert window._folder_upload_cancel_count == 1
     assert window.transfer_interface._find_record("upload", queued_id) is None
     assert window.transfer_interface._find_record("upload", root_id) is not None
@@ -6628,9 +6629,7 @@ def test_batch_remove_pending_child_root_and_folder_never_starts_selected_folder
     selected_id = window._create_upload_record(tmp_path / "selected")
     survivor_id = window._create_upload_record(tmp_path / "survivor")
     window._folder_upload_record_id = root_id
-    window._folder_upload_active = QueuedUploadFile(
-        child_id, tmp_path / "child.txt", "c", "child.txt"
-    )
+    window._folder_upload_child_ids = {child_id}
     window._upload_pending = [
         PendingUploadTask("c", tmp_path / "child.txt", child_id, "child.txt", False)
     ]
@@ -6687,33 +6686,35 @@ def test_remove_active_folder_child_waits_then_drains(
     child_id = window._create_upload_record(tmp_path / "child.txt")
     next_id = window._create_upload_record(tmp_path / "next.txt")
     window._folder_upload_record_id = root_id
-    window._folder_upload_active = QueuedUploadFile(
-        child_id, tmp_path / "child.txt", "c", "child.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile(next_id, tmp_path / "next.txt", "c", "next.txt")
+    window._folder_upload_child_ids = {child_id, next_id}
+    window._upload_pending = [
+        PendingUploadTask("c", tmp_path / "next.txt", next_id, "next.txt", False)
     ]
     requested: list[bool] = []
     window._upload_workers[child_id] = SimpleNamespace(
         request_cancel=lambda: requested.append(True)
     )  # type: ignore[assignment]
     window._upload_threads[child_id] = QThread(window)
-    started: list[str] = []
-    monkeypatch.setattr(
-        window, "_start_upload_task", lambda parent, path, tid, **kw: started.append(tid)
-    )
+    launched: list[str] = []
+
+    def fake_launch(_parent: str, _path: Path, task_id: str, **_kwargs: object) -> None:
+        launched.append(task_id)
+        window._upload_threads[task_id] = QThread(window)
+        window._upload_workers[task_id] = SimpleNamespace(request_cancel=lambda: None)
+
+    monkeypatch.setattr(window, "_launch_upload_task", fake_launch)
 
     window._remove_transfer_records("upload", {child_id})
     assert requested == [True]
+    assert launched == [next_id]  # 槽位仍在（child 未退出），next 由统一 FIFO 补位
     assert window.transfer_interface._find_record("upload", child_id) is not None
     window._on_upload_cancelled(child_id)
     window._upload_workers.pop(child_id)
     window._upload_threads.pop(child_id)
-    window._continue_folder_upload_queue()
+    window._maybe_finish_folder_upload()
 
     assert window.transfer_interface._find_record("upload", child_id) is None
     assert window._folder_upload_cancel_count == 1
-    assert started == [next_id]
     assert window.transfer_interface._find_record("upload", root_id) is not None
 
 
@@ -6758,11 +6759,10 @@ def test_remove_running_folder_waits_for_child_then_starts_next_folder(
     next_id = window._create_upload_record(tmp_path / "next")
     window._folder_upload_record_id = root_id
     window._folder_upload_target_dir_id = "different-directory"
-    window._folder_upload_active = QueuedUploadFile(
-        child_id, tmp_path / "child.txt", "c", "child.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile(queued_id, tmp_path / "queued.txt", "c", "queued.txt")
+    window._folder_upload_child_ids = {child_id, queued_id}
+    window._folder_children_registered = True
+    window._upload_pending = [
+        PendingUploadTask("c", tmp_path / "queued.txt", queued_id, "queued.txt", False)
     ]
     window._folder_prepare_pending = [
         PendingFolderUpload(tmp_path / "next", "0", "next", next_id)
@@ -6788,7 +6788,7 @@ def test_remove_running_folder_waits_for_child_then_starts_next_folder(
     window._on_upload_cancelled(child_id)
     window._upload_workers.pop(child_id)
     window._upload_threads.pop(child_id)
-    window._continue_folder_upload_queue()
+    window._maybe_finish_folder_upload()
     assert window.transfer_interface._find_record("upload", root_id) is None
     assert window.transfer_interface._find_record("upload", child_id) is None
     assert started == [next_id]
@@ -6803,15 +6803,11 @@ def test_successful_folder_child_retry_clears_root_failure(
     window._folder_upload_record_id = root_id
     window.transfer_interface.update_record("upload", root_id, status="上传中")
     window._folder_upload_child_ids = {child_id}
-    window._folder_upload_active = QueuedUploadFile(
-        child_id, tmp_path / "child.txt", "c", "child.txt"
-    )
     monkeypatch.setattr(main_window_module.InfoBar, "error", lambda **kwargs: None)
     monkeypatch.setattr(main_window_module.InfoBar, "info", lambda **kwargs: None)
 
     window._on_upload_failed("暂时失败", child_id)
     assert window._folder_upload_failure_count == 1
-    window._folder_upload_active = None
     window._upload_workers[child_id] = SimpleNamespace(
         request_cancel=lambda: None
     )  # type: ignore[assignment]
@@ -6862,9 +6858,7 @@ def test_remove_folder_root_stops_retried_child_in_parallel(
     active_id = window._create_upload_record(tmp_path / "active.txt")
     window._folder_upload_record_id = root_id
     window._folder_upload_child_ids = {retried_id, active_id}
-    window._folder_upload_active = QueuedUploadFile(
-        active_id, tmp_path / "active.txt", "cloud-root", "active.txt"
-    )
+    window._folder_children_registered = True
     requested: list[str] = []
     for task_id in (retried_id, active_id):
         window._upload_workers[task_id] = SimpleNamespace(
@@ -6884,7 +6878,7 @@ def test_remove_folder_root_stops_retried_child_in_parallel(
     window._on_upload_cancelled(active_id)
     window._upload_workers.pop(active_id)
     window._upload_threads.pop(active_id)
-    window._continue_folder_upload_queue()
+    window._maybe_finish_folder_upload()
     assert window.transfer_interface._find_record("upload", root_id) is None
     assert window._folder_upload_child_ids == set()
 
@@ -6898,8 +6892,9 @@ def test_remove_folder_root_starts_next_waiting_folder(
     next_id = window._create_upload_record(tmp_path / "next")
     window._folder_upload_record_id = root_id
     window._folder_upload_target_dir_id = "different-directory"
-    window._folder_upload_queue = [
-        QueuedUploadFile(child_id, tmp_path / "child.txt", "cloud-root", "child.txt")
+    window._folder_upload_child_ids = {child_id}
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", tmp_path / "child.txt", child_id, "child.txt", False)
     ]
     window._folder_prepare_pending = [
         PendingFolderUpload(tmp_path / "next", "0", "next", next_id)
@@ -6921,10 +6916,19 @@ def test_remove_folder_root_starts_next_waiting_folder(
 def test_remove_pending_folder_does_not_stop_active_folder(
     qapp: QApplication, tmp_path: Path,
 ) -> None:
-    window = MainWindow(WorkerFileBrowser())
+    # 单并发 + 占位线程：子任务留在 FIFO，确保删除无关行不影响活跃批次
+    window = MainWindow(
+        WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1)
+    )
+    window._upload_thread = QThread(window)  # type: ignore[assignment]
     active_id = window._create_upload_record(tmp_path / "active")
     waiting_id = window._create_upload_record(tmp_path / "waiting")
+    child_id = window._create_upload_record(tmp_path / "child.txt")
     window._folder_upload_record_id = active_id
+    window._folder_upload_child_ids = {child_id}
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", tmp_path / "child.txt", child_id, "child.txt", False)
+    ]
     window._folder_prepare_pending = [
         PendingFolderUpload(tmp_path / "waiting", "0", "waiting", waiting_id)
     ]
@@ -6949,9 +6953,12 @@ def test_folder_upload_starts_next_pending_folder_after_queue_finishes(
         "upload_folder_to_current_directory",
         lambda path, **kwargs: started.append((path, kwargs)),
     )
-    window._folder_upload_active = QueuedUploadFile(
-        "active", second / "active.txt", "cloud-root", "active.txt"
-    )
+    window._folder_upload_record_id = "active-batch"
+    window._folder_upload_child_ids = {"active"}
+    window._folder_children_registered = True
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", second / "active.txt", "active", "active.txt", False)
+    ]
     window._folder_prepare_pending = [
         PendingFolderUpload(second, "pinned-second", "Second", "second-task"),
         PendingFolderUpload(third, "pinned-third", "Third", "third-task"),
@@ -6961,6 +6968,8 @@ def test_folder_upload_starts_next_pending_folder_after_queue_finishes(
     assert started == []
     assert [pending.local_path for pending in window._folder_prepare_pending] == [second, third]
 
+    # 活跃子任务全部离开统一管线后，批次收尾并启动下一个文件夹
+    window._upload_pending.clear()
     window._finish_folder_upload()
 
     assert started == [
@@ -7118,8 +7127,10 @@ def test_folder_upload_entry_remains_usable_while_upload_is_active(
     window._folder_prepare_thread = None
     window._folder_prepare_pending.clear()
 
-    window._folder_upload_queue = [
-        QueuedUploadFile("upload-1", local_root / "file.txt", "cloud-root", "file.txt")
+    window._folder_upload_record_id = "batch-root"
+    window._folder_upload_child_ids = {"upload-1"}
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", local_root / "file.txt", "upload-1", "file.txt", False)
     ]
     window.upload_folder_to_current_directory(local_root)
     pending = window._folder_prepare_pending[0]
@@ -7130,7 +7141,7 @@ def test_folder_upload_entry_remains_usable_while_upload_is_active(
         record.task_id for record in window.transfer_interface.upload_records
     }
 
-    window._folder_upload_queue.clear()
+    window._upload_pending.clear()
 
 
 def test_folder_upload_defers_until_single_upload_slot_frees(
@@ -7149,10 +7160,8 @@ def test_folder_upload_defers_until_single_upload_slot_frees(
     window._upload_thread = QThread(window)  # type: ignore[assignment]
     window._folder_upload_target_dir_id = ROOT_DIRECTORY_ID
     window._on_folder_upload_prepared(job)
-    assert len(window._folder_upload_queue) == len(job.files) - 1
-    assert [task.task_id for task in window._upload_pending] == [
-        window._folder_upload_active.task_id
-    ]
+    # 单并发槽被占用：全部子任务留在统一 FIFO，等待槽位释放
+    assert len(window._upload_pending) == len(job.files)
     assert browser.uploaded_files == []
 
     window._upload_thread = None
@@ -7162,7 +7171,7 @@ def test_folder_upload_defers_until_single_upload_slot_frees(
         (f"cloud-{ROOT_DIRECTORY_ID}-2024", local_root / "2024" / "春节.md"),
         (f"cloud-{ROOT_DIRECTORY_ID}-root", local_root / "说明.txt"),
     ]
-    assert window._folder_upload_queue == []
+    assert window._upload_pending == []
 
 
 def test_folder_upload_prepared_batch_renders_table_once(
@@ -7209,8 +7218,9 @@ def test_folder_upload_prepared_batch_renders_table_once(
     assert widget_growth < file_count * 10
 
     window._upload_thread = None
-    window._folder_upload_queue.clear()
-    window._folder_upload_active = None
+    window._upload_pending.clear()
+    window._folder_upload_child_ids.clear()
+    window._folder_upload_record_id = None
 
 
 def test_upload_folder_to_current_directory_requires_browser(qapp: QApplication) -> None:

@@ -879,16 +879,6 @@ TRANSFER_TABLE_SORT_KEYS: dict[int, Callable[[TransferRecord], object]] = {
 }
 
 
-@dataclass(slots=True)
-class QueuedUploadFile:
-    """One folder-upload file waiting for the single upload slot."""
-
-    task_id: str
-    local_path: Path
-    target_dir_id: str
-    upload_name: str
-
-
 @dataclass(frozen=True, slots=True)
 class PendingFolderUpload:
     """One folder upload waiting for its preparation slot."""
@@ -2924,9 +2914,11 @@ class MainWindow(_MainWindowBase):
         self._folder_prepare_worker: BrowserOperationWorker | None = None
         self._folder_prepare_cancel: threading.Event | None = None
         self._folder_upload_record_id: str | None = None
-        self._folder_upload_queue: list[QueuedUploadFile] = []
-        self._folder_upload_active: QueuedUploadFile | None = None
+        # 文件夹批次与单文件共用 _upload_pending FIFO；批次只保留聚合记账。
         self._folder_upload_child_ids: set[str] = set()
+        # 子任务是否已随 prepare 成功登记（空文件夹也会登记空集）：
+        # 区分「prepare 进行中」与「批次可判定完成」。
+        self._folder_children_registered = False
         self._folder_upload_failed_ids: set[str] = set()
         self._folder_upload_success_count = 0
         self._folder_upload_failure_count = 0
@@ -3043,11 +3035,6 @@ class MainWindow(_MainWindowBase):
                 )
             self._paused_uploads.clear()
             self._folder_prepare_pending.clear()
-            for queued in self._folder_upload_queue:
-                self.transfer_interface.update_record(
-                    "upload", queued.task_id, status="已取消"
-                )
-            self._folder_upload_queue.clear()
             if self._folder_upload_record_id is not None:
                 self.transfer_interface.update_record(
                     "upload", self._folder_upload_record_id, status="已取消"
@@ -5032,8 +5019,7 @@ class MainWindow(_MainWindowBase):
             return
         if (
             self._folder_prepare_thread is not None
-            or self._folder_upload_active is not None
-            or self._folder_upload_queue
+            or self._folder_upload_record_id is not None
         ):
             record_id = self._create_upload_record(
                 local_root,
@@ -5129,7 +5115,7 @@ class MainWindow(_MainWindowBase):
             job.root_item_id,
             len(job.files),
         )
-        queue: list[QueuedUploadFile] = []
+        child_ids: set[str] = set()
         # One render for the whole batch: rendering per added record rebuilds
         # every row's action widgets N times inside this slot.
         with self.transfer_interface.batch_updates():
@@ -5142,18 +5128,25 @@ class MainWindow(_MainWindowBase):
                     upload_name=planned.name,
                     retryable=True,
                 )
-                queue.append(
-                    QueuedUploadFile(
-                        task_id=task_id,
+                child_ids.add(task_id)
+                # 统一管线：文件夹子任务进入与单文件上传相同的 FIFO，
+                # 并发数同样由 max_concurrent_uploads 控制（不再单槽串行）。
+                self._upload_pending.append(
+                    PendingUploadTask(
+                        parent_id=planned.target_dir_id,
                         local_path=planned.local_path,
-                        target_dir_id=planned.target_dir_id,
+                        task_id=task_id,
                         upload_name=planned.name,
+                        show_enqueue_status=False,
                     )
                 )
-        self._folder_upload_queue = queue
-        self._folder_upload_child_ids = {item.task_id for item in queue}
-        self._set_status(f"已添加 {len(queue)} 个上传任务")
-        self._start_next_folder_upload_file()
+        self._folder_upload_child_ids = child_ids
+        self._folder_children_registered = True
+        self._set_status(f"已添加 {len(child_ids)} 个上传任务")
+        if child_ids:
+            self._start_next_upload_task()
+        else:
+            self._maybe_finish_folder_upload()
 
     def _on_folder_upload_prepare_failed(self, message: str) -> None:
         if self._closing:
@@ -5180,8 +5173,17 @@ class MainWindow(_MainWindowBase):
         self._folder_prepare_thread = None
         self._folder_prepare_worker = None
         self._folder_prepare_cancel = None
-        if self._folder_upload_active is None and not self._folder_upload_queue:
+        if (
+            self._folder_upload_record_id is not None
+            and not self._folder_children_registered
+        ):
+            # prepare 失败/取消：批次没有登记子任务，复位标记让下一个
+            # 排队的文件夹批次可以开始（成功路径已登记，含空集）。
             self._folder_upload_record_id = None
+            self._folder_upload_target_dir_id = None
+        # prepare 线程存活期间子任务可能已全部完成（同步线程/快速上传）：
+        # 这里补一次收尾判定。
+        self._maybe_finish_folder_upload()
         self._start_next_pending_folder()
 
     def _start_next_pending_folder(self) -> None:
@@ -5189,8 +5191,7 @@ class MainWindow(_MainWindowBase):
             self._closing
             or self._upload_delete_batch
             or self._folder_prepare_thread is not None
-            or self._folder_upload_active is not None
-            or self._folder_upload_queue
+            or self._folder_upload_record_id is not None
             or not self._folder_prepare_pending
         ):
             return
@@ -5207,50 +5208,19 @@ class MainWindow(_MainWindowBase):
     def _take_pending_folder(self) -> PendingFolderUpload:
         return self._folder_prepare_pending.pop(0)
 
-    def _start_next_folder_upload_file(self) -> None:
-        """Dequeue and start the next folder-upload file when the slot is free."""
-        if self._upload_delete_batch:
+    def _maybe_finish_folder_upload(self) -> None:
+        """Finish the folder batch once every child left the unified pipeline."""
+        if self._folder_upload_record_id is None or not self._folder_children_registered:
+            # prepare 未完成（子任务未登记，含空集）时不能据此收尾批次。
             return
-        if not self._folder_upload_queue:
-            self._finish_folder_upload()
-            return
-        queued = next(
-            (
-                item
-                for item in self._folder_upload_queue
-                if item.task_id not in self._paused_uploads
-            ),
-            None,
-        )
-        if queued is None:
-            return
-        self._folder_upload_queue.remove(queued)
-        self._folder_upload_active = queued
-        self._start_upload_task(
-            queued.target_dir_id,
-            queued.local_path,
-            queued.task_id,
-            upload_name=queued.upload_name,
-            show_enqueue_status=False,
-        )
-
-    def _continue_folder_upload_queue(self) -> None:
-        """Advance the folder-upload queue after the upload slot cleared."""
-        if self._closing:
-            return
-        active = self._folder_upload_active
-        if active is not None and (
-            active.task_id in self._upload_threads
-            or active.task_id in self._paused_uploads
-            or any(pending.task_id == active.task_id for pending in self._upload_pending)
-        ):
-            return
-        self._folder_upload_active = None
-        if self._folder_upload_queue:
-            self._start_next_folder_upload_file()
-            return
-        if active is not None:
-            self._finish_folder_upload()
+        for child_id in self._folder_upload_child_ids:
+            if (
+                child_id in self._upload_workers
+                or any(pending.task_id == child_id for pending in self._upload_pending)
+                or child_id in self._paused_uploads
+            ):
+                return
+        self._finish_folder_upload()
 
     def _finish_folder_upload(self) -> None:
         success_count = self._folder_upload_success_count
@@ -5266,9 +5236,8 @@ class MainWindow(_MainWindowBase):
             or any(task_id in self._paused_uploads for task_id in self._folder_upload_child_ids)
         ):
             return
-        self._folder_upload_active = None
-        self._folder_upload_queue = []
         self._folder_upload_child_ids.clear()
+        self._folder_children_registered = False
         self._folder_upload_failed_ids.clear()
         self._folder_upload_success_count = 0
         self._folder_upload_failure_count = 0
@@ -5815,6 +5784,10 @@ class MainWindow(_MainWindowBase):
     def _start_next_upload_task(self) -> None:
         while self._upload_pending:
             active_count = len(self._upload_threads)
+            if active_count == 0 and self._upload_thread is not None:
+                # 与 _start_upload_task 相同的旧版单任务引用兼容：占位视作
+                # 一个活动槽，避免绕过并发上限（测试用该引用占住槽位）。
+                active_count = 1
             if active_count >= max(1, self._settings.max_concurrent_uploads):
                 return
             if self._upload_pending[0].task_id in self._upload_threads:
@@ -6070,9 +6043,7 @@ class MainWindow(_MainWindowBase):
         )
 
     def _on_upload_cancelled(self, task_id: str) -> None:
-        folder_child = task_id in self._folder_upload_child_ids or (
-            self._folder_upload_active is not None and self._folder_upload_active.task_id == task_id
-        )
+        folder_child = task_id in self._folder_upload_child_ids
         if folder_child:
             self._folder_upload_cancel_count += 1
         self.transfer_interface.update_record("upload", task_id, status="已取消")
@@ -6111,13 +6082,7 @@ class MainWindow(_MainWindowBase):
         if (
             record_id is not None
             and self._folder_upload_record_id is not None
-            and (
-                record_id in self._folder_upload_child_ids
-                or (
-                    self._folder_upload_active is not None
-                    and record_id == self._folder_upload_active.task_id
-                )
-            )
+            and record_id in self._folder_upload_child_ids
         ):
             if record_id in self._folder_upload_failed_ids:
                 self._folder_upload_failed_ids.remove(record_id)
@@ -6148,13 +6113,7 @@ class MainWindow(_MainWindowBase):
             return
         LOGGER.warning("main_window.upload.failed error=%s", message)
         record_id = task_id or self._upload_task_id
-        if record_id is not None and (
-            record_id in self._folder_upload_child_ids
-            or (
-                self._folder_upload_active is not None
-                and record_id == self._folder_upload_active.task_id
-            )
-        ):
+        if record_id is not None and record_id in self._folder_upload_child_ids:
             if record_id not in self._folder_upload_failed_ids:
                 self._folder_upload_failed_ids.add(record_id)
                 self._folder_upload_failure_count += 1
@@ -6170,27 +6129,38 @@ class MainWindow(_MainWindowBase):
         failed_task_id = task_id or self._upload_task_id
         self._mark_transfer_failed("upload", failed_task_id, message)
         self._show_login_required_error(message)
-        folder_task_ids = {queued.task_id for queued in self._folder_upload_queue}
-        if self._folder_upload_active is not None:
-            folder_task_ids.add(self._folder_upload_active.task_id)
-        if failed_task_id not in folder_task_ids:
+        if failed_task_id not in self._folder_upload_child_ids:
             return
+        child_ids = set(self._folder_upload_child_ids)
         self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
         self._folder_upload_record_id = None
         self._folder_upload_child_ids.clear()
+        self._folder_children_registered = False
         self._folder_upload_failed_ids.clear()
-        LOGGER.info(
-            "main_window.folder_upload.login_stopped pending=%s",
-            len(self._folder_upload_queue),
-        )
-        for pending_task_id in folder_task_ids:
-            if pending_task_id != failed_task_id:
-                self._mark_transfer_failed("upload", pending_task_id, "登录已过期，请重新登录")
-        self._folder_upload_active = None
-        self._folder_upload_queue = []
+        LOGGER.info("main_window.folder_upload.login_stopped children=%s", len(child_ids))
+        with self.transfer_interface.batch_updates():
+            for child_id in child_ids:
+                if child_id == failed_task_id:
+                    continue
+                if child_id in self._upload_workers:
+                    # 活跃 worker 会各自以登录错误收尾，这里不重复标失败。
+                    continue
+                child_record = self.transfer_interface._find_record("upload", child_id)
+                if child_record is None or child_record.status in TERMINAL_TRANSFER_STATUSES:
+                    # 已完成/已取消的子任务保持终态，不改标失败。
+                    continue
+                self._paused_uploads.pop(child_id, None)
+                self._upload_pending = [
+                    pending
+                    for pending in self._upload_pending
+                    if pending.task_id != child_id
+                ]
+                self._mark_transfer_failed("upload", child_id, "登录已过期，请重新登录")
         self._folder_upload_success_count = 0
         self._folder_upload_failure_count = 0
+        self._folder_upload_cancel_count = 0
         self._folder_upload_target_dir_id = None
+        self._start_next_pending_folder()
 
     def _clear_upload_task(self) -> None:
         self._delete_finished_thread()
@@ -6216,13 +6186,7 @@ class MainWindow(_MainWindowBase):
             )
             self._upload_task_id = next_task_id
             self._upload_path = None
-        self._continue_folder_upload_queue()
-        if (
-            self._folder_upload_record_id is not None
-            and self._folder_upload_active is None
-            and not self._folder_upload_queue
-        ):
-            self._finish_folder_upload()
+        self._maybe_finish_folder_upload()
         self._start_next_upload_task()
         self.update_operation_controls()
         self._start_next_pending_folder()
@@ -6331,37 +6295,24 @@ class MainWindow(_MainWindowBase):
             return
         worker = self._upload_workers.get(task_id)
         if worker is not None:
+            # 暂停的 worker 线程阻塞在下一个分片检查点，仍占着一个并发槽
+            # （取消会丢会话分片，见 file_browser.upload_file 的取消路径），
+            # 恢复时原线程继续。同时登记暂停表供批次收尾判定与重建用。
             worker.request_pause()
+            if record.target_path is not None and record.upload_parent_id:
+                self._paused_uploads[task_id] = PendingUploadTask(
+                    parent_id=record.upload_parent_id,
+                    local_path=record.target_path,
+                    task_id=task_id,
+                    upload_name=record.upload_name,
+                    show_enqueue_status=False,
+                )
             self.transfer_interface.update_record(
                 "upload", task_id, status="已暂停", can_resume=True
             )
-            active = self._folder_upload_active
-            if active is not None and active.task_id == task_id:
-                self._paused_uploads[task_id] = PendingUploadTask(
-                    parent_id=active.target_dir_id,
-                    local_path=active.local_path,
-                    task_id=active.task_id,
-                    upload_name=active.upload_name,
-                    show_enqueue_status=False,
-                )
-                self._folder_upload_active = None
-                self._continue_folder_upload_queue()
-                self._start_next_upload_task()
             return
         pending = next((item for item in self._upload_pending if item.task_id == task_id), None)
-        if pending is None:
-            queued = next(
-                (item for item in self._folder_upload_queue if item.task_id == task_id), None
-            )
-            if queued is not None:
-                pending = PendingUploadTask(
-                    parent_id=queued.target_dir_id,
-                    local_path=queued.local_path,
-                    task_id=queued.task_id,
-                    upload_name=queued.upload_name,
-                    show_enqueue_status=False,
-                )
-        else:
+        if pending is not None:
             self._upload_pending.remove(pending)
         if pending is None:
             # 重启恢复的「等待中」行不在任何内存队列（worker/pending/folder
@@ -6388,7 +6339,6 @@ class MainWindow(_MainWindowBase):
             return
         self._paused_uploads[task_id] = pending
         self.transfer_interface.update_record("upload", task_id, status="已暂停", can_resume=True)
-        self._continue_folder_upload_queue()
         self._start_next_upload_task()
 
     def _resume_upload_task(self, task_id: str) -> None:
@@ -6425,13 +6375,6 @@ class MainWindow(_MainWindowBase):
                 upload_name=record.upload_name,
                 show_enqueue_status=False,
             )
-        if any(item.task_id == task_id for item in self._folder_upload_queue):
-            self.transfer_interface.update_record(
-                "upload", task_id, status="等待中", can_resume=False
-            )
-            if self._folder_upload_active is None:
-                self._start_next_folder_upload_file()
-            return
         self.transfer_interface.update_record("upload", task_id, status="等待中", can_resume=False)
         self._start_upload_task(
             pending.parent_id,
@@ -6508,7 +6451,7 @@ class MainWindow(_MainWindowBase):
                         self._remove_upload_task(task_id)
             finally:
                 self._upload_delete_batch = False
-            self._continue_folder_upload_queue()
+            self._maybe_finish_folder_upload()
             self._start_next_upload_task()
             self._start_next_pending_folder()
             return
@@ -6535,22 +6478,10 @@ class MainWindow(_MainWindowBase):
                 worker.request_cancel()
                 self._set_status("正在停止上传；已发出的请求可能仍会在云端完成")
                 return
-            queued = next(
-                (item for item in self._folder_upload_queue if item.task_id == task_id), None
-            )
-            if queued is not None:
-                self._folder_upload_queue.remove(queued)
             if task_id in self._folder_upload_child_ids:
                 self._folder_upload_cancel_count += 1
-            if (
-                self._folder_upload_active is not None
-                and self._folder_upload_active.task_id == task_id
-            ):
-                self._folder_upload_active = None
             self.transfer_interface.remove_records("upload", {task_id})
-            self._continue_folder_upload_queue()
-            if self._folder_upload_record_id is not None and not self._folder_upload_queue:
-                self._finish_folder_upload()
+            self._maybe_finish_folder_upload()
             return
         pending = next((item for item in self._upload_pending if item.task_id == task_id), None)
         if pending is not None:
@@ -6560,22 +6491,11 @@ class MainWindow(_MainWindowBase):
         )
         if folder_pending is not None:
             self._folder_prepare_pending.remove(folder_pending)
-        queued = next((item for item in self._folder_upload_queue if item.task_id == task_id), None)
-        if queued is not None:
-            self._folder_upload_queue.remove(queued)
-            self._folder_upload_cancel_count += 1
-        active = self._folder_upload_active
-        if active is not None and active.task_id == task_id and task_id not in self._upload_workers:
-            self._folder_upload_cancel_count += 1
-            self._folder_upload_active = None
+        if pending is not None or folder_pending is not None:
+            if task_id in self._folder_upload_child_ids:
+                self._folder_upload_cancel_count += 1
             self.transfer_interface.remove_records("upload", {task_id})
-            if self._folder_upload_queue:
-                self._start_next_folder_upload_file()
-            else:
-                self._finish_folder_upload()
-            return
-        if pending is not None or folder_pending is not None or queued is not None:
-            self.transfer_interface.remove_records("upload", {task_id})
+            self._maybe_finish_folder_upload()
             self._start_next_pending_folder()
             return
         worker = self._upload_workers.get(task_id)
@@ -6598,41 +6518,27 @@ class MainWindow(_MainWindowBase):
         self._upload_removal_requested.add(root_id)
         if self._folder_prepare_cancel is not None:
             self._folder_prepare_cancel.set()
-        pending_ids = {queued.task_id for queued in self._folder_upload_queue}
-        self._folder_upload_queue.clear()
-        for child_id in self._folder_upload_child_ids:
-            paused = self._paused_uploads.pop(child_id, None)
+        child_ids = set(self._folder_upload_child_ids)
+        pending_ids: set[str] = set()
+        for child_id in child_ids:
+            self._paused_uploads.pop(child_id, None)
             worker = self._upload_workers.get(child_id)
             if worker is not None:
+                # 活跃子任务协作取消：已取消事件到达时各自移除记录行，
+                # 最后一个退出时 _maybe_finish_folder_upload 收尾批次。
                 self._upload_removal_requested.add(child_id)
                 worker.request_cancel()
-            elif paused is not None:
+            else:
                 pending_ids.add(child_id)
-            pending_ids.update(
-                pending.task_id for pending in self._upload_pending if pending.task_id == child_id
-            )
-        active = self._folder_upload_active
-        if active is not None:
-            pending_ids.update(
-                pending.task_id
-                for pending in self._upload_pending
-                if pending.task_id == active.task_id
-            )
         self._upload_pending = [
-            pending for pending in self._upload_pending if pending.task_id not in pending_ids
+            pending for pending in self._upload_pending if pending.task_id not in child_ids
         ]
         if pending_ids:
             self.transfer_interface.remove_records("upload", pending_ids)
-        if active is not None:
-            worker = self._upload_workers.get(active.task_id)
-            if worker is not None:
-                if active.task_id not in self._folder_upload_child_ids:
-                    self._upload_removal_requested.add(active.task_id)
-                    worker.request_cancel()
-            else:
-                self._folder_upload_active = None
         self._set_status("正在停止文件夹上传；已创建的云端内容不会自动删除")
-        if self._folder_prepare_thread is None and self._folder_upload_active is None:
+        if self._folder_prepare_thread is None and not any(
+            child_id in self._upload_workers for child_id in child_ids
+        ):
             self._finish_folder_upload()
 
     def _queue_download_operation(
