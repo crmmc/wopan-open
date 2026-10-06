@@ -6564,6 +6564,54 @@ def test_folder_upload_defers_until_single_upload_slot_frees(
     assert window._folder_upload_queue == []
 
 
+def test_folder_upload_prepared_batch_renders_table_once(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """文件夹批量入队只做 O(1) 次全表渲染（回归：逐条渲染曾造成 O(n²) 控件重建）。
+
+    修复前每加一条记录就整表重建一次，157 个文件实测 GUI 线程阻塞 ~60s、
+    RSS 冲到 ~6GB（~6.2 万个待删除控件堆积）。修复后一次批量只渲染一次，
+    控件增长与文件数线性相关。
+    """
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser, settings=AppSettings(max_concurrent_uploads=1))
+    window.refresh_current_directory()
+    local_root = tmp_path / "批量"
+    local_root.mkdir()
+    file_count = 60
+    for index in range(file_count):
+        (local_root / f"ep{index:02d}.mkv").write_bytes(b"x")
+    job = browser.prepare_folder_upload(ROOT_DIRECTORY_ID, local_root)
+    assert len(job.files) == file_count
+
+    renders = [0]
+    original_render = window.transfer_interface._render_upload_table
+
+    def counting_render() -> None:
+        renders[0] += 1
+        original_render()
+
+    monkeypatch.setattr(window.transfer_interface, "_render_upload_table", counting_render)
+    widgets_before = len(QApplication.allWidgets())
+
+    # 占住上传槽位，避免首批任务启动引入额外状态渲染（与相邻测试同法）。
+    window._upload_thread = QThread(window)  # type: ignore[assignment]
+    window._folder_upload_target_dir_id = ROOT_DIRECTORY_ID
+    window._on_folder_upload_prepared(job)
+
+    assert renders[0] == 1
+    assert len(window.transfer_interface.upload_records) == file_count
+    # 单次渲染为每行建一组操作控件（~5 个/行）；O(n²) 路径会超出一个数量级。
+    widget_growth = len(QApplication.allWidgets()) - widgets_before
+    assert widget_growth < file_count * 10
+
+    window._upload_thread = None
+    window._folder_upload_queue.clear()
+    window._folder_upload_active = None
+
+
 def test_upload_folder_to_current_directory_requires_browser(qapp: QApplication) -> None:
     window = MainWindow()
 

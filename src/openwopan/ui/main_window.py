@@ -7,7 +7,8 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -903,6 +904,9 @@ class TransferInterface(QWidget):
         self._active_direction = "download"
         self._pending_progress_directions: set[str] = set()
         self._progress_render_scheduled = False
+        # Batch render coalescing: >0 while batch_updates() is active.
+        self._batch_depth = 0
+        self._batch_render_directions: set[str] = set()
         self._speed_estimators: dict[tuple[str, str], TransferRateEstimator] = {}
         # Injectable for tests; must return a fresh TransferRateEstimator.
         self._new_speed_estimator: Callable[[], TransferRateEstimator] = TransferRateEstimator
@@ -936,7 +940,7 @@ class TransferInterface(QWidget):
             self._save_record(record)
         if render:
             self.flush_progress_render()
-            self._render_upload_table()
+            self._render_direction("upload")
 
     def add_download_record(
         self, record: TransferRecord, *, render: bool = True, persist: bool = True
@@ -948,7 +952,7 @@ class TransferInterface(QWidget):
             self._save_record(record)
         if render:
             self.flush_progress_render()
-            self._render_download_table()
+            self._render_direction("download")
 
     def _on_record_added(self, direction: str, record: TransferRecord) -> None:
         """Reset speed state for a (re-)added record; recovered tasks re-baseline."""
@@ -1092,10 +1096,37 @@ class TransferInterface(QWidget):
         QTimer.singleShot(self.PROGRESS_RENDER_INTERVAL_MS, self.flush_progress_render)
 
     def _render_direction(self, direction: str) -> None:
+        # Defers while batch_updates() is active: record adds/removals/status
+        # changes each rebuild the whole table (and every row's action
+        # widgets), and a tight loop of N mutations inside one slot would
+        # create N table-loads of widgets whose deferred deletes can only run
+        # after the slot returns (the folder-upload batch freeze).
+        if self._batch_depth:
+            self._batch_render_directions.add(direction)
+            return
         if direction == "upload":
             self._render_upload_table()
         else:
             self._render_download_table()
+
+    @contextmanager
+    def batch_updates(self) -> Iterator[None]:
+        """Coalesce table renders across a batch of record mutations.
+
+        On exit each direction touched inside the batch renders exactly once,
+        so a batch of N mutations costs one render instead of N; nested
+        batches coalesce into the outermost one.
+        """
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._batch_render_directions:
+                directions = tuple(self._batch_render_directions)
+                self._batch_render_directions.clear()
+                for direction in directions:
+                    self._render_direction(direction)
 
     def _ensure_speed_sampler(self) -> None:
         """Start the 1-second speed tick; runs only while active tasks exist."""
@@ -1151,13 +1182,13 @@ class TransferInterface(QWidget):
                 record for record in self.upload_records if record.task_id not in task_ids
             ]
             self.flush_progress_render()
-            self._render_upload_table()
+            self._render_direction("upload")
         else:
             self.download_records = [
                 record for record in self.download_records if record.task_id not in task_ids
             ]
             self.flush_progress_render()
-            self._render_download_table()
+            self._render_direction("download")
         for task_id in task_ids:
             self._speed_estimators.pop((direction, task_id), None)
             self._persist_dirty.discard((direction, task_id))
@@ -4269,20 +4300,21 @@ class MainWindow(_MainWindowBase):
         submit = getattr(self._file_browser, "submit_download", None)
         if not callable(submit):
             # Keep test doubles and older backends on the original worker boundary.
-            for item, path in valid:
-                task_id = self._create_download_record(item, path)
-                if run_in_background:
-                    self._start_download_task(item, path, task_id)
-                else:
-                    try:
-                        self._download_with_callbacks(item, path, task_id)
-                    except FileBrowserLoginRequiredError as exc:
-                        self._mark_transfer_failed("download", task_id, str(exc))
-                        self._show_login_required_error(str(exc))
-                    except FileBrowserError as exc:
-                        self._on_download_failed(str(exc), task_id=task_id)
+            with self.transfer_interface.batch_updates():
+                for item, path in valid:
+                    task_id = self._create_download_record(item, path)
+                    if run_in_background:
+                        self._start_download_task(item, path, task_id)
                     else:
-                        self._on_download_succeeded(item.name, str(path), task_id=task_id)
+                        try:
+                            self._download_with_callbacks(item, path, task_id)
+                        except FileBrowserLoginRequiredError as exc:
+                            self._mark_transfer_failed("download", task_id, str(exc))
+                            self._show_login_required_error(str(exc))
+                        except FileBrowserError as exc:
+                            self._on_download_failed(str(exc), task_id=task_id)
+                        else:
+                            self._on_download_succeeded(item.name, str(path), task_id)
             return
 
         def submit_all() -> list[tuple[WopanItem, Path, str | None, str]]:
@@ -4319,19 +4351,22 @@ class MainWindow(_MainWindowBase):
         submissions = cast(list[tuple[WopanItem, Path, str | None, str]], result)
         succeeded = 0
         failed = 0
-        for item, path, task_id, error in submissions:
-            if task_id is None:
-                failed += 1
-                self._create_download_record(item, path, status="失败", error=error)
-                if error == "登录已过期，请重新登录":
-                    self._show_login_required_error(error)
-                continue
-            succeeded += 1
-            self._removed_download_task_ids.discard(task_id)
-            self._create_download_record(item, path, task_id=task_id)
-            event = self._pending_download_events.pop(task_id, None)
-            if event is not None:
-                self._on_download_event(event)
+        # One render for the whole submission batch (record adds plus any
+        # replayed scheduler events each render the full table otherwise).
+        with self.transfer_interface.batch_updates():
+            for item, path, task_id, error in submissions:
+                if task_id is None:
+                    failed += 1
+                    self._create_download_record(item, path, status="失败", error=error)
+                    if error == "登录已过期，请重新登录":
+                        self._show_login_required_error(error)
+                    continue
+                succeeded += 1
+                self._removed_download_task_ids.discard(task_id)
+                self._create_download_record(item, path, task_id=task_id)
+                event = self._pending_download_events.pop(task_id, None)
+                if event is not None:
+                    self._on_download_event(event)
         self._set_status(f"已添加 {succeeded} 个下载任务，失败 {failed} 个")
         self.update_operation_controls()
 
@@ -4879,23 +4914,26 @@ class MainWindow(_MainWindowBase):
             len(job.files),
         )
         queue: list[QueuedUploadFile] = []
-        for planned in job.files:
-            task_id = self._create_upload_record(
-                planned.local_path,
-                name=planned.name,
-                size=planned.size,
-                parent_id=planned.target_dir_id,
-                upload_name=planned.name,
-                retryable=True,
-            )
-            queue.append(
-                QueuedUploadFile(
-                    task_id=task_id,
-                    local_path=planned.local_path,
-                    target_dir_id=planned.target_dir_id,
+        # One render for the whole batch: rendering per added record rebuilds
+        # every row's action widgets N times inside this slot.
+        with self.transfer_interface.batch_updates():
+            for planned in job.files:
+                task_id = self._create_upload_record(
+                    planned.local_path,
+                    name=planned.name,
+                    size=planned.size,
+                    parent_id=planned.target_dir_id,
                     upload_name=planned.name,
+                    retryable=True,
                 )
-            )
+                queue.append(
+                    QueuedUploadFile(
+                        task_id=task_id,
+                        local_path=planned.local_path,
+                        target_dir_id=planned.target_dir_id,
+                        upload_name=planned.name,
+                    )
+                )
         self._folder_upload_queue = queue
         self._folder_upload_child_ids = {item.task_id for item in queue}
         self._set_status(f"已添加 {len(queue)} 个上传任务")
@@ -6041,26 +6079,30 @@ class MainWindow(_MainWindowBase):
     def _pause_selected_downloads(self, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
-        for task_id in sorted(task_ids):
-            self._pause_download_task(task_id)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                self._pause_download_task(task_id)
 
     def _resume_selected_downloads(self, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
-        for task_id in sorted(task_ids):
-            self._resume_download_task(task_id)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                self._resume_download_task(task_id)
 
     def _pause_selected_uploads(self, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
-        for task_id in sorted(task_ids):
-            self._pause_upload_task(task_id)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                self._pause_upload_task(task_id)
 
     def _resume_selected_uploads(self, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
-        for task_id in sorted(task_ids):
-            self._resume_upload_task(task_id)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                self._resume_upload_task(task_id)
 
     def _pause_upload_task(self, task_id: str) -> None:
         record = self.transfer_interface._find_record("upload", task_id)
@@ -6162,11 +6204,12 @@ class MainWindow(_MainWindowBase):
             for record in self.transfer_interface.upload_records
             if record.task_id in task_ids
         }
-        for task_id in sorted(task_ids):
-            record = records.get(task_id)
-            if record is None or not record.upload_retryable or record.status != "失败":
-                continue
-            self._retry_upload_task(record)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                record = records.get(task_id)
+                if record is None or not record.upload_retryable or record.status != "失败":
+                    continue
+                self._retry_upload_task(record)
 
     def _retry_upload_task(self, record: TransferRecord) -> None:
         if self._file_browser is None:
@@ -6208,14 +6251,15 @@ class MainWindow(_MainWindowBase):
         if direction == "upload":
             self._upload_delete_batch = True
             try:
-                for task_id in sorted(
-                    normalized_ids,
-                    key=lambda value: (
-                        value == self._folder_upload_record_id,
-                        value in self._upload_workers,
-                    ),
-                ):
-                    self._remove_upload_task(task_id)
+                with self.transfer_interface.batch_updates():
+                    for task_id in sorted(
+                        normalized_ids,
+                        key=lambda value: (
+                            value == self._folder_upload_record_id,
+                            value in self._upload_workers,
+                        ),
+                    ):
+                        self._remove_upload_task(task_id)
             finally:
                 self._upload_delete_batch = False
             self._continue_folder_upload_queue()
@@ -6506,11 +6550,10 @@ class MainWindow(_MainWindowBase):
     def _on_upload_recovery_succeeded(self, result: object) -> None:
         if not isinstance(result, tuple) or self._closing:
             return
-        for persisted in result:
-            self._add_persisted_upload_record(persisted)
-        if result:
-            self.transfer_interface.flush_progress_render()
-            self.transfer_interface._render_upload_table()
+        # One render for the recovered batch, not one per restored record.
+        with self.transfer_interface.batch_updates():
+            for persisted in result:
+                self._add_persisted_upload_record(persisted)
 
     def _on_upload_recovery_failed(self, message: str) -> None:
         LOGGER.warning("main_window.upload.recovery.failed error=%s", message)

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from PySide6.QtCore import Qt, QThread
@@ -1840,6 +1841,56 @@ def test_transfer_dynamic_columns_ignore_header_clicks(qapp: QApplication, colum
     assert transfer._upload_sort_state.column is None
     assert _transfer_row_names(transfer, transfer.upload_table) == ["b.txt", "a.txt"]
     assert transfer.upload_table.horizontalHeader().sortIndicatorSection() == -1
+
+
+def test_transfer_batch_updates_renders_once_per_direction(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Batch mutations render each table once on exit, not once per mutation.
+
+    Regression guard for the folder-upload add freeze: every render inside
+    one slot rebuilds all rows' action widgets, whose deferred deletes can
+    only run after the slot returns, so N renders cost O(n²) live widgets
+    (~60s freeze and a multi-GB RSS spike on a 157-file folder).
+    """
+    transfer = TransferInterface()
+    counts = {"upload": 0, "download": 0}
+    for direction in ("upload", "download"):
+        original = getattr(transfer, f"_render_{direction}_table")
+
+        def make_counted(direction: str, original: object) -> Callable[[], None]:
+            def counted() -> None:
+                counts[direction] += 1
+                cast(Callable[[], None], original)()
+
+            return counted
+
+        monkeypatch.setattr(
+            transfer, f"_render_{direction}_table", make_counted(direction, original)
+        )
+
+    with transfer.batch_updates():
+        for index in range(20):
+            transfer.add_upload_record(_upload_record(f"u-{index}", f"u{index}.txt"))
+            transfer.add_download_record(
+                _upload_record(f"d-{index}", f"d{index}.txt", direction="download")
+            )
+            transfer.update_record("upload", f"u-{index}", status="已暂停", can_resume=True)
+            transfer.remove_records("download", {f"d-{index}"})
+        assert counts == {"upload": 0, "download": 0}
+
+    assert counts == {"upload": 1, "download": 1}
+
+    # Outside a batch a status change still renders immediately.
+    transfer.update_record("upload", "u-0", status="上传中")
+    assert counts["upload"] == 2
+
+    # Nested batches coalesce into the outermost exit.
+    with transfer.batch_updates():
+        transfer.update_record("upload", "u-1", status="已暂停", can_resume=True)
+        with transfer.batch_updates():
+            transfer.update_record("upload", "u-2", status="已暂停", can_resume=True)
+    assert counts["upload"] == 3
 
 
 def test_file_page_unknown_column_click_is_ignored(qapp: QApplication) -> None:
