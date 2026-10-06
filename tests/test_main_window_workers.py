@@ -39,6 +39,7 @@ from openwopan.tasks.upload import (
     PlannedUploadFile,
     UploadBatchSummary,
     UploadSummaryEntry,
+    UploadTaskRecord,
     UploadTaskState,
     UploadTaskStore,
     scan_folder_tree,
@@ -3788,6 +3789,219 @@ def test_pause_restored_waiting_upload_row_without_queue_entry(
     window._resume_selected_uploads({task_id})
     assert record.status == "已完成"
     assert ("cloud-root", local_path) in browser.uploaded_files
+
+
+def test_history_restore_normalizes_non_terminal_upload_rows(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """重启恢复：非终态上传历史行归一为「已暂停」，不再显示僵尸状态。"""
+    window = MainWindow(WorkerFileBrowser())
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=tmp_path / "ep01.mkv",
+                status="上传中",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+            TransferRecord(
+                task_id="upload-2",
+                direction="upload",
+                name="ep02.mkv",
+                size=10,
+                target_path=tmp_path / "ep02.mkv",
+                status="等待中",
+                upload_parent_id="cloud-1",
+                upload_name="ep02.mkv",
+                upload_retryable=True,
+            ),
+            TransferRecord(
+                task_id="upload-3",
+                direction="upload",
+                name="done.mkv",
+                size=10,
+                target_path=tmp_path / "done.mkv",
+                status="已完成",
+            ),
+        )
+    )
+
+    statuses = {r.task_id: r.status for r in window.transfer_interface.upload_records}
+    assert statuses == {
+        "upload-1": "已暂停",
+        "upload-2": "已暂停",
+        "upload-3": "已完成",
+    }
+    paused = window.transfer_interface._find_record("upload", "upload-1")
+    assert paused is not None and paused.can_resume
+
+
+def test_upload_session_recovery_merges_into_restored_history_row(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """会话恢复与归一化历史行同文件合并：无双行、带断点信息、不自动续传。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=local_path,
+                status="上传中",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+    session = UploadTaskRecord(
+        task_id="abc123hash",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="已暂停",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="应用中断，已暂停（已完成 3/5 分片）",
+        resumable=True,
+    )
+
+    window._on_upload_recovery_succeeded((session,))
+
+    rows = [
+        r
+        for r in window.transfer_interface.upload_records
+        if r.target_path == local_path
+    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.task_id == "upload-1"
+    assert row.status == "已暂停" and row.can_resume and row.upload_retryable
+    assert "3/5" in row.error
+    assert browser.uploaded_files == []  # was_active=False：不自动续传
+
+
+def test_history_ghost_row_dropped_when_session_row_already_present(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """会话恢复先到时，同文件的历史僵尸行被丢弃，不产生双行。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    session = UploadTaskRecord(
+        task_id="hash1",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="已暂停",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="应用中断，已暂停（已完成 3/5 分片）",
+        resumable=True,
+    )
+    window._on_upload_recovery_succeeded((session,))
+
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-9",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=local_path,
+                status="上传中",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+
+    rows = [
+        r
+        for r in window.transfer_interface.upload_records
+        if r.target_path == local_path
+    ]
+    assert len(rows) == 1 and rows[0].task_id == "hash1"
+    assert "upload-9" not in {r.task_id for r in window.transfer_interface.upload_records}
+
+
+def test_active_upload_session_auto_resumes_after_restart(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """死前「进行中」的会话重启后自动续传（与下载侧恢复语义对齐）。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=local_path,
+                status="上传中",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+    session = UploadTaskRecord(
+        task_id="abc123hash",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="已暂停",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="应用中断，已暂停（已完成 3/5 分片）",
+        resumable=True,
+        was_active=True,
+    )
+
+    window._on_upload_recovery_succeeded((session,))
+
+    record = window.transfer_interface._find_record("upload", "upload-1")
+    assert record is not None and record.status == "已完成"
+    assert ("cloud-1", local_path) in browser.uploaded_files
+
+
+def test_resume_folder_summary_row_is_guarded(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """文件夹汇总行（重启后归一为已暂停）继续时被守卫：不报错、不标失败。"""
+    window = MainWindow(WorkerFileBrowser())
+    folder = tmp_path / "已看完"
+    folder.mkdir()
+    task_id = window._create_upload_record(folder, name="已看完", parent_id="cloud-root")
+    window.transfer_interface.update_record(
+        "upload", task_id, status="已暂停", can_resume=True
+    )
+
+    window._resume_selected_uploads({task_id})
+
+    record = window.transfer_interface._find_record("upload", task_id)
+    assert record is not None and record.status == "已暂停"
+    assert "文件夹汇总" in window.status_message()
 
 
 def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(

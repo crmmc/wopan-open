@@ -319,6 +319,9 @@ class UploadTaskRecord:
     upload_name: str | None = None
     error: str = ""
     resumable: bool = False
+    # True when the session was 进行中 when the previous run ended: the
+    # restart recovery auto-continues exactly these (download parity).
+    was_active: bool = False
 
 
 def make_upload_task_id(parent_id: str, local_path: Path, upload_name: str | None) -> str:

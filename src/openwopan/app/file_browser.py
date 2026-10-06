@@ -4,7 +4,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -920,13 +920,15 @@ class FileBrowserService:
             if state.status == "已完成" or not state.local_path.exists():
                 store.delete(state.task_id)
                 continue
+            was_active = state.status == "进行中"
             try:
                 updated = store.update(state.task_id, _mark_upload_interrupted)
             except KeyError:
                 # The session was deleted concurrently (retention purge racing
                 # this recovery loop); nothing left to recover for it.
                 continue
-            records.append(_upload_state_record(updated))
+            record = _upload_state_record(updated)
+            records.append(replace(record, was_active=was_active))
         return tuple(records)
 
     def discard_upload_sessions(self, task_ids: Sequence[str]) -> None:
