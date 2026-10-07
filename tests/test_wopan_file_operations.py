@@ -881,6 +881,37 @@ def test_upload_file_maps_non_success_upload_response(tmp_path: Path) -> None:
         client.upload_file("0", local_file)
 
 
+def test_upload_part_failure_logs_server_error_body(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """分片 500：每次重试的日志必须带上服务端响应体片段——裸 500 的唯一
+    文字线索（此前只记状态码，服务端给的原因被 raise_for_status 丢弃）。"""
+    local_file = tmp_path / "report.txt"
+    local_file.write_text("content")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return _success_response({"url": "https://upload.example.test"})
+        return httpx.Response(500, json={"error": "part assembly failed"})
+
+    client = WopanClient(
+        COOKIE_HEADER,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with caplog.at_level("WARNING", logger="openwopan.wopan.client"):
+        with pytest.raises(httpx.HTTPStatusError):
+            client.upload_file("0", local_file)
+
+    attempt_lines = [
+        line for line in caplog.text.splitlines() if "upload_part.attempt_failed" in line
+    ]
+    assert len(attempt_lines) == 4  # 默认重试 3 次 → 共 4 次尝试，每次都留痕
+    assert "status=500" in caplog.text
+    assert "part assembly failed" in caplog.text  # 响应体片段入库
+    assert "upload_file.http_error" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # Quick transfer (秒传) — instant upload by content hash, official-client
 # parity: full-file SHA-256 → POST b.smartont.net quickTransfer; hasFile=1

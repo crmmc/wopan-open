@@ -913,7 +913,11 @@ class WopanClient:
                 fid=fid,
             )
         except httpx.HTTPError as exc:
-            LOGGER.warning("wopan.upload_file.http_error parent_id=%s", parent_id)
+            LOGGER.warning(
+                "wopan.upload_file.http_error parent_id=%s %s",
+                parent_id,
+                _http_error_detail(exc),
+            )
             # Resumable uploads: a 5xx on the final part can still mean the
             # server assembled the file, so check the listing before giving
             # up — same recovery as the generic handler below. Fresh uploads
@@ -1102,10 +1106,10 @@ class WopanClient:
                     isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500
                 )
                 LOGGER.warning(
-                    "wopan.quick_transfer.probe_error attempt=%s transient=%s error_type=%s",
+                    "wopan.quick_transfer.probe_error attempt=%s transient=%s %s",
                     attempt,
                     transient,
-                    type(exc).__name__,
+                    _http_error_detail(exc),
                 )
                 if not transient or attempt == attempts:
                     return None
@@ -1292,6 +1296,13 @@ class WopanClient:
             except (httpx.HTTPError, WopanBusinessError) as exc:
                 _check_upload_cancelled(cancel_requested)
                 last_error = exc
+                LOGGER.warning(
+                    "wopan.upload_part.attempt_failed part_index=%s attempt=%s/%s %s",
+                    part_index,
+                    _attempt + 1,
+                    max_attempts,
+                    _http_error_detail(exc),
+                )
             except ValueError as exc:
                 raise WopanResponseError("upload2C response cannot be decoded") from exc
         if last_error is not None:
@@ -1440,6 +1451,19 @@ def _sha256_file(
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _http_error_detail(exc: Exception) -> str:
+    """Compact diagnostic text for one upload-path HTTP failure.
+
+    HTTP status errors carry the server's response body — often the only
+    textual reason a bare 500 ever gets — so a short snippet is included;
+    everything else degrades to the exception type.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        snippet = exc.response.text[:200].replace("\n", " ").strip()
+        return f"status={exc.response.status_code} body={snippet!r}"
+    return f"type={type(exc).__name__}"
 
 
 def _sign(key: str, res_time: int, req_seq: int, channel: str) -> str:

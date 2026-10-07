@@ -144,6 +144,8 @@ def _join_distinct_errors(*errors: str | None) -> str:
         if text and text not in joined:
             joined.append(text)
     return "；".join(joined)
+
+
 FILE_SPLITTER_STRETCH_FACTORS = (1, 6)
 ROOT_DISPLAY_NAME = "/"
 TRANSFER_TABLE_HEADERS = ("名称", "大小", "进度", "速度", "状态", "操作")
@@ -899,9 +901,7 @@ class TransferRecordPersistence(Protocol):
     def load_history(self) -> tuple[TransferRecord, ...]:
         """Load all persisted rows ordered by update time ascending."""
 
-    def purge_stale_records(
-        self, max_age_days: int = ...
-    ) -> tuple[tuple[str, str], ...]:
+    def purge_stale_records(self, max_age_days: int = ...) -> tuple[tuple[str, str], ...]:
         """Delete retention-expired terminal rows; return their (direction, task_id) keys."""
 
 
@@ -1085,10 +1085,7 @@ class TransferInterface(QWidget):
         # _render_table from _on_upload_progress; 4.24ms/signal vs 0.004ms
         # coalesced). Status/error/resume/max-connections still render now.
         progress_only = (
-            status is None
-            and max_connections is None
-            and can_resume is None
-            and error is None
+            status is None and max_connections is None and can_resume is None and error is None
         )
         if status is not None:
             record.status = status
@@ -1477,9 +1474,7 @@ class TransferInterface(QWidget):
         self.upload_filter_combo.currentIndexChanged.connect(self._on_upload_filter_changed)
         self.download_filter_combo.currentIndexChanged.connect(self._on_download_filter_changed)
         self.open_download_folder_button.clicked.connect(self._request_open_download_folder)
-        self.cancel_folder_prepare_button.clicked.connect(
-            self.folder_prepare_cancel_requested.emit
-        )
+        self.cancel_folder_prepare_button.clicked.connect(self.folder_prepare_cancel_requested.emit)
         self.upload_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("upload"))
         self.download_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("download"))
         self.upload_batch_buttons["select_all"].clicked.connect(
@@ -3499,12 +3494,9 @@ class MainWindow(_MainWindowBase):
                             error=_join_distinct_errors(failed_row.error, record.error),
                         )
                         if self._transfer_history is not None:
-                            self._transfer_history.delete_records(
-                                "upload", [record.task_id]
-                            )
+                            self._transfer_history.delete_records("upload", [record.task_id])
                         LOGGER.info(
-                            "main_window.transfer_history.failed_ghost_folded "
-                            "task_id=%s into=%s",
+                            "main_window.transfer_history.failed_ghost_folded task_id=%s into=%s",
                             record.task_id,
                             failed_row.task_id,
                         )
@@ -3582,9 +3574,7 @@ class MainWindow(_MainWindowBase):
 
         def purge() -> tuple[tuple[str, str], ...]:
             purged = history.purge_stale_records()
-            upload_ids = sorted(
-                {task_id for direction, task_id in purged if direction == "upload"}
-            )
+            upload_ids = sorted({task_id for direction, task_id in purged if direction == "upload"})
             if upload_ids:
                 discard_sessions = getattr(browser, "discard_upload_sessions", None)
                 if callable(discard_sessions):
@@ -3822,9 +3812,7 @@ class MainWindow(_MainWindowBase):
         """Drop every cached listing (after a server-side mutation)."""
         if not self._directory_cache:
             return
-        LOGGER.debug(
-            "main_window.directory_cache.invalidated size=%s", len(self._directory_cache)
-        )
+        LOGGER.debug("main_window.directory_cache.invalidated size=%s", len(self._directory_cache))
         self._directory_cache.clear()
 
     def _consume_after_refresh(self) -> None:
@@ -4896,7 +4884,11 @@ class MainWindow(_MainWindowBase):
         self._scan_thread = thread
         self._scan_worker = worker
         self._set_status("正在扫描待上传内容...")
-        LOGGER.info("main_window.upload_scan.start top_count=%s", len(paths))
+        LOGGER.info(
+            "main_window.upload_scan.start top_count=%s paths=%s",
+            len(paths),
+            [str(path) for path in paths],
+        )
         thread.start()
 
     def _on_upload_scan_succeeded(self, result: object) -> None:
@@ -5267,10 +5259,7 @@ class MainWindow(_MainWindowBase):
         if root_name is None and not _conflict_checked:
             self._submit_upload_paths((local_root,))
             return
-        if (
-            self._folder_prepare_thread is not None
-            or self._folder_upload_record_id is not None
-        ):
+        if self._folder_prepare_thread is not None or self._folder_upload_record_id is not None:
             # 文件夹批次不进传输列表：目录创建属于准备阶段（API 直建），
             # 列表里只有原子文件任务。record_id 仅作内部批次令牌。
             self._folder_prepare_pending.append(
@@ -5414,10 +5403,7 @@ class MainWindow(_MainWindowBase):
         self._folder_prepare_thread = None
         self._folder_prepare_worker = None
         self._folder_prepare_cancel = None
-        if (
-            self._folder_upload_record_id is not None
-            and not self._folder_children_registered
-        ):
+        if self._folder_upload_record_id is not None and not self._folder_children_registered:
             # prepare 失败/取消：批次没有登记子任务，复位标记让下一个
             # 排队的文件夹批次可以开始（成功路径已登记，含空集）。
             self._folder_upload_record_id = None
@@ -6409,9 +6395,7 @@ class MainWindow(_MainWindowBase):
                     continue
                 self._paused_uploads.pop(child_id, None)
                 self._upload_pending = [
-                    pending
-                    for pending in self._upload_pending
-                    if pending.task_id != child_id
+                    pending for pending in self._upload_pending if pending.task_id != child_id
                 ]
                 self._mark_transfer_failed("upload", child_id, "登录已过期，请重新登录")
         self._folder_upload_success_count = 0
@@ -6736,9 +6720,7 @@ class MainWindow(_MainWindowBase):
         task_ids = [record.task_id]
         if record.target_path is not None and record.upload_parent_id:
             task_ids.append(
-                make_upload_task_id(
-                    record.upload_parent_id, record.target_path, record.upload_name
-                )
+                make_upload_task_id(record.upload_parent_id, record.target_path, record.upload_name)
             )
         discard_sessions(task_ids)
 
