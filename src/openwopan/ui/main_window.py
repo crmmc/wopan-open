@@ -24,7 +24,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QShowEvent
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -694,7 +694,7 @@ class UploadWorker(QObject):
         self._resume_requested.set()
         hook = self._cancel_hook
         if hook is not None:
-            hook.preserve_session = True
+            hook.preserve_session = True  # type: ignore[attr-defined]
 
     def _upload_stop_requested(self) -> bool:
         while self._pause_requested.is_set() and not self._cancel_requested.is_set():
@@ -1539,7 +1539,7 @@ class TransferInterface(QWidget):
         # hidden, so the visible window's widgets need one render.
         self._schedule_progress_render(self._active_direction)
 
-    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt naming
         super().resizeEvent(event)
         # 名称列的省略点是"绘制时"按列宽算的：窗口变宽后已绘制行若未被
         # 重绘，省略号会停在旧位置、右侧留大片空白（真机 2026-10-07）。
@@ -3103,7 +3103,7 @@ class MainWindow(_MainWindowBase):
         self.setMinimumSize(*MAIN_WINDOW_MINIMUM_SIZE)
         # 构造期设置而非在 show() 处切换：首次显示即最大化，之后 hide/show
         # （如登录流程）沿用用户手动还原的窗口状态。
-        self.setWindowState(Qt.WindowMaximized)
+        self.setWindowState(Qt.WindowState.WindowMaximized)
 
         self.file_interface = FileInterface(self)
         if transfer_record_store is not None:

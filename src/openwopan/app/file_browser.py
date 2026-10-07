@@ -213,8 +213,13 @@ class FileBrowserBackend(Protocol):
         *,
         root_name: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        merge: bool = False,
     ) -> FolderUploadJob:
-        """Create the cloud directory tree for a local folder upload."""
+        """Create the cloud directory tree for a local folder upload.
+
+        With ``merge`` same-name directories reuse the existing cloud tree
+        (server-side merge) instead of failing on a same-name root.
+        """
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""
