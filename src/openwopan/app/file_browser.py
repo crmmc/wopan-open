@@ -4,7 +4,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -32,6 +32,7 @@ from openwopan.tasks.scheduler import (
 from openwopan.tasks.upload import (
     UPLOAD_SESSION_MAX_AGE_SECONDS,
     FolderUploadJob,
+    MergeUploadEstimate,
     PlannedUploadFile,
     UploadTaskRecord,
     UploadTaskState,
@@ -39,6 +40,7 @@ from openwopan.tasks.upload import (
     make_upload_task_id,
     next_available_name,
     scan_folder_tree,
+    server_file_name,
 )
 from openwopan.wopan.client import (
     ORIGIN,
@@ -132,7 +134,9 @@ class FileBrowserBackend(Protocol):
     def resolve_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
         """Resolve a directory id to its root-relative id/name path."""
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
         """Create a folder and return the created item."""
 
     def rename_item(self, item: WopanItem, new_name: str) -> None:
@@ -209,8 +213,13 @@ class FileBrowserBackend(Protocol):
         *,
         root_name: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        merge: bool = False,
     ) -> FolderUploadJob:
-        """Create the cloud directory tree for a local folder upload."""
+        """Create the cloud directory tree for a local folder upload.
+
+        With ``merge`` same-name directories reuse the existing cloud tree
+        (server-side merge) instead of failing on a same-name root.
+        """
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""
@@ -226,6 +235,19 @@ class FileBrowserBackend(Protocol):
 
     def empty_recycle_bin(self) -> None:
         """Permanently delete every recycle-bin entry."""
+
+
+def _merge_existing_item(items: dict[str, WopanItem], name: str) -> WopanItem | None:
+    """Find a cloud sibling by local name, tolerating server truncation."""
+    exact = items.get(name)
+    if exact is not None:
+        return exact
+    return items.get(server_file_name(name))
+
+
+def _server_name_taken(taken: set[str], name: str) -> bool:
+    """Whether ``name`` collides with taken cloud names, truncation-aware."""
+    return name in taken or server_file_name(name) in taken
 
 
 class FileBrowserService:
@@ -429,14 +451,24 @@ class FileBrowserService:
         )
         return items
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
-        """Create a folder in a directory."""
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
+        """Create a folder in a directory.
+
+        ``reuse_existing`` lets the server merge into a same-name directory
+        and return its id (upload-tree reuse) instead of reporting a
+        conflict.
+        """
         LOGGER.info(
-            "file_browser.create_folder.start parent_id=%s name_length=%s",
+            "file_browser.create_folder.start parent_id=%s name_length=%s reuse_existing=%s",
             parent_id,
             len(name),
+            reuse_existing,
         )
-        item = self._call(lambda: self._client.create_folder(parent_id, name))
+        item = self._call(
+            lambda: self._client.create_folder(parent_id, name, reuse_existing=reuse_existing)
+        )
         LOGGER.info(
             "file_browser.create_folder.success parent_id=%s item_id=%s",
             parent_id,
@@ -587,7 +619,7 @@ class FileBrowserService:
         if upload_name is not None:
             if not upload_name:
                 raise FileBrowserError("上传文件名称不能为空")
-            if upload_name in self._existing_names(parent_id):
+            if _server_name_taken(self._existing_names(parent_id), upload_name):
                 raise FileBrowserError("上传目标已存在，请刷新后重试")
         if cancel_requested is not None and cancel_requested():
             raise FileBrowserUploadCancelledError("上传已取消")
@@ -657,10 +689,38 @@ class FileBrowserService:
                 resume=resume,
             )
         except FileBrowserUploadCancelledError:
+            # 「暂停中关闭」的退出不丢会话：cancel 回调携带 preserve_session
+            # 标志（见 UploadWorker.request_abandon），分片留给下次启动续传，
+            # 会话状态归一为「已暂停」（was_active=False，重启后手动继续）；
+            # 普通用户取消仍删除会话。
             if store is not None:
-                store.delete(upload_task_id)
+                if getattr(cancel_requested, "preserve_session", False):
+                    try:
+                        store.update(upload_task_id, _mark_upload_interrupted)
+                    except KeyError:
+                        # 会话已被并发清理（保留期清理竞态）：无可保留内容。
+                        pass
+                else:
+                    store.delete(upload_task_id)
             raise
         except Exception as exc:
+            if store is not None and self._should_restart_rejected_session(
+                store, upload_task_id, resume=resume, error=exc
+            ):
+                # The server rejected the reused session outright (e.g. HTTP
+                # 500 on the one remaining part, UAT 2026-10-06: retrying the
+                # same session hits the same wall forever). Discard it and
+                # re-upload the whole file once under a fresh session.
+                item = self._restart_rejected_upload_session(
+                    store,
+                    upload_task_id,
+                    parent_id=parent_id,
+                    local_path=local_path,
+                    upload_name=upload_name,
+                    progress_callback=progress_callback,
+                    cancel_requested=cancel_requested,
+                )
+                return item
             if store is not None:
                 message = str(exc)
                 try:
@@ -697,6 +757,7 @@ class FileBrowserService:
             "max_upload_threads": self._settings.max_upload_threads,
             "retry_max_attempts": self._settings.retry_max_attempts,
             "upload_name": upload_name,
+            "quick_transfer": self._settings.enable_quick_transfer,
         }
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
@@ -715,7 +776,13 @@ class FileBrowserService:
                         )
                     )
                 except TypeError:
-                    for key in ("resume", "cancel_requested", "progress_callback"):
+                    drop_order = (
+                        "quick_transfer",
+                        "resume",
+                        "cancel_requested",
+                        "progress_callback",
+                    )
+                    for key in drop_order:
                         if key in kwargs:
                             del kwargs[key]
                             break
@@ -761,21 +828,132 @@ class FileBrowserService:
             return store.update(task_id, _reset_upload_session)
         if state is not None:
             store.delete(task_id)
-        fresh = UploadTaskState(
+        fresh = _new_upload_state(
             task_id=task_id,
-            file_name=upload_name if upload_name is not None else local_path.name,
-            local_path=local_path,
             parent_id=parent_id,
+            local_path=local_path,
             upload_name=upload_name,
             file_size=file_size,
             file_mtime=file_mtime,
             part_size=part_size,
             total_parts=total_parts,
-            unique_id=str(int(time.time() * 1000)),
-            batch_no=time.strftime("%Y%m%d%H%M%S"),
         )
         store.save(fresh)
         return fresh
+
+    def _should_restart_rejected_session(
+        self,
+        store: UploadTaskStore,
+        task_id: str,
+        *,
+        resume: UploadResumeContext | None,
+        error: Exception,
+    ) -> bool:
+        """Whether a failed resume should be retried once with a fresh session.
+
+        Only when the server rejected the REUSED session outright — an HTTP
+        5xx from the upload endpoint with zero newly confirmed parts — is a
+        full re-upload worthwhile; the same session would keep hitting the
+        same wall (UAT 2026-10-06: last remaining part of a 130/131 session
+        answered HTTP 500 on every retry). Mid-transfer network failures
+        still keep their parts and follow the normal fail-then-resume path.
+        """
+        if resume is None or not resume.completed_indexes:
+            return False
+        cause = error.__cause__
+        if not (
+            isinstance(error, FileBrowserError)
+            and isinstance(cause, httpx.HTTPStatusError)
+            and 500 <= cause.response.status_code < 600
+        ):
+            return False
+        state = store.load(task_id)
+        if state is None:
+            return False
+        return frozenset(state.completed_indexes) == frozenset(resume.completed_indexes)
+
+    def _restart_rejected_upload_session(
+        self,
+        store: UploadTaskStore,
+        task_id: str,
+        *,
+        parent_id: str,
+        local_path: Path,
+        upload_name: str | None,
+        progress_callback: UploadProgressCallback | None,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> WopanItem:
+        """Discard a server-rejected session and re-upload the file once."""
+        LOGGER.warning(
+            "file_browser.upload_file.session_rejected_restart parent_id=%s file_name_length=%s",
+            parent_id,
+            len(local_path.name),
+        )
+        # stat before delete: an unreadable file must keep the old session's
+        # confirmed parts instead of losing them to an unwrapped OSError.
+        try:
+            stat_result = local_path.stat()
+        except OSError as exc:
+            LOGGER.warning(
+                "file_browser.upload_file.restart_stat_failed error_type=%s",
+                type(exc).__name__,
+            )
+            raise FileBrowserError(f"无法读取本地文件：{exc}") from exc
+        store.delete(task_id)
+        part_size, total_parts = resolve_upload_part_plan(
+            stat_result.st_size, self._settings.upload_part_size_mb
+        )
+        fresh = _new_upload_state(
+            task_id=task_id,
+            parent_id=parent_id,
+            local_path=local_path,
+            upload_name=upload_name,
+            file_size=stat_result.st_size,
+            file_mtime=stat_result.st_mtime,
+            part_size=part_size,
+            total_parts=total_parts,
+        )
+        store.save(fresh)
+        resume = UploadResumeContext(
+            unique_id=fresh.unique_id,
+            batch_no=fresh.batch_no,
+            completed_indexes=frozenset(),
+            known_fid="",
+            on_part_result=self._make_upload_part_recorder(store, task_id),
+        )
+        try:
+            item = self._invoke_upload_client(
+                parent_id,
+                local_path,
+                upload_name=upload_name,
+                progress_callback=progress_callback,
+                cancel_requested=cancel_requested,
+                resume=resume,
+            )
+        except FileBrowserUploadCancelledError:
+            if getattr(cancel_requested, "preserve_session", False):
+                try:
+                    store.update(task_id, _mark_upload_interrupted)
+                except KeyError:
+                    pass
+            else:
+                store.delete(task_id)
+            raise
+        except Exception as exc:
+            message = str(exc)
+            try:
+                store.update(task_id, lambda state: _mark_upload_failed(state, message))
+            except KeyError:
+                LOGGER.debug("file_browser.upload_file.record_after_delete")
+            raise
+        store.delete(task_id)
+        LOGGER.info(
+            "file_browser.upload_file.success parent_id=%s item_id=%s file_name_length=%s",
+            parent_id,
+            item.item_id,
+            len(item.name),
+        )
+        return item
 
     def _make_upload_part_recorder(
         self, store: UploadTaskStore, task_id: str
@@ -806,13 +984,20 @@ class FileBrowserService:
             if state.status == "已完成" or not state.local_path.exists():
                 store.delete(state.task_id)
                 continue
+            was_active = state.status == "进行中"
             try:
-                updated = store.update(state.task_id, _mark_upload_interrupted)
+                if was_active:
+                    # 只有「进行中」是被打断的；「失败」保留原状态与错误
+                    # 原因（重试语义不变），「已暂停」本就是用户意图。
+                    updated = store.update(state.task_id, _mark_upload_interrupted)
+                else:
+                    updated = state
             except KeyError:
                 # The session was deleted concurrently (retention purge racing
                 # this recovery loop); nothing left to recover for it.
                 continue
-            records.append(_upload_state_record(updated))
+            record = _upload_state_record(updated)
+            records.append(replace(record, was_active=was_active))
         return tuple(records)
 
     def discard_upload_sessions(self, task_ids: Sequence[str]) -> None:
@@ -836,6 +1021,7 @@ class FileBrowserService:
         *,
         root_name: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        merge: bool = False,
     ) -> FolderUploadJob:
         """Create the cloud directory tree for a local folder upload.
 
@@ -844,6 +1030,18 @@ class FileBrowserService:
         and returns the per-file upload plan. On any failure the whole
         preparation fails without partial results; directories already
         created stay on the cloud (no rollback).
+
+        ``merge`` continues into an existing tree instead of duplicating it:
+        directories (root included) are merged server-side — one
+        ``CreateDirectory`` per folder with ``isCouldRepeat="1"``, the
+        server returning the existing same-name directory's id (code 130007
+        included) or creating it — so no parent directory is pre-listed and
+        no name is compared client-side; the server's stored names (long
+        names truncated) are the single source of truth. Same-name
+        same-size files are then treated as already uploaded and skipped;
+        only the missing files are planned. A same-name *file* blocking a
+        directory name is expected to fail the server request instead of
+        silently renaming (edge not yet observed on the real server).
         """
         if not parent_id:
             raise FileBrowserError("目标文件夹不能为空")
@@ -869,38 +1067,62 @@ class FileBrowserService:
         try:
             if cancel_requested is not None and cancel_requested():
                 raise FileBrowserUploadCancelledError("上传已取消")
-            existing_root_names = self._existing_names(parent_id)
-            if root_name is None:
-                resolved_root_name = next_available_name(plan.root_name, existing_root_names)
+            requested_root = root_name if root_name is not None else plan.root_name
+            if not requested_root:
+                raise FileBrowserError("上传文件夹名称不能为空")
+            if merge:
+                # 合并模式：根目录交给服务端合并（isCouldRepeat，同名返回
+                # 已有 id），不预列父目录、不按名字猜测——服务端存储名
+                # （含长名截断）是唯一事实。
+                root_item = self.create_folder(parent_id, requested_root, reuse_existing=True)
+                resolved_root_name = requested_root
             else:
-                if not root_name:
-                    raise FileBrowserError("上传文件夹名称不能为空")
-                if root_name in existing_root_names:
+                existing_root_names = set(self._existing_items(parent_id))
+                if root_name is not None and _server_name_taken(existing_root_names, root_name):
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
-                resolved_root_name = root_name
-            if cancel_requested is not None and cancel_requested():
-                raise FileBrowserUploadCancelledError("上传已取消")
-            root_item = self.create_folder(parent_id, resolved_root_name)
+                resolved_root_name = (
+                    root_name
+                    if root_name is not None
+                    else next_available_name(plan.root_name, existing_root_names)
+                )
+                if cancel_requested is not None and cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
+                root_item = self.create_folder(parent_id, resolved_root_name)
             dir_ids = {"": root_item.item_id}
             used_names: dict[str, set[str]] = {}
+            cloud_items: dict[str, dict[str, WopanItem]] = {}
+
+            def cloud_items_for(rel_dir: str) -> dict[str, WopanItem]:
+                """One listing per directory serves both name-dedup and merge."""
+                if rel_dir not in cloud_items:
+                    cloud_items[rel_dir] = self._existing_items(dir_ids[rel_dir])
+                return cloud_items[rel_dir]
 
             def taken_names(rel_dir: str) -> set[str]:
                 if rel_dir not in used_names:
-                    used_names[rel_dir] = self._existing_names(dir_ids[rel_dir])
+                    used_names[rel_dir] = set(cloud_items_for(rel_dir))
                 return used_names[rel_dir]
 
             for rel_path in plan.folders:
                 if cancel_requested is not None and cancel_requested():
                     raise FileBrowserUploadCancelledError("上传已取消")
                 rel_parent, _, local_name = rel_path.rpartition("/")
+                if merge:
+                    # 合并模式：子目录同样交给服务端合并，客户端不做名字
+                    # 预判，也不为没有文件的目录浪费一次列目录请求。
+                    merged = self.create_folder(
+                        dir_ids[rel_parent], local_name, reuse_existing=True
+                    )
+                    dir_ids[rel_path] = merged.item_id
+                    continue
                 parent_names = taken_names(rel_parent)
-                if root_name is not None and local_name in parent_names:
+                if root_name is not None and _server_name_taken(parent_names, local_name):
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 folder_name = next_available_name(local_name, parent_names)
                 if cancel_requested is not None and cancel_requested():
                     raise FileBrowserUploadCancelledError("上传已取消")
                 created = self.create_folder(dir_ids[rel_parent], folder_name)
-                parent_names.add(folder_name)
+                parent_names.add(server_file_name(folder_name))
                 dir_ids[rel_path] = created.item_id
 
             planned_files: list[PlannedUploadFile] = []
@@ -908,10 +1130,25 @@ class FileBrowserService:
                 if cancel_requested is not None and cancel_requested():
                     raise FileBrowserUploadCancelledError("上传已取消")
                 names = taken_names(planned.rel_dir)
-                if root_name is not None and planned.name in names:
+                existing = (
+                    _merge_existing_item(cloud_items_for(planned.rel_dir), planned.name)
+                    if merge
+                    else None
+                )
+                if (
+                    merge
+                    and existing is not None
+                    and existing.kind is WopanItemKind.FILE
+                    and existing.size == planned.size
+                ):
+                    # 合并模式：同名同大小视为已上传完成，跳过（名字按服务端
+                    # 存储形态匹配，长名文件上传后被截断存储，仍能识别为已存在）。
+                    names.add(server_file_name(planned.name))
+                    continue
+                if root_name is not None and _server_name_taken(names, planned.name) and not merge:
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 upload_name = next_available_name(planned.name, names)
-                names.add(upload_name)
+                names.add(server_file_name(upload_name))
                 planned_files.append(
                     PlannedUploadFile(
                         local_path=planned.local_path,
@@ -951,6 +1188,67 @@ class FileBrowserService:
 
     def _existing_names(self, directory_id: str) -> set[str]:
         return {item.name for item in self.list_directory(directory_id)}
+
+    def _existing_items(self, directory_id: str) -> dict[str, WopanItem]:
+        """Map one cloud directory's entries by name (merge-mode lookups)."""
+        return {item.name: item for item in self.list_directory(directory_id)}
+
+    def estimate_merge_uploads(
+        self,
+        parent_id: str,
+        local_root: Path,
+        root_name: str | None = None,
+    ) -> MergeUploadEstimate:
+        """Read-only estimate of what merging ``local_root`` would add.
+
+        文件跳过判定与 prepare_folder_upload 的 merge 分支同源：同名同大小
+        文件视为已上传；本地独有的子树整树计为新增。目录以存储名比对判定
+        （估算无法触发服务端合并）——服务端对同名目录返回同一个 id（130007
+        契约），存储名在同一父目录内唯一，所以名字走到的一定是 prepare 实际
+        合并进的目录。不创建任何云端内容，只做列表读取；同名根目录不存在
+        时全量新增。
+        """
+        plan = scan_folder_tree(local_root)
+        requested_root = root_name if root_name is not None else plan.root_name
+        root_existing = _merge_existing_item(self._existing_items(parent_id), requested_root)
+        if root_existing is None or root_existing.kind is not WopanItemKind.FOLDER:
+            return MergeUploadEstimate(files_to_upload=len(plan.files), files_skipped=0)
+
+        # rel_dir -> 云端目录 id；None 表示云端没有对应目录（整棵子树全量）。
+        dir_ids: dict[str, str | None] = {"": root_existing.item_id}
+        cloud_items: dict[str, dict[str, WopanItem]] = {}
+
+        def items_for(rel_dir: str) -> dict[str, WopanItem] | None:
+            dir_id = dir_ids.get(rel_dir)
+            if dir_id is None:
+                return None
+            if rel_dir not in cloud_items:
+                cloud_items[rel_dir] = self._existing_items(dir_id)
+            return cloud_items[rel_dir]
+
+        for rel_path in plan.folders:  # 父目录先于子目录（scan 保证）
+            rel_parent, _, local_name = rel_path.rpartition("/")
+            items = items_for(rel_parent)
+            existing = _merge_existing_item(items, local_name) if items is not None else None
+            if existing is not None and existing.kind is WopanItemKind.FOLDER:
+                dir_ids[rel_path] = existing.item_id
+            else:
+                dir_ids[rel_path] = None
+
+        files_to_upload = 0
+        files_skipped = 0
+        for planned in plan.files:
+            items = items_for(planned.rel_dir)
+            existing = _merge_existing_item(items, planned.name) if items is not None else None
+            if (
+                existing is not None
+                and existing.kind is WopanItemKind.FILE
+                and existing.size == planned.size
+            ):
+                files_skipped += 1
+            else:
+                files_to_upload += 1
+        return MergeUploadEstimate(files_to_upload=files_to_upload, files_skipped=files_skipped)
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""
@@ -1053,6 +1351,33 @@ def _reset_upload_session(state: UploadTaskState) -> None:
     """Mark a reused upload session as active again."""
     state.status = "进行中"
     state.error = ""
+
+
+def _new_upload_state(
+    *,
+    task_id: str,
+    parent_id: str,
+    local_path: Path,
+    upload_name: str | None,
+    file_size: int,
+    file_mtime: float,
+    part_size: int,
+    total_parts: int,
+) -> UploadTaskState:
+    """Build a fresh session with new server-side aggregation identifiers."""
+    return UploadTaskState(
+        task_id=task_id,
+        file_name=upload_name if upload_name is not None else local_path.name,
+        local_path=local_path,
+        parent_id=parent_id,
+        upload_name=upload_name,
+        file_size=file_size,
+        file_mtime=file_mtime,
+        part_size=part_size,
+        total_parts=total_parts,
+        unique_id=str(int(time.time() * 1000)),
+        batch_no=time.strftime("%Y%m%d%H%M%S"),
+    )
 
 
 def _record_upload_part(state: UploadTaskState, part_index: int, fid: str) -> None:

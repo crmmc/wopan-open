@@ -1545,7 +1545,12 @@ def _replace_output_file(source_path: Path, target_path: Path) -> None:
                         raise
                     _copy_output_exclusive(tmp_path, target_path)
             finally:
-                tmp_path.unlink(missing_ok=True)
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    # 临时文件清理失败不得掩盖 try 内已抛出的
+                    # 「下载目标已存在」等原始错误。
+                    pass
         else:
             raise
     source_path.unlink()

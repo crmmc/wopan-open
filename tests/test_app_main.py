@@ -78,6 +78,7 @@ def test_main_handles_session_marker_and_crash_dialogs(
     notice_paths: list[Path] = []
     crash_dialog_paths: list[Path] = []
     crash_callbacks: list[Callable[[Path], None]] = []
+    deferred: list[Callable[[], object]] = []
 
     class _FakeApplication:
         setHighDpiScaleFactorRoundingPolicy = staticmethod(lambda _policy: None)
@@ -130,13 +131,22 @@ def test_main_handles_session_marker_and_crash_dialogs(
         "ApplicationController",
         lambda *_args: SimpleNamespace(start=lambda: None),
     )
-    monkeypatch.setattr(main_module.QTimer, "singleShot", staticmethod(lambda *_args: None))
-    monkeypatch.setattr(main_module, "show_crash_dialog", crash_dialog_paths.append)
     monkeypatch.setattr(
-        main_module,
-        "show_unclean_shutdown_notice",
-        lambda path: notice_paths.append(path) or True,
+        main_module.QTimer,
+        "singleShot",
+        staticmethod(lambda _ms, callback: deferred.append(callback)),
     )
+    monkeypatch.setattr(main_module, "show_crash_dialog", crash_dialog_paths.append)
+
+    def _fake_notice(log_dir: Path, parent: object = None) -> bool:
+        # 参数类型自检：曾因调用点位置参数写反（window/log_dir 互换）让
+        # QMessageBox(Path) 崩溃——替身必须钉住参数形状。
+        assert isinstance(log_dir, Path)
+        assert parent is not None
+        notice_paths.append(log_dir)
+        return True
+
+    monkeypatch.setattr(main_module, "show_unclean_shutdown_notice", _fake_notice)
     if smoke_test:
         monkeypatch.setenv(main_module.SMOKE_TEST_ENV, "1")
     else:
@@ -147,5 +157,13 @@ def test_main_handles_session_marker_and_crash_dialogs(
     assert len(crash_callbacks) == 1
     crash_callbacks[0](log_path)
     assert crash_dialog_paths == [tmp_path]
-    assert notice_paths == [tmp_path] * expected_notice_calls
+    # 提示不再同步阻塞弹出，而是注册为启动后的延迟回调：第一个回调是
+    # 主窗口启动，非干净退出时第二个是非阻塞提示（主窗口先可用）。
+    if expected_notice_calls:
+        assert len(deferred) == 2
+        deferred[1]()
+        assert notice_paths == [tmp_path]
+    else:
+        assert len(deferred) == 1
+        assert notice_paths == []
     assert not marker_path.exists()

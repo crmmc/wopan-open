@@ -16,11 +16,12 @@ from typing import Any, Literal
 from platformdirs import user_cache_path
 
 from openwopan.storage.settings import APP_AUTHOR, APP_NAME
+from openwopan.wopan.naming import SERVER_FILE_NAME_LIMIT, server_file_name
 
 LOGGER = logging.getLogger(__name__)
 
 JUNK_FILE_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
-UploadConflictResolution = Literal["skip", "copy"]
+UploadConflictResolution = Literal["skip", "copy", "merge"]
 UPLOAD_SESSION_MAX_AGE_SECONDS = 24 * 3600
 
 
@@ -74,6 +75,18 @@ class UploadSummaryEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class MergeUploadEstimate:
+    """Read-only estimate of what a merge upload would add.
+
+    Same skip rules as the merge branch of folder preparation: same-name
+    directories are reused, same-name same-size files count as uploaded.
+    """
+
+    files_to_upload: int
+    files_skipped: int
+
+
+@dataclass(frozen=True, slots=True)
 class UploadBatchSummary:
     """Safe, bounded summary of local upload inputs."""
 
@@ -94,15 +107,36 @@ class UploadTarget:
 
 
 def next_available_name(requested: str, used: set[str]) -> str:
-    """Return ``requested``, or a repeatedly suffixed ``(copy)`` name."""
-    if requested not in used:
+    """Return ``requested``, or a repeatedly suffixed ``(copy)`` name.
+
+    Names are matched by their server-stored form (the server truncates
+    names beyond ``SERVER_FILE_NAME_LIMIT``), and suffixed candidates are
+    generated to already fit that limit — otherwise the ``(copy)`` marker
+    would sit past the truncation point and collide server-side again.
+    """
+    if requested not in used and server_file_name(requested) not in used:
         return requested
-    path = Path(requested)
-    candidate = f"{path.stem} (copy){path.suffix}"
-    while candidate in used:
-        candidate_path = Path(candidate)
-        candidate = f"{candidate_path.stem} (copy){candidate_path.suffix}"
-    return candidate
+    marker = " (copy)"
+    ext = Path(requested).suffix
+    stem = Path(requested).stem
+    max_stem = max(SERVER_FILE_NAME_LIMIT - len(ext), len(marker) + 1)
+    copies = 1
+    while len(marker) * copies <= max_stem:
+        base = stem[: max_stem - len(marker) * copies]
+        candidate = f"{base}{marker * copies}{ext}"
+        if candidate not in used and server_file_name(candidate) not in used:
+            return candidate
+        copies += 1
+    # Degenerate fallback (every fitting "(copy)" variant is taken):
+    # numeric suffixes stay distinct inside the fitting window, and the
+    # bounded attempts guarantee termination on any listing.
+    for attempt in range(2, 1000):
+        tag = f" ({attempt})"
+        base = stem[: max_stem - len(tag)]
+        candidate = f"{base}{tag}{ext}"
+        if candidate not in used and server_file_name(candidate) not in used:
+            return candidate
+    raise ValueError("无法为上传文件生成可用名称：同名冲突过多")
 
 
 def find_upload_conflicts(
@@ -112,9 +146,10 @@ def find_upload_conflicts(
     used_names = set(existing_names)
     conflicts: list[Path] = []
     for path in paths:
-        if path.name in used_names:
+        stored = server_file_name(path.name)
+        if path.name in used_names or stored in used_names:
             conflicts.append(path)
-        used_names.add(path.name)
+        used_names.add(stored)
     return tuple(conflicts)
 
 
@@ -123,22 +158,34 @@ def resolve_upload_targets(
     existing_names: set[str],
     resolution: UploadConflictResolution,
 ) -> tuple[UploadTarget, ...]:
-    """Resolve a batch by skipping conflicts or assigning unique copy names."""
+    """Resolve a batch by skipping/copying conflicts, or merging into existing.
+
+    ``merge`` keeps the original name for conflicts so folders can continue
+    uploading into the existing cloud directory (``prepare_folder_upload``
+    reuses directories and skips same-name files); conflicting top-level
+    files are dropped by the caller, which knows path kinds.
+    """
     used_names = set(existing_names)
     targets: list[UploadTarget] = []
     for path in paths:
         requested_name = path.name
-        if requested_name not in used_names:
+        if (
+            requested_name not in used_names
+            and server_file_name(requested_name) not in used_names
+        ):
             targets.append(UploadTarget(path, None))
-            used_names.add(requested_name)
+            used_names.add(server_file_name(requested_name))
             continue
         if resolution == "skip":
+            continue
+        if resolution == "merge":
+            targets.append(UploadTarget(path, None))
             continue
         if resolution != "copy":
             raise ValueError(f"不支持的上传冲突策略：{resolution}")
         upload_name = next_available_name(requested_name, used_names)
         targets.append(UploadTarget(path, upload_name))
-        used_names.add(upload_name)
+        used_names.add(server_file_name(upload_name))
     return tuple(targets)
 
 
@@ -319,6 +366,9 @@ class UploadTaskRecord:
     upload_name: str | None = None
     error: str = ""
     resumable: bool = False
+    # True when the session was 进行中 when the previous run ended: the
+    # restart recovery auto-continues exactly these (download parity).
+    was_active: bool = False
 
 
 def make_upload_task_id(parent_id: str, local_path: Path, upload_name: str | None) -> str:
@@ -403,9 +453,21 @@ class UploadTaskStore:
             return state
 
     def delete(self, task_id: str) -> None:
-        """Delete one persisted task metadata file."""
+        """Delete one persisted task metadata file (best-effort cleanup).
+
+        Called after uploads succeed or cancel: a Windows file-handle race on
+        unlink must never flip an already-successful upload into a failure,
+        so OSError is logged and swallowed.
+        """
         with self._lock:
-            self.task_path(task_id).unlink(missing_ok=True)
+            try:
+                self.task_path(task_id).unlink(missing_ok=True)
+            except OSError as exc:
+                LOGGER.warning(
+                    "upload.task_state.delete_failed task_id=%s error_type=%s",
+                    task_id,
+                    type(exc).__name__,
+                )
 
 
 def _normalize_completed_indexes(indexes: list[int], total_parts: int) -> list[int]:

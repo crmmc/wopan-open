@@ -33,6 +33,7 @@ from openwopan.wopan.models import (
     WopanItemKind,
     WopanRecycleItem,
 )
+from openwopan.wopan.naming import server_file_name
 
 UploadProgressCallback = Callable[[int, int], None]
 UploadPartResultCallback = Callable[[int, str], None]
@@ -80,6 +81,14 @@ PERSONAL_SEARCH_TYPE = "2"
 SEARCH_DEFAULT_PAGE_SIZE = 50
 PERSONAL_FAMILY_ID = "0"
 DEFAULT_VIP_LEVEL = "0"
+QUICK_TRANSFER_API = "https://b.smartont.net:443/openapi/transfer/quickTransfer"
+# 官方客户端阈值：小于 3MB 的文件不做秒传探测，直接分片上传。
+QUICK_TRANSFER_MIN_FILE_SIZE = 3 * 1024 * 1024
+QUICK_TRANSFER_TIMEOUT_SECONDS = 30.0
+QUICK_TRANSFER_HASH_CHUNK_SIZE = 1024 * 1024
+# 官方客户端契约：分片/zone 重试间隔 5 秒（RETRY_DELAY=5e3）。零间隔连发
+# 对持续几十秒的服务端抖动毫无意义（UAT 2026-10-07：4 发 6 秒内全灭）。
+UPLOAD_RETRY_DELAY_SECONDS = 5.0
 STANDARD_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -193,8 +202,11 @@ class WopanClient:
         param: dict[str, Any],
         *,
         body_extra: dict[str, Any] | None = None,
+        accepted_codes: tuple[str, ...] = (),
     ) -> dict[str, Any]:
-        data = self._dispatch_wohome_payload(key, param, body_extra=body_extra)
+        data = self._dispatch_wohome_payload(
+            key, param, body_extra=body_extra, accepted_codes=accepted_codes
+        )
         if not isinstance(data, dict):
             raise WopanResponseError("WoPan response DATA is not an object")
         return data
@@ -205,6 +217,7 @@ class WopanClient:
         param: dict[str, Any],
         *,
         body_extra: dict[str, Any] | None = None,
+        accepted_codes: tuple[str, ...] = (),
     ) -> Any:
         token_key = _wohome_crypto_key(self._access_token)
         now = int(time.time() * 1000)
@@ -232,6 +245,7 @@ class WopanClient:
             payload=payload,
             headers={"Content-Type": "application/json", "Accesstoken": self._access_token},
             decrypt_key=token_key,
+            accepted_codes=accepted_codes,
         )
 
     def _post_dispatch(
@@ -268,6 +282,7 @@ class WopanClient:
         payload: dict[str, Any],
         headers: dict[str, str],
         decrypt_key: str,
+        accepted_codes: tuple[str, ...] = (),
     ) -> Any:
         LOGGER.debug("wopan.dispatch.start channel=%s key=%s", channel, key)
         try:
@@ -280,7 +295,7 @@ class WopanClient:
             raw = response.json()
             if not isinstance(raw, dict):
                 raise WopanResponseError("WoPan response is not an object")
-            data = _read_dispatch_payload(raw, decrypt_key)
+            data = _read_dispatch_payload(raw, decrypt_key, accepted_codes=accepted_codes)
         except WopanAuthenticationError:
             LOGGER.info("wopan.dispatch.auth_failed channel=%s key=%s", channel, key)
             raise
@@ -416,23 +431,46 @@ class WopanClient:
         )
         return chain
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
-        """Create a folder under a parent directory."""
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
+        """Create a folder under a parent directory.
+
+        ``reuse_existing`` asks the server to merge into a same-name
+        directory instead of reporting a conflict — the contract the
+        official client's folder upload uses: the request carries
+        ``isCouldRepeat="1"``, and business code 130007 ("directory already
+        exists") counts as success with ``DATA.id`` identifying the existing
+        directory. The returned id is always safe to upload into either way;
+        without the flag a same-name directory keeps raising a business
+        error.
+        """
         if not parent_id:
             raise ValueError("parent_id must not be empty")
         if not name:
             raise ValueError("name must not be empty")
 
-        LOGGER.info("wopan.create_folder.start parent_id=%s name_length=%s", parent_id, len(name))
+        LOGGER.info(
+            "wopan.create_folder.start parent_id=%s name_length=%s reuse_existing=%s",
+            parent_id,
+            len(name),
+            reuse_existing,
+        )
+        param: dict[str, Any] = {
+            "spaceType": PERSONAL_SPACE_TYPE,
+            "familyId": PERSONAL_FAMILY_ID,
+            "parentDirectoryId": parent_id,
+            "directoryName": name,
+            "clientId": CLIENT_ID,
+        }
+        accepted_codes: tuple[str, ...] = ()
+        if reuse_existing:
+            param["isCouldRepeat"] = "1"
+            accepted_codes = ("130007",)
         data = self._dispatch_wohome(
             "CreateDirectory",
-            {
-                "spaceType": PERSONAL_SPACE_TYPE,
-                "familyId": PERSONAL_FAMILY_ID,
-                "parentDirectoryId": parent_id,
-                "directoryName": name,
-                "clientId": CLIENT_ID,
-            },
+            param,
+            accepted_codes=accepted_codes,
         )
         item_id = str(data.get("id") or "")
         if not item_id:
@@ -700,6 +738,7 @@ class WopanClient:
         progress_callback: UploadProgressCallback | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         resume: UploadResumeContext | None = None,
+        quick_transfer: bool = False,
     ) -> WopanItem:
         """Upload a local file to a parent directory.
 
@@ -710,6 +749,12 @@ class WopanClient:
         finishes its parts without a usable fid, or fails after the server
         may already have assembled the file, the target directory listing is
         queried to recover the fid by name+size match.
+
+        With ``quick_transfer`` files at or above
+        ``QUICK_TRANSFER_MIN_FILE_SIZE`` first probe the instant-transfer
+        API (full-file SHA-256, official-client parity): a hit completes
+        the file server-side without sending any part; a miss or any probe
+        failure falls back to the normal chunked upload.
         """
         if not parent_id:
             raise ValueError("parent_id must not be empty")
@@ -764,6 +809,22 @@ class WopanClient:
                 progress_callback(file_size, file_size)
             return recovered
 
+        unique_id = resume.unique_id if resume is not None else str(int(time.time() * 1000))
+        batch_no = resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
+        if quick_transfer and file_size >= QUICK_TRANSFER_MIN_FILE_SIZE:
+            item = self._try_quick_transfer(
+                parent_id=parent_id,
+                file_name=file_name,
+                file_size=file_size,
+                file_type=upload_file_type,
+                batch_no=batch_no,
+                local_path=local_path,
+                cancel_requested=cancel_requested,
+            )
+            if item is not None:
+                if progress_callback is not None:
+                    progress_callback(file_size, file_size)
+                return item
         if cancel_requested is None:
             zone_url = self.get_upload_zone_url(retry_max_attempts=retry_max_attempts)
         else:
@@ -772,8 +833,6 @@ class WopanClient:
             )
         _check_upload_cancelled(cancel_requested)
         upload_url = f"{zone_url.rstrip('/')}/openapi/client/upload2C"
-        unique_id = resume.unique_id if resume is not None else str(int(time.time() * 1000))
-        batch_no = resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
         token_key = _wohome_crypto_key(self._access_token)
         file_info = {
             "spaceType": PERSONAL_SPACE_TYPE,
@@ -856,9 +915,29 @@ class WopanClient:
                 file_size=file_size,
                 fid=fid,
             )
-        except httpx.HTTPError:
-            LOGGER.warning("wopan.upload_file.http_error parent_id=%s", parent_id)
-            raise
+        except httpx.HTTPError as exc:
+            LOGGER.warning(
+                "wopan.upload_file.http_error parent_id=%s %s",
+                parent_id,
+                _http_error_detail(exc),
+            )
+            # Resumable uploads: a 5xx on the final part can still mean the
+            # server assembled the file, so check the listing before giving
+            # up — same recovery as the generic handler below. Fresh uploads
+            # (resume is None) never spend an extra request here.
+            if resume is None:
+                raise
+            recovered = self._recover_upload_item_on_error(
+                original_error=exc,
+                parent_id=parent_id,
+                file_name=file_name,
+                file_size=file_size,
+            )
+            if recovered is None:
+                raise
+            if progress_callback is not None:
+                progress_callback(file_size, file_size)
+            return recovered
         except (OSError, ValueError) as exc:
             LOGGER.warning("wopan.upload_file.response_error parent_id=%s", parent_id)
             raise WopanResponseError("upload2C response cannot be decoded") from exc
@@ -890,16 +969,20 @@ class WopanClient:
 
         UAT (2026-09-26): once the server has assembled all parts the file
         exists in the cloud even when the client never captured the fid from
-        the final part response. Only a FILE entry matching both the exact
-        name and the exact size counts, so an older same-name file is never
+        the final part response. Only a FILE entry matching both the name
+        and the exact size counts, so an older same-name file is never
         mistaken for this upload; same-name conflicts are already rejected by
         the service layer's pre-upload check, so the first hit is taken.
-        Entries without a fid cannot yield a usable item and are ignored.
+        The name is matched in its server-stored form too, because names
+        longer than the server limit are truncated when stored (UAT
+        2026-10-06). Entries without a fid cannot yield a usable item and
+        are ignored.
         """
+        stored_name = server_file_name(file_name)
         for item in self.list_files(parent_id):
             if (
                 item.kind is WopanItemKind.FILE
-                and item.name == file_name
+                and item.name in (file_name, stored_name)
                 and item.size == file_size
                 and item.download_id
             ):
@@ -909,6 +992,135 @@ class WopanClient:
                     file_size=file_size,
                     fid=item.download_id,
                 )
+        return None
+
+    def _try_quick_transfer(
+        self,
+        *,
+        parent_id: str,
+        file_name: str,
+        file_size: int,
+        file_type: str,
+        batch_no: str,
+        local_path: Path,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> WopanItem | None:
+        """Probe the instant-transfer API; return the completed item or None.
+
+        Mirrors the official client: hash the whole file with SHA-256, then
+        POST it with name/size/directory/mtime to ``QUICK_TRANSFER_API``.
+        ``meta.code == "0000"`` with ``result.hasFile == 1`` means the
+        server created the target entry from existing content instantly.
+        A miss, a non-success code, or any probe failure returns None so
+        the caller falls back to the chunked upload — the probe must never
+        block an upload. The one exception: a hit whose fid cannot be
+        confirmed (missing from the response and from the directory
+        listing) raises instead, because re-uploading would duplicate the
+        entry the server just created.
+        """
+        _check_upload_cancelled(cancel_requested)
+        LOGGER.info(
+            "wopan.quick_transfer.start parent_id=%s file_name_length=%s file_size=%s",
+            parent_id,
+            len(file_name),
+            file_size,
+        )
+        try:
+            sha256 = _sha256_file(local_path, cancel_requested=cancel_requested)
+            payload = {
+                "sha256": sha256,
+                "fileSize": file_size,
+                "fileName": file_name,
+                "fileType": file_type,
+                "batchNo": batch_no,
+                "spaceType": PERSONAL_SPACE_TYPE,
+                "directoryId": parent_id,
+                "fileModificationTime": int(local_path.stat().st_mtime * 1000),
+            }
+        except WopanUploadCancelledError:
+            raise
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("wopan.quick_transfer.probe_failed error_type=%s", type(exc).__name__)
+            return None
+        raw = self._post_quick_transfer_payload(payload)
+        if raw is None:
+            return None
+        meta = raw.get("meta")
+        result = raw.get("result")
+        meta_info = meta if isinstance(meta, dict) else {}
+        result_info = result if isinstance(result, dict) else {}
+        code = str(meta_info.get("code") or "")
+        if code != "0000" or str(result_info.get("hasFile")) != "1":
+            # 2001（容量不足）等非成功码按未命中回落，配额错误交给分片
+            # 上传的既有通路统一上报——官方在探测阶段即时报错，属有意分歧。
+            LOGGER.info("wopan.quick_transfer.miss code=%s", code)
+            return None
+        fid = str(result_info.get("fid") or result_info.get("fileId") or "")
+        if fid:
+            LOGGER.info("wopan.quick_transfer.hit parent_id=%s fid_from=1", parent_id)
+            return build_uploaded_file_item(
+                file_name=file_name,
+                parent_id=parent_id,
+                file_size=file_size,
+                fid=fid,
+            )
+        try:
+            recovered = self._recover_upload_item_from_listing(
+                parent_id=parent_id, file_name=file_name, file_size=file_size
+            )
+        except Exception as recovery_error:
+            # 服务端已确认转存：任何恢复失败都必须报「未找到」并停止，
+            # 绝不能带着 5xx 原始异常冒泡——那会让服务层的会话重启守卫
+            # 误判并整文件重传，产生改名副本。
+            LOGGER.warning(
+                "wopan.quick_transfer.recovery_failed error_type=%s",
+                type(recovery_error).__name__,
+            )
+            raise WopanResponseError(
+                "秒传已完成但目标目录未找到对应文件，请刷新后重试"
+            ) from recovery_error
+        if recovered is None:
+            raise WopanResponseError("秒传已完成但目标目录未找到对应文件，请刷新后重试")
+        LOGGER.info("wopan.quick_transfer.hit parent_id=%s fid_from=2", parent_id)
+        return recovered
+
+    def _post_quick_transfer_payload(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """POST the quick transfer probe, retrying transient failures.
+
+        Official client parity: timeout 30s, two retries (three attempts).
+        Only transient failures (transport errors, 5xx) are retried; a 4xx
+        or a malformed body gives up immediately. Returns the decoded
+        response object, or None when the probe could not complete so the
+        caller falls back to the chunked upload.
+        """
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._http_client.post(
+                    QUICK_TRANSFER_API,
+                    json=payload,
+                    headers={"access-token": self._access_token},
+                    timeout=QUICK_TRANSFER_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                raw = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                transient = not (
+                    isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500
+                )
+                LOGGER.warning(
+                    "wopan.quick_transfer.probe_error attempt=%s transient=%s %s",
+                    attempt,
+                    transient,
+                    _http_error_detail(exc),
+                )
+                if not transient or attempt == attempts:
+                    return None
+                continue
+            if not isinstance(raw, dict):
+                LOGGER.info("wopan.quick_transfer.malformed_response")
+                return None
+            return raw
         return None
 
     def _recover_upload_item_on_error(
@@ -1087,6 +1299,15 @@ class WopanClient:
             except (httpx.HTTPError, WopanBusinessError) as exc:
                 _check_upload_cancelled(cancel_requested)
                 last_error = exc
+                LOGGER.warning(
+                    "wopan.upload_part.attempt_failed part_index=%s attempt=%s/%s %s",
+                    part_index,
+                    _attempt + 1,
+                    max_attempts,
+                    _http_error_detail(exc),
+                )
+                if _attempt + 1 < max_attempts:
+                    _sleep_cancelable(UPLOAD_RETRY_DELAY_SECONDS, cancel_requested)
             except ValueError as exc:
                 raise WopanResponseError("upload2C response cannot be decoded") from exc
         if last_error is not None:
@@ -1118,6 +1339,8 @@ class WopanClient:
                     exc.response.status_code,
                     attempt + 1,
                 )
+                if attempt + 1 < attempts:
+                    _sleep_cancelable(UPLOAD_RETRY_DELAY_SECONDS, cancel_requested)
             except httpx.HTTPError:
                 _check_upload_cancelled(cancel_requested)
                 raise
@@ -1219,6 +1442,48 @@ def build_uploaded_file_item(
     )
 
 
+def _sha256_file(
+    path: Path,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+    chunk_size: int = QUICK_TRANSFER_HASH_CHUNK_SIZE,
+) -> str:
+    """Stream one file through SHA-256, checking cancellation per chunk."""
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        while True:
+            _check_upload_cancelled(cancel_requested)
+            chunk = file_obj.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _http_error_detail(exc: Exception) -> str:
+    """Compact diagnostic text for one upload-path HTTP failure.
+
+    HTTP status errors carry the server's response body — often the only
+    textual reason a bare 500 ever gets — so a short snippet is included;
+    everything else degrades to the exception type.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        snippet = exc.response.text[:200].replace("\n", " ").strip()
+        return f"status={exc.response.status_code} body={snippet!r}"
+    return f"type={type(exc).__name__}"
+
+
+def _sleep_cancelable(seconds: float, cancel_requested: Callable[[], bool] | None) -> None:
+    """Sleep in small steps so pause/cancel stays responsive during retry delays."""
+    deadline = time.monotonic() + seconds
+    while True:
+        _check_upload_cancelled(cancel_requested)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
+
+
 def _sign(key: str, res_time: int, req_seq: int, channel: str) -> str:
     return hashlib.md5(f"{key}{res_time}{req_seq}{channel}".encode()).hexdigest()
 
@@ -1240,7 +1505,13 @@ def _read_dispatch_data(raw: dict[str, Any], decrypt_key: str) -> dict[str, Any]
     raise WopanResponseError("WoPan response DATA is not an object")
 
 
-def _read_dispatch_payload(raw: dict[str, Any], decrypt_key: str) -> Any:
+def _read_dispatch_payload(
+    raw: dict[str, Any],
+    decrypt_key: str,
+    accepted_codes: tuple[str, ...] = (),
+) -> Any:
+    """Decode one dispatch envelope; codes besides ``0000`` fail unless
+    whitelisted in ``accepted_codes`` (those return their DATA like success)."""
     if raw.get("STATUS") != "200":
         raise WopanResponseError(str(raw.get("MSG") or "WoPan service call failed"))
     rsp = raw.get("RSP")
@@ -1250,7 +1521,7 @@ def _read_dispatch_payload(raw: dict[str, Any], decrypt_key: str) -> Any:
     desc = str(rsp.get("RSP_DESC") or "")
     if code == "1001":
         raise WopanAuthenticationError(desc or "WoPan login expired")
-    if code != "0000":
+    if code != "0000" and code not in accepted_codes:
         raise WopanBusinessError(code, desc or "WoPan business error")
     data = rsp.get("DATA")
     if isinstance(data, dict | list):

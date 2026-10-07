@@ -7,7 +7,8 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -23,7 +24,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -95,13 +96,17 @@ from openwopan.tasks.scheduler import DownloadTaskEvent
 from openwopan.tasks.transfer_rate import TransferRateEstimator
 from openwopan.tasks.upload import (
     FolderUploadJob,
+    MergeUploadEstimate,
     UploadBatchSummary,
     UploadConflictResolution,
     UploadTaskRecord,
     find_upload_conflicts,
     format_upload_summary,
+    make_upload_task_id,
     resolve_upload_targets,
+    scan_folder_tree,
     scan_upload_inputs,
+    server_file_name,
 )
 from openwopan.ui.formatting import format_bytes as _format_bytes
 from openwopan.ui.formatting import format_items_summary as _format_items_summary
@@ -129,6 +134,18 @@ from openwopan.wopan.models import WopanCloudUsage, WopanItem, WopanItemKind, Wo
 
 MAIN_WINDOW_DEFAULT_SIZE = (900, 600)
 MAIN_WINDOW_MINIMUM_SIZE = (800, 600)
+
+
+def _join_distinct_errors(*errors: str | None) -> str:
+    """Merge error texts from rows describing the same upload (dedup, keep order)."""
+    joined: list[str] = []
+    for error in errors:
+        text = (error or "").strip()
+        if text and text not in joined:
+            joined.append(text)
+    return "；".join(joined)
+
+
 FILE_SPLITTER_STRETCH_FACTORS = (1, 6)
 ROOT_DISPLAY_NAME = "/"
 TRANSFER_TABLE_HEADERS = ("名称", "大小", "进度", "速度", "状态", "操作")
@@ -140,6 +157,22 @@ TRANSFER_COL_STATUS = 4
 TRANSFER_COL_ACTION = 5
 TRANSFER_ACTION_COLUMN_WIDTH = 156
 TRANSFER_ACTION_BUTTON_SIZE = (32, 24)
+# Precomputed once: per-item flag ORs cost ~25% of a full-table render
+# (cProfile on 157-row renders).
+_TRANSFER_RIGHT_COLUMNS = frozenset(
+    {TRANSFER_COL_SIZE, TRANSFER_COL_PROGRESS, TRANSFER_COL_SPEED, TRANSFER_COL_STATUS}
+)
+_TRANSFER_RIGHT_ALIGNMENT = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
+# Action widgets (4 styled ToolButtons each, ~3.8ms/row with QSS rendering)
+# are only installed for rows near the viewport; scrolling re-installs them
+# via the coalesced progress render.
+ACTION_WIDGET_WINDOW_OVERHANG_ROWS = 20
+# A hidden table (background page / offscreen tests) has no viewport, so
+# small row counts keep the old install-everything semantics for direct
+# cellWidget reads; larger hidden tables skip widgets entirely — building
+# 157-500 of them took 0.6-1.9s at startup — and the show/segment hooks
+# install the visible window when the page appears.
+HIDDEN_TABLE_FULL_WIDGET_ROW_LIMIT = 100
 FILE_COL_NAME = 0
 FILE_COL_KIND = 1
 FILE_COL_SIZE = 2
@@ -150,11 +183,13 @@ FILE_TYPE_FILTERS = (FILE_TYPE_FILTER_ALL, FILE_TYPE_FILTER_FOLDERS, FILE_TYPE_F
 THREAD_JOIN_TIMEOUT_MS = 3000
 # B24：已访问目录 LRU 缓存上限（目录数）；写操作成功后整体失效。
 DIRECTORY_CACHE_MAX_ENTRIES = 128
+# 过滤项对齐 qBittorrent 的状态栏设计：只暴露用户心智状态，内部管线
+# 阶段（等待中/上传中/创建目录中/校验中/合并中）聚合为「进行中」，
+# 细粒度状态仍显示在表格状态列。选中值经 itemData 传递——显示文本
+# 带实时计数（"失败 (1)"），不能直接当过滤键比较。
 UPLOAD_STATUS_FILTERS = (
     "全部",
-    "等待中",
-    "上传中",
-    "创建目录中",
+    "进行中",
     "已暂停",
     "已完成",
     "失败",
@@ -162,15 +197,13 @@ UPLOAD_STATUS_FILTERS = (
 )
 DOWNLOAD_STATUS_FILTERS = (
     "全部",
-    "等待中",
-    "校验中",
-    "下载中",
-    "合并中",
+    "进行中",
     "已暂停",
     "已完成",
     "失败",
     "已取消",
 )
+UPLOAD_ACTIVE_FILTER_STATUSES = frozenset({"等待中", "上传中", "创建目录中"})
 TERMINAL_TRANSFER_STATUSES = frozenset({"已完成", "失败", "已取消"})
 ACTIVE_DOWNLOAD_STATUSES = frozenset({"等待中", "校验中", "下载中", "合并中"})
 ACTIVE_UPLOAD_STATUSES = frozenset({"等待中", "上传中"})
@@ -400,9 +433,11 @@ class UploadSummaryDialog(QDialog):
         parent: QWidget,
         *,
         conflicts: tuple[Path, ...] = (),
+        merge_estimate: MergeUploadEstimate | None = None,
     ) -> None:
         super().__init__(parent)
         self._skip_conflicts_button: QRadioButton | None = None
+        self._merge_conflicts_button: QRadioButton | None = None
         self.setWindowTitle("确认上传")
         self.resize(640, 420)
         layout = QVBoxLayout(self)
@@ -425,11 +460,22 @@ class UploadSummaryDialog(QDialog):
             layout.addWidget(BodyLabel(f"发现 {len(conflicts)} 个同名项目", self))
             skip_button = QRadioButton("跳过冲突", self)
             self._skip_conflicts_button = skip_button
+            if merge_estimate is not None:
+                merge_button = QRadioButton(
+                    f"合并（跳过已存在的文件，补传缺失文件）——预计新增 "
+                    f"{merge_estimate.files_to_upload} 个任务",
+                    self,
+                )
+            else:
+                merge_button = QRadioButton("合并（跳过已存在的文件，补传缺失文件）", self)
+            self._merge_conflicts_button = merge_button
             copy_button = QRadioButton("保留副本", self)
             skip_button.setChecked(True)
             layout.addWidget(skip_button)
+            layout.addWidget(merge_button)
             layout.addWidget(copy_button)
             decision_label = BodyLabel("", self)
+            decision_label.setObjectName("uploadDecisionLabel")
             layout.addWidget(decision_label)
 
         buttons = QDialogButtonBox(
@@ -441,15 +487,38 @@ class UploadSummaryDialog(QDialog):
         if conflicts:
             confirm_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
 
-            def update_choice(skip: bool) -> None:
-                count = len(summary.top_paths) - len(conflicts) if skip else len(summary.top_paths)
-                decision_label.setText(f"将添加 {count} 个上传任务")
-                confirm_button.setEnabled(count > 0)
+            def update_choice() -> None:
+                resolution = self.resolution()
+                if resolution == "skip":
+                    count = len(summary.top_paths) - len(conflicts)
+                    # 文件夹批次按文件展开为多个任务，此计数以顶层项目为单位。
+                    decision_label.setText(f"将添加 {count} 个上传项目（同名跳过）")
+                    confirm_button.setEnabled(count > 0)
+                elif resolution == "merge":
+                    if merge_estimate is not None:
+                        detail = f"合并：预计新增 {merge_estimate.files_to_upload} 个上传任务"
+                        if merge_estimate.files_skipped:
+                            detail += f"（跳过 {merge_estimate.files_skipped} 个已存在文件）"
+                        decision_label.setText(detail)
+                    else:
+                        decision_label.setText(
+                            "同名文件夹将合并续传：只补传缺失文件，已存在的同名文件跳过"
+                        )
+                    confirm_button.setEnabled(True)
+                else:
+                    decision_label.setText(
+                        f"将添加 {len(summary.top_paths)} 个上传项目（同名的按副本重命名）"
+                    )
+                    confirm_button.setEnabled(True)
 
-            skip_button.toggled.connect(update_choice)
-            update_choice(True)
+            skip_button.toggled.connect(lambda _checked: update_choice())
+            merge_button.toggled.connect(lambda _checked: update_choice())
+            update_choice()
 
     def resolution(self) -> UploadConflictResolution:
+        merge_button = getattr(self, "_merge_conflicts_button", None)
+        if merge_button is not None and merge_button.isChecked():
+            return "merge"
         if self._skip_conflicts_button is not None and self._skip_conflicts_button.isChecked():
             return "skip"
         return "copy"
@@ -595,7 +664,9 @@ class UploadWorker(QObject):
         self._cancel_requested = threading.Event()
         self._pause_requested = threading.Event()
         self._resume_requested = threading.Event()
+        self._abandon_requested = threading.Event()
         self._resume_requested.set()
+        self._cancel_hook: Callable[[], bool] | None = None
 
     def request_pause(self) -> None:
         """Pause after the current upload request reaches a safe check."""
@@ -611,6 +682,20 @@ class UploadWorker(QObject):
         self._cancel_requested.set()
         self._resume_requested.set()
 
+    def request_abandon(self) -> None:
+        """Stop a paused upload at application close, keeping its session.
+
+        Unlike cancel, the persisted session (completed parts) is preserved
+        and no terminal event is emitted: the row keeps its「已暂停」status
+        so the next start resumes from the stored parts.
+        """
+        self._abandon_requested.set()
+        self._cancel_requested.set()
+        self._resume_requested.set()
+        hook = self._cancel_hook
+        if hook is not None:
+            hook.preserve_session = True  # type: ignore[attr-defined]
+
     def _upload_stop_requested(self) -> bool:
         while self._pause_requested.is_set() and not self._cancel_requested.is_set():
             self._resume_requested.wait()
@@ -620,8 +705,19 @@ class UploadWorker(QObject):
         self._upload_stop_requested()
         self.progress.emit(bytes_done, total_bytes, self._task_id)
 
+    def _make_cancel_hook(self) -> Callable[[], bool]:
+        # 独立函数对象而非绑定方法：request_abandon 通过 preserve_session
+        # 属性告知服务层「关闭退出，保留会话分片」（绑定方法无法挂属性）。
+        def cancel_requested() -> bool:
+            return self._upload_stop_requested()
+
+        cancel_requested.preserve_session = False  # type: ignore[attr-defined]
+        return cancel_requested
+
     def run(self) -> None:
         """Run the blocking upload in a worker thread."""
+        cancel_hook = self._make_cancel_hook()
+        self._cancel_hook = cancel_hook
         try:
             if self._upload_stop_requested():
                 raise FileBrowserUploadCancelledError("上传已取消")
@@ -636,7 +732,7 @@ class UploadWorker(QObject):
                             self._parent_id,
                             self._local_path,
                             progress_callback=progress_callback,
-                            cancel_requested=self._upload_stop_requested,
+                            cancel_requested=cancel_hook,
                         )
                     else:
                         item = self._file_browser.upload_file(
@@ -644,7 +740,7 @@ class UploadWorker(QObject):
                             self._local_path,
                             upload_name=self._upload_name,
                             progress_callback=progress_callback,
-                            cancel_requested=self._upload_stop_requested,
+                            cancel_requested=cancel_hook,
                         )
                 except TypeError as exc:
                     if "unexpected keyword argument 'cancel_requested'" not in str(exc):
@@ -672,16 +768,29 @@ class UploadWorker(QObject):
             if self._upload_stop_requested():
                 raise FileBrowserUploadCancelledError("上传已取消")
         except FileBrowserUploadCancelledError:
+            if self._abandon_requested.is_set():
+                # 关闭退出：保留已暂停状态与持久化会话，不发终态事件。
+                return
             self.cancelled.emit(self._task_id)
         except FileBrowserLoginRequiredError as exc:
+            if self._abandon_requested.is_set():
+                # 关闭退出与登录过期的竞态：行保持原状态（重启后续传时
+                # 服务层会再次报登录过期），不在关闭途中改写状态。
+                return
             self.login_required.emit(str(exc), self._task_id)
         except FileBrowserError as exc:
+            if self._abandon_requested.is_set():
+                # 关闭退出与网络错误的竞态：会话已由服务层按 preserve 语义
+                # 标记（失败时保留分片），行保持原状态，不发终态事件。
+                return
             if self._upload_stop_requested():
                 self.cancelled.emit(self._task_id)
             else:
                 self.failed.emit(str(exc), self._task_id)
         except Exception as exc:
             LOGGER.exception("main_window.upload.unexpected_error")
+            if self._abandon_requested.is_set():
+                return
             self.failed.emit(str(exc), self._task_id)
         else:
             self.succeeded.emit(item, self._task_id)
@@ -792,9 +901,7 @@ class TransferRecordPersistence(Protocol):
     def load_history(self) -> tuple[TransferRecord, ...]:
         """Load all persisted rows ordered by update time ascending."""
 
-    def purge_stale_records(
-        self, max_age_days: int = ...
-    ) -> tuple[tuple[str, str], ...]:
+    def purge_stale_records(self, max_age_days: int = ...) -> tuple[tuple[str, str], ...]:
         """Delete retention-expired terminal rows; return their (direction, task_id) keys."""
 
 
@@ -842,16 +949,6 @@ TRANSFER_TABLE_SORT_KEYS: dict[int, Callable[[TransferRecord], object]] = {
 }
 
 
-@dataclass(slots=True)
-class QueuedUploadFile:
-    """One folder-upload file waiting for the single upload slot."""
-
-    task_id: str
-    local_path: Path
-    target_dir_id: str
-    upload_name: str
-
-
 @dataclass(frozen=True, slots=True)
 class PendingFolderUpload:
     """One folder upload waiting for its preparation slot."""
@@ -860,6 +957,7 @@ class PendingFolderUpload:
     parent_id: str
     root_name: str | None
     record_id: str
+    merge: bool = False
 
 
 class TransferInterface(QWidget):
@@ -883,6 +981,8 @@ class TransferInterface(QWidget):
     pause_downloads_requested = Signal(object)
     resume_downloads_requested = Signal(object)
     retry_upload_requested = Signal(object)
+    # 目录准备/排队批次没有列表行（qB/传统网盘语义），取消入口走这个信号。
+    folder_prepare_cancel_requested = Signal()
 
     def __init__(
         self,
@@ -903,6 +1003,9 @@ class TransferInterface(QWidget):
         self._active_direction = "download"
         self._pending_progress_directions: set[str] = set()
         self._progress_render_scheduled = False
+        # Batch render coalescing: >0 while batch_updates() is active.
+        self._batch_depth = 0
+        self._batch_render_directions: set[str] = set()
         self._speed_estimators: dict[tuple[str, str], TransferRateEstimator] = {}
         # Injectable for tests; must return a fresh TransferRateEstimator.
         self._new_speed_estimator: Callable[[], TransferRateEstimator] = TransferRateEstimator
@@ -936,7 +1039,7 @@ class TransferInterface(QWidget):
             self._save_record(record)
         if render:
             self.flush_progress_render()
-            self._render_upload_table()
+            self._render_direction("upload")
 
     def add_download_record(
         self, record: TransferRecord, *, render: bool = True, persist: bool = True
@@ -948,7 +1051,7 @@ class TransferInterface(QWidget):
             self._save_record(record)
         if render:
             self.flush_progress_render()
-            self._render_download_table()
+            self._render_direction("download")
 
     def _on_record_added(self, direction: str, record: TransferRecord) -> None:
         """Reset speed state for a (re-)added record; recovered tasks re-baseline."""
@@ -975,12 +1078,14 @@ class TransferInterface(QWidget):
             return
         previous_status = record.status
         now = time.monotonic()
+        # Progress-class fields (bytes/total/connections) display in the
+        # progress and speed columns only; classifying them as structural
+        # made every per-part progress callback render the whole table and
+        # commit sqlite synchronously (py-spy: GUI thread pegged in
+        # _render_table from _on_upload_progress; 4.24ms/signal vs 0.004ms
+        # coalesced). Status/error/resume/max-connections still render now.
         progress_only = (
-            status is None
-            and total_bytes is None
-            and max_connections is None
-            and can_resume is None
-            and error is None
+            status is None and max_connections is None and can_resume is None and error is None
         )
         if status is not None:
             record.status = status
@@ -1092,10 +1197,37 @@ class TransferInterface(QWidget):
         QTimer.singleShot(self.PROGRESS_RENDER_INTERVAL_MS, self.flush_progress_render)
 
     def _render_direction(self, direction: str) -> None:
+        # Defers while batch_updates() is active: record adds/removals/status
+        # changes each rebuild the whole table (and every row's action
+        # widgets), and a tight loop of N mutations inside one slot would
+        # create N table-loads of widgets whose deferred deletes can only run
+        # after the slot returns (the folder-upload batch freeze).
+        if self._batch_depth:
+            self._batch_render_directions.add(direction)
+            return
         if direction == "upload":
             self._render_upload_table()
         else:
             self._render_download_table()
+
+    @contextmanager
+    def batch_updates(self) -> Iterator[None]:
+        """Coalesce table renders across a batch of record mutations.
+
+        On exit each direction touched inside the batch renders exactly once,
+        so a batch of N mutations costs one render instead of N; nested
+        batches coalesce into the outermost one.
+        """
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._batch_render_directions:
+                directions = tuple(self._batch_render_directions)
+                self._batch_render_directions.clear()
+                for direction in directions:
+                    self._render_direction(direction)
 
     def _ensure_speed_sampler(self) -> None:
         """Start the 1-second speed tick; runs only while active tasks exist."""
@@ -1146,18 +1278,27 @@ class TransferInterface(QWidget):
 
     def remove_records(self, direction: str, task_ids: set[str]) -> None:
         """Remove task rows by id."""
+        if task_ids:
+            # 审计日志：历史上传输列表曾出现整表行无端消失且无法溯源，
+            # 所有删除入口现在都留痕（方向/数量/样本 id）。
+            LOGGER.info(
+                "transfer.records.remove direction=%s count=%s ids_sample=%s",
+                direction,
+                len(task_ids),
+                sorted(task_ids)[:5],
+            )
         if direction == "upload":
             self.upload_records = [
                 record for record in self.upload_records if record.task_id not in task_ids
             ]
             self.flush_progress_render()
-            self._render_upload_table()
+            self._render_direction("upload")
         else:
             self.download_records = [
                 record for record in self.download_records if record.task_id not in task_ids
             ]
             self.flush_progress_render()
-            self._render_download_table()
+            self._render_direction("download")
         for task_id in task_ids:
             self._speed_estimators.pop((direction, task_id), None)
             self._persist_dirty.discard((direction, task_id))
@@ -1193,19 +1334,27 @@ class TransferInterface(QWidget):
         self.upload_filter_label = BodyLabel("状态", top_bar)
         self.upload_filter_combo = ComboBox(top_bar)
         self.upload_filter_combo.addItems(list(UPLOAD_STATUS_FILTERS))
-        self.upload_filter_combo.setCurrentText(self.upload_status_filter)
-        self.upload_filter_combo.setMinimumWidth(120)
+        for index, name in enumerate(UPLOAD_STATUS_FILTERS):
+            self.upload_filter_combo.setItemData(index, name)
+        self.upload_filter_combo.setMinimumWidth(140)
 
         self.download_filter_label = BodyLabel("状态", top_bar)
         self.download_filter_combo = ComboBox(top_bar)
         self.download_filter_combo.addItems(list(DOWNLOAD_STATUS_FILTERS))
-        self.download_filter_combo.setCurrentText(self.download_status_filter)
-        self.download_filter_combo.setMinimumWidth(120)
+        for index, name in enumerate(DOWNLOAD_STATUS_FILTERS):
+            self.download_filter_combo.setItemData(index, name)
+        self.download_filter_combo.setMinimumWidth(140)
         self.open_download_folder_button = PushButton(
             FIF.FOLDER.icon(),
             "打开下载文件夹",
             top_bar,
         )
+        self.cancel_folder_prepare_button = PushButton(
+            FIF.CANCEL.icon(),
+            "取消目录创建",
+            top_bar,
+        )
+        self.cancel_folder_prepare_button.hide()
 
         top_layout.addWidget(self.title_label)
         top_layout.addWidget(self.segmented_widget)
@@ -1214,6 +1363,7 @@ class TransferInterface(QWidget):
         top_layout.addWidget(self.upload_filter_combo)
         top_layout.addWidget(self.download_filter_label)
         top_layout.addWidget(self.download_filter_combo)
+        top_layout.addWidget(self.cancel_folder_prepare_button)
         top_layout.addWidget(self.open_download_folder_button)
         self._main_layout.addWidget(top_bar)
 
@@ -1261,6 +1411,12 @@ class TransferInterface(QWidget):
             # sentinel; clear it to -1 so "no sort" is always observable.
             sync_sort_indicator(header, TableSortState())
             header.sectionClicked.connect(partial(self._on_table_header_clicked, direction))
+        # Rows scrolled into view need their texts diffed and their action
+        # widgets installed (widgets are viewport-windowed); the coalesced
+        # 150ms progress render does both without a per-scroll storm.
+        table.verticalScrollBar().valueChanged.connect(
+            lambda _value, direction=direction: self._schedule_progress_render(direction)
+        )
 
         layout.addWidget(batch_bar)
         layout.addWidget(table)
@@ -1315,9 +1471,10 @@ class TransferInterface(QWidget):
 
     def _connect_signals(self) -> None:
         self.segmented_widget.currentItemChanged.connect(self._on_segment_changed)
-        self.upload_filter_combo.currentTextChanged.connect(self._on_upload_filter_changed)
-        self.download_filter_combo.currentTextChanged.connect(self._on_download_filter_changed)
+        self.upload_filter_combo.currentIndexChanged.connect(self._on_upload_filter_changed)
+        self.download_filter_combo.currentIndexChanged.connect(self._on_download_filter_changed)
         self.open_download_folder_button.clicked.connect(self._request_open_download_folder)
+        self.cancel_folder_prepare_button.clicked.connect(self.folder_prepare_cancel_requested.emit)
         self.upload_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("upload"))
         self.download_table.itemSelectionChanged.connect(lambda: self._update_batch_bar("download"))
         self.upload_batch_buttons["select_all"].clicked.connect(
@@ -1369,18 +1526,43 @@ class TransferInterface(QWidget):
         self.download_filter_label.setVisible(not is_upload)
         self.download_filter_combo.setVisible(not is_upload)
         self.open_download_folder_button.setVisible(not is_upload)
+        # The freshly shown table may have skipped widgets while hidden
+        # (large-row windowing); install the visible window soon. Skip when
+        # this page is not visible (e.g. the __init__-time segment setup) so
+        # no stale render request waits around.
+        if self.isVisible():
+            self._schedule_progress_render(route_key)
 
-    def _on_upload_filter_changed(self, status: str) -> None:
-        self.upload_status_filter = status
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        # Same reason as the segment hook: rows changed while this page was
+        # hidden, so the visible window's widgets need one render.
+        self._schedule_progress_render(self._active_direction)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        # 名称列的省略点是"绘制时"按列宽算的：窗口变宽后已绘制行若未被
+        # 重绘，省略号会停在旧位置、右侧留大片空白（真机 2026-10-07）。
+        # 强制两个表视口重绘一次，绘制期会用当前列宽重新省略；Qt 会对
+        # resize 事件做合并，成本是每次几何变化最多两次全视口重绘。
+        self.upload_table.viewport().update()
+        self.download_table.viewport().update()
+
+    def _on_upload_filter_changed(self, index: int) -> None:
+        data = self.upload_filter_combo.itemData(index)
+        # 文本带计数后缀（"已完成 (5)"），过滤键必须是 itemData 里的规范名。
+        self.upload_status_filter = data if isinstance(data, str) else "全部"
         self.flush_progress_render()
         self._render_upload_table()
 
-    def _on_download_filter_changed(self, status: str) -> None:
-        self.download_status_filter = status
+    def _on_download_filter_changed(self, index: int) -> None:
+        data = self.download_filter_combo.itemData(index)
+        self.download_status_filter = data if isinstance(data, str) else "全部"
         self.flush_progress_render()
         self._render_download_table()
 
     def _render_upload_table(self) -> None:
+        self._refresh_upload_filter_counts()
         self._render_table(
             self.upload_table,
             self._filtered_upload_records(),
@@ -1389,6 +1571,7 @@ class TransferInterface(QWidget):
         self._update_batch_bar("upload")
 
     def _render_download_table(self) -> None:
+        self._refresh_download_filter_counts()
         self._render_table(
             self.download_table,
             self._filtered_download_records(),
@@ -1413,11 +1596,18 @@ class TransferInterface(QWidget):
         for row in range(table.rowCount()):
             item = table.item(row, 0)
             rendered_ids.append(item.data(Qt.ItemDataRole.UserRole) if item is not None else None)
-        if rendered_ids != [record.task_id for record in records]:
-            table.clearSelection()
-        if table.rowCount() != len(records):
-            self._clear_action_widgets(table)
-        table.setRowCount(len(records))
+        expected_ids = [record.task_id for record in records]
+        structural = rendered_ids != expected_ids or table.rowCount() != len(records)
+        if structural:
+            if rendered_ids != expected_ids:
+                table.clearSelection()
+            if table.rowCount() != len(records):
+                self._clear_action_widgets(table)
+            table.setRowCount(len(records))
+        # Fast path: an unchanged id sequence only diffs cell texts in place
+        # (no 5N QTableWidgetItem reallocation, no selection touch); a full
+        # rebuild also diffs because the items above were recreated.
+        first_window_row, last_window_row = self._action_widget_window(table, len(records))
         for row, record in enumerate(records):
             values = (
                 record.name,
@@ -1426,32 +1616,85 @@ class TransferInterface(QWidget):
                 _format_speed(record.speed_bps),
                 record.status,
             )
+            in_window = first_window_row <= row <= last_window_row
             for column, value in enumerate(values):
-                table_item = QTableWidgetItem(value)
-                table_item.setData(Qt.ItemDataRole.UserRole, record.task_id)
-                if column in (
-                    TRANSFER_COL_SIZE,
-                    TRANSFER_COL_PROGRESS,
-                    TRANSFER_COL_SPEED,
-                    TRANSFER_COL_STATUS,
-                ):
-                    table_item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
-                    )
-                table.setItem(row, column, table_item)
-            action_key = (record.task_id, record.status, record.can_resume, record.upload_retryable)
-            widget = table.cellWidget(row, TRANSFER_COL_ACTION)
-            if widget is not None and widget.property("action_key") == action_key:
-                continue
+                table_item = table.item(row, column)
+                if structural or table_item is None:
+                    # Structural rebuilds must recreate items: after a
+                    # reorder the item at this row belongs to another task,
+                    # so its UserRole id would poison the sequence compare.
+                    table_item = QTableWidgetItem(value)
+                    table_item.setData(Qt.ItemDataRole.UserRole, record.task_id)
+                    if column == TRANSFER_COL_NAME:
+                        # 无论省略位置如何，悬停始终能看到完整名称。
+                        table_item.setToolTip(record.name)
+                    if column in _TRANSFER_RIGHT_COLUMNS:
+                        table_item.setTextAlignment(_TRANSFER_RIGHT_ALIGNMENT)
+                    table.setItem(row, column, table_item)
+                    continue
+                if table_item.text() != value:
+                    table_item.setText(value)
+            self._ensure_row_action_widget(table, row, record, direction, in_window)
+        self._update_total_speed(direction)
+
+    def _action_widget_window(self, table: TableWidget, row_count: int) -> tuple[int, int]:
+        """Return the inclusive row range that keeps live action widgets.
+
+        A shown table materializes widgets only for the viewport plus an
+        overhang, because each row's 4 styled buttons cost ~3.8ms to build
+        and reinstall (measured: 68% of a 1.9s / 500-row history restore was
+        setCellWidget alone). Hidden tables follow
+        HIDDEN_TABLE_FULL_WIDGET_ROW_LIMIT.
+        """
+        if row_count <= 0:
+            return (0, -1)
+        if not table.isVisible():
+            if row_count <= HIDDEN_TABLE_FULL_WIDGET_ROW_LIMIT:
+                return (0, row_count - 1)
+            return (0, -1)
+        viewport = table.viewport()
+        first_row = table.indexAt(QPoint(0, 1)).row()
+        last_row = table.indexAt(QPoint(0, max(1, viewport.height() - 1))).row()
+        if first_row < 0:
+            first_row = 0
+        if last_row < 0:
+            last_row = row_count - 1
+        return (
+            max(0, first_row - ACTION_WIDGET_WINDOW_OVERHANG_ROWS),
+            min(row_count - 1, last_row + ACTION_WIDGET_WINDOW_OVERHANG_ROWS),
+        )
+
+    def _ensure_row_action_widget(
+        self,
+        table: TableWidget,
+        row: int,
+        record: TransferRecord,
+        direction: str,
+        in_window: bool,
+    ) -> None:
+        action_key = (record.task_id, record.status, record.can_resume, record.upload_retryable)
+        widget = table.cellWidget(row, TRANSFER_COL_ACTION)
+        if not in_window:
+            # Strict window: rows outside the viewport+overhang hold no
+            # action widgets — bounded memory, and scroll re-installs via the
+            # coalesced render. A kept widget would also survive row reorders
+            # pointing at another task's handlers.
             if widget is not None:
                 widget.hide()
                 table.removeCellWidget(row, TRANSFER_COL_ACTION)
                 widget.setParent(None)
                 widget.deleteLater()
-            widget = self._build_row_action_widget(record, direction, table)
-            widget.setProperty("action_key", action_key)
-            table.setCellWidget(row, TRANSFER_COL_ACTION, widget)
-        self._update_total_speed(direction)
+            return
+        if widget is not None and widget.property("action_key") == action_key:
+            return
+        if widget is not None:
+            widget.hide()
+            table.removeCellWidget(row, TRANSFER_COL_ACTION)
+            widget.setParent(None)
+            widget.deleteLater()
+        widget = self._build_row_action_widget(record, direction, table)
+        widget.setProperty("action_key", action_key)
+        table.setCellWidget(row, TRANSFER_COL_ACTION, widget)
 
     def _build_row_action_widget(
         self,
@@ -1568,6 +1811,12 @@ class TransferInterface(QWidget):
         """Upload render sequence: status filter, then the active column sort."""
         if self.upload_status_filter == "全部":
             visible = list(self.upload_records)
+        elif self.upload_status_filter == "进行中":
+            visible = [
+                record
+                for record in self.upload_records
+                if record.status in UPLOAD_ACTIVE_FILTER_STATUSES
+            ]
         else:
             visible = [
                 record
@@ -1580,6 +1829,12 @@ class TransferInterface(QWidget):
         """Download render sequence: status filter, then the active column sort."""
         if self.download_status_filter == "全部":
             visible = list(self.download_records)
+        elif self.download_status_filter == "进行中":
+            visible = [
+                record
+                for record in self.download_records
+                if record.status in ACTIVE_DOWNLOAD_STATUSES
+            ]
         else:
             visible = [
                 record
@@ -1587,6 +1842,48 @@ class TransferInterface(QWidget):
                 if record.status == self.download_status_filter
             ]
         return sorted_view(visible, self._download_sort_state, TRANSFER_TABLE_SORT_KEYS)
+
+    def _filter_count_key_upload(self, status: str) -> str | None:
+        if status in UPLOAD_ACTIVE_FILTER_STATUSES:
+            return "进行中"
+        if status in ("已暂停", "已完成", "失败", "已取消"):
+            return status
+        return None
+
+    def _filter_count_key_download(self, status: str) -> str | None:
+        if status in ACTIVE_DOWNLOAD_STATUSES:
+            return "进行中"
+        if status in ("已暂停", "已完成", "失败", "已取消"):
+            return status
+        return None
+
+    def _refresh_upload_filter_counts(self) -> None:
+        """qB 风格计数：下拉项显示「失败 (2)」，每次表格渲染时同步。
+
+        setItemText 只改显示文本不动索引，不会触发选择变化。
+        """
+        counts = {"全部": len(self.upload_records)}
+        for record in self.upload_records:
+            key = self._filter_count_key_upload(record.status)
+            if key is not None:
+                counts[key] = counts.get(key, 0) + 1
+        combo = self.upload_filter_combo
+        for index in range(combo.count()):
+            name = combo.itemData(index)
+            if isinstance(name, str):
+                combo.setItemText(index, f"{name} ({counts.get(name, 0)})")
+
+    def _refresh_download_filter_counts(self) -> None:
+        counts = {"全部": len(self.download_records)}
+        for record in self.download_records:
+            key = self._filter_count_key_download(record.status)
+            if key is not None:
+                counts[key] = counts.get(key, 0) + 1
+        combo = self.download_filter_combo
+        for index in range(combo.count()):
+            name = combo.itemData(index)
+            if isinstance(name, str):
+                combo.setItemText(index, f"{name} ({counts.get(name, 0)})")
 
     def _on_table_header_clicked(self, direction: str, column: int) -> None:
         """Cycle one table's sort state; progress/speed/action never react."""
@@ -1625,6 +1922,24 @@ class TransferInterface(QWidget):
                 or visible[row].status == "已暂停"
             )
         }
+        if not task_ids and rows:
+            # 选中了不可删除的行（下载方向仅终态/已暂停可删）：明确提示，
+            # 不做无声吞掉操作的静默返回。
+            InfoBar.warning(
+                title="删除下载任务",
+                content="没有可删除的任务：仅已暂停/已完成/失败/已取消的下载可删除",
+                parent=self,
+            )
+            return
+        if len(task_ids) > 5:
+            # 批量删除确认：一次误操作不应静默清空整个传输列表。
+            confirm = MessageBox(
+                "确认删除",
+                f"将删除 {len(task_ids)} 条传输记录，删除后无法恢复。确定继续吗？",
+                self,
+            )
+            if not confirm.exec():
+                return
         self._request_delete_ids(direction, task_ids)
 
     def _request_delete_ids(self, direction: str, task_ids: set[str]) -> None:
@@ -1786,6 +2101,17 @@ class TransferInterface(QWidget):
                 0 <= row < len(visible)
                 and visible[row].can_resume
                 and visible[row].status in {"已暂停", "失败"}
+                for row in rows
+            )
+        )
+        # 与单行删除按钮同款门控：下载方向仅终态/已暂停可删。
+        buttons["delete"].setEnabled(
+            any(
+                0 <= row < len(visible)
+                and (
+                    visible[row].status in TERMINAL_TRANSFER_STATUSES
+                    or visible[row].status == "已暂停"
+                )
                 for row in rows
             )
         )
@@ -2714,8 +3040,11 @@ class MainWindow(_MainWindowBase):
         self._download_submit_paths: dict[QThread, set[Path]] = {}
         self._download_reserved_targets: set[Path] = set()
         self._download_recovery_thread: QThread | None = None
+        self._download_recovery_done = False
+        self._download_recovery_failed = False
         self._upload_recovery_thread: QThread | None = None
         self._upload_recovery_worker: BrowserOperationWorker | None = None
+        self._upload_recovery_done = False
         self._download_recovery_worker: BrowserOperationWorker | None = None
         self._download_close_thread: QThread | None = None
         self._download_close_worker: BrowserOperationWorker | None = None
@@ -2736,9 +3065,11 @@ class MainWindow(_MainWindowBase):
         self._folder_prepare_worker: BrowserOperationWorker | None = None
         self._folder_prepare_cancel: threading.Event | None = None
         self._folder_upload_record_id: str | None = None
-        self._folder_upload_queue: list[QueuedUploadFile] = []
-        self._folder_upload_active: QueuedUploadFile | None = None
+        # 文件夹批次与单文件共用 _upload_pending FIFO；批次只保留聚合记账。
         self._folder_upload_child_ids: set[str] = set()
+        # 子任务是否已随 prepare 成功登记（空文件夹也会登记空集）：
+        # 区分「prepare 进行中」与「批次可判定完成」。
+        self._folder_children_registered = False
         self._folder_upload_failed_ids: set[str] = set()
         self._folder_upload_success_count = 0
         self._folder_upload_failure_count = 0
@@ -2770,6 +3101,9 @@ class MainWindow(_MainWindowBase):
         self.setWindowTitle("OpenWoPan")
         self.resize(*MAIN_WINDOW_DEFAULT_SIZE)
         self.setMinimumSize(*MAIN_WINDOW_MINIMUM_SIZE)
+        # 构造期设置而非在 show() 处切换：首次显示即最大化，之后 hide/show
+        # （如登录流程）沿用用户手动还原的窗口状态。
+        self.setWindowState(Qt.WindowState.WindowMaximized)
 
         self.file_interface = FileInterface(self)
         if transfer_record_store is not None:
@@ -2801,6 +3135,9 @@ class MainWindow(_MainWindowBase):
         self.transfer_interface.pause_downloads_requested.connect(self._pause_selected_downloads)
         self.transfer_interface.resume_downloads_requested.connect(self._resume_selected_downloads)
         self.transfer_interface.retry_upload_requested.connect(self._retry_selected_uploads)
+        self.transfer_interface.folder_prepare_cancel_requested.connect(
+            self._request_cancel_folder_prepare
+        )
         self.recycle_interface = RecycleInterface(self)
         self.recycle_interface.refresh_requested.connect(self.refresh_recycle_items)
         self.recycle_interface.restore_requested.connect(self._restore_recycle_items)
@@ -2843,24 +3180,15 @@ class MainWindow(_MainWindowBase):
         self._download_reserved_targets.clear()
         self._upload_conflict_pending.clear()
         self._upload_scan_pending.clear()
-        for folder_pending in self._folder_prepare_pending:
-            self.transfer_interface.update_record(
-                "upload", folder_pending.record_id, status="已取消"
-            )
-        for paused_task_id in self._paused_uploads:
-            self.transfer_interface.update_record("upload", paused_task_id, status="已取消")
-        self._paused_uploads.clear()
-        self._folder_prepare_pending.clear()
-        for queued in self._folder_upload_queue:
-            self.transfer_interface.update_record("upload", queued.task_id, status="已取消")
-        self._folder_upload_queue.clear()
-        if self._folder_upload_record_id is not None:
-            self.transfer_interface.update_record(
-                "upload", self._folder_upload_record_id, status="已取消"
-            )
-        for pending in self._upload_pending:
-            self.transfer_interface.update_record("upload", pending.task_id, status="已取消")
-        self._upload_pending.clear()
+        # 收尾逐条状态更新合并为一次渲染：表格即将销毁，逐条全渲染全部浪费。
+        with self.transfer_interface.batch_updates():
+            # 文件夹批次无列表行（目录创建属准备阶段）：排队批次直接作废，
+            # 其子文件行与独立任务的「已暂停/等待中」保持原状态落盘——
+            # 重启后由历史加载归一为「已暂停」并可手动继续，服务层按持久
+            # 会话断点续传。关闭不应把用户暂停/排队的任务变成已取消。
+            self._folder_prepare_pending.clear()
+            self._paused_uploads.clear()
+            self._upload_pending.clear()
         thread_entries: list[tuple[QThread | None, str, str | None]] = [
             (self._directory_thread, "directory", None),
             (self._create_thread, "create", None),
@@ -2909,7 +3237,10 @@ class MainWindow(_MainWindowBase):
                 task_id = upload_task_id
                 worker = self._upload_workers.get(task_id) if task_id is not None else None
                 if worker is not None:
-                    worker.request_cancel()
+                    # 关闭 ≠ 取消：存活的上传 worker 一律 abandon 退出——
+                    # 会话标记「已暂停（中断）」保留分片，行保持原状态，
+                    # 下次启动手动继续断点续传（与下载侧关闭即暂停对齐）。
+                    worker.request_abandon()
             else:
                 task_id = None
             thread.quit()
@@ -3067,6 +3398,22 @@ class MainWindow(_MainWindowBase):
 
     def set_file_browser(self, file_browser: FileBrowserBackend) -> None:
         """Attach a UI-safe file browser backend and load the root directory."""
+        if self._file_browser is not None and self._file_browser is not file_browser:
+            # 重新登录会带着新 backend 再次进入：旧 backend 的下载调度器
+            # 若继续运行，会与新调度器并发写同一批分片文件和 sqlite 行
+            # （两者共享磁盘下载存储）。协作暂停并关闭旧调度器，未完成
+            # 任务由新 backend 的恢复流程按持久化状态重新入队。
+            close_downloads = getattr(self._file_browser, "close_downloads", None)
+            if callable(close_downloads):
+                try:
+                    close_downloads(wait=False)
+                except Exception:  # pragma: no cover - docs/testing-exemptions.md
+                    LOGGER.exception("main_window.set_file_browser.close_old_failed")
+            # 下载恢复是按 backend 一次性守卫的：新调度器不认识旧持久化
+            # 任务，不重跑恢复会让暂停/继续/取消全部 KeyError，直到重启。
+            # （上传恢复仍一次性：行未离开表格，重跑只会重复建行。）
+            self._download_recovery_done = False
+            self._download_recovery_failed = False
         self._file_browser = file_browser
         set_callback = getattr(file_browser, "set_download_event_callback", None)
         if callable(set_callback):
@@ -3131,8 +3478,65 @@ class MainWindow(_MainWindowBase):
                 continue
             self._raise_transfer_sequence(record.direction, record.task_id)
             if record.direction == "upload":
+                merged = self._find_upload_row_by_target(
+                    record.target_path, record.upload_parent_id, record.upload_name
+                )
+                if merged is not None:
+                    # 会话恢复先到（worker 完成顺序不定）：该历史行是同一
+                    # 文件的僵尸残影，删除避免双行。
+                    if self._transfer_history is not None:
+                        self._transfer_history.delete_records("upload", [record.task_id])
+                    LOGGER.info(
+                        "main_window.transfer_history.ghost_dropped task_id=%s",
+                        record.task_id,
+                    )
+                    continue
+                if record.status == "失败":
+                    failed_row = self._find_failed_upload_row_by_target(
+                        record.target_path, record.upload_parent_id, record.upload_name
+                    )
+                    if failed_row is not None:
+                        # 失败会话行先到时 _find_upload_row_by_target 匹配不上
+                        # （只查非终态）：同一文件的失败历史行折叠其错误信息
+                        # 进会话行后删除，避免同一文件出现两行失败——与
+                        # _add_persisted_upload_record 的失败折叠互为镜像。
+                        self.transfer_interface.update_record(
+                            "upload",
+                            failed_row.task_id,
+                            error=_join_distinct_errors(failed_row.error, record.error),
+                        )
+                        if self._transfer_history is not None:
+                            self._transfer_history.delete_records("upload", [record.task_id])
+                        LOGGER.info(
+                            "main_window.transfer_history.failed_ghost_folded task_id=%s into=%s",
+                            record.task_id,
+                            failed_row.task_id,
+                        )
+                        continue
+                if record.status not in TERMINAL_TRANSFER_STATUSES:
+                    # 上传侧没有调度器认领恢复行：非终态历史行重启后没有
+                    # 任何执行体，原样恢复会显示成僵尸「上传中/等待中」。
+                    # 统一归一为「已暂停」——有会话的行随后被上传恢复合并
+                    # 修正为断点续传，文件行可单个/批量继续重传；文件夹
+                    # 汇总行保持不可续传（本身没有可上传的内容）。
+                    record.status = "已暂停"
+                    if record.target_path is not None and record.target_path.is_file():
+                        record.upload_retryable = True
+                        record.can_resume = True
+                    self.transfer_interface._save_record(record)
                 uploads.append(record)
             else:
+                if (
+                    self._download_recovery_failed
+                    and record.status not in TERMINAL_TRANSFER_STATUSES
+                ):
+                    # 下载恢复已失败（如离线启动）而后到达的历史行：调度器
+                    # 不会认领它们，与 _on_download_recovery_failed 同法归一
+                    # 为可恢复的暂停态，避免僵尸「下载中」。
+                    record.status = "已暂停"
+                    record.can_resume = True
+                    record.error = "恢复下载任务失败：调度器不可用"
+                    self.transfer_interface._save_record(record)
                 downloads.append(record)
         for record in uploads:
             self.transfer_interface.add_upload_record(record, render=False, persist=False)
@@ -3182,9 +3586,7 @@ class MainWindow(_MainWindowBase):
 
         def purge() -> tuple[tuple[str, str], ...]:
             purged = history.purge_stale_records()
-            upload_ids = sorted(
-                {task_id for direction, task_id in purged if direction == "upload"}
-            )
+            upload_ids = sorted({task_id for direction, task_id in purged if direction == "upload"})
             if upload_ids:
                 discard_sessions = getattr(browser, "discard_upload_sessions", None)
                 if callable(discard_sessions):
@@ -3422,9 +3824,7 @@ class MainWindow(_MainWindowBase):
         """Drop every cached listing (after a server-side mutation)."""
         if not self._directory_cache:
             return
-        LOGGER.debug(
-            "main_window.directory_cache.invalidated size=%s", len(self._directory_cache)
-        )
+        LOGGER.debug("main_window.directory_cache.invalidated size=%s", len(self._directory_cache))
         self._directory_cache.clear()
 
     def _consume_after_refresh(self) -> None:
@@ -4269,20 +4669,21 @@ class MainWindow(_MainWindowBase):
         submit = getattr(self._file_browser, "submit_download", None)
         if not callable(submit):
             # Keep test doubles and older backends on the original worker boundary.
-            for item, path in valid:
-                task_id = self._create_download_record(item, path)
-                if run_in_background:
-                    self._start_download_task(item, path, task_id)
-                else:
-                    try:
-                        self._download_with_callbacks(item, path, task_id)
-                    except FileBrowserLoginRequiredError as exc:
-                        self._mark_transfer_failed("download", task_id, str(exc))
-                        self._show_login_required_error(str(exc))
-                    except FileBrowserError as exc:
-                        self._on_download_failed(str(exc), task_id=task_id)
+            with self.transfer_interface.batch_updates():
+                for item, path in valid:
+                    task_id = self._create_download_record(item, path)
+                    if run_in_background:
+                        self._start_download_task(item, path, task_id)
                     else:
-                        self._on_download_succeeded(item.name, str(path), task_id=task_id)
+                        try:
+                            self._download_with_callbacks(item, path, task_id)
+                        except FileBrowserLoginRequiredError as exc:
+                            self._mark_transfer_failed("download", task_id, str(exc))
+                            self._show_login_required_error(str(exc))
+                        except FileBrowserError as exc:
+                            self._on_download_failed(str(exc), task_id=task_id)
+                        else:
+                            self._on_download_succeeded(item.name, str(path), task_id)
             return
 
         def submit_all() -> list[tuple[WopanItem, Path, str | None, str]]:
@@ -4319,19 +4720,22 @@ class MainWindow(_MainWindowBase):
         submissions = cast(list[tuple[WopanItem, Path, str | None, str]], result)
         succeeded = 0
         failed = 0
-        for item, path, task_id, error in submissions:
-            if task_id is None:
-                failed += 1
-                self._create_download_record(item, path, status="失败", error=error)
-                if error == "登录已过期，请重新登录":
-                    self._show_login_required_error(error)
-                continue
-            succeeded += 1
-            self._removed_download_task_ids.discard(task_id)
-            self._create_download_record(item, path, task_id=task_id)
-            event = self._pending_download_events.pop(task_id, None)
-            if event is not None:
-                self._on_download_event(event)
+        # One render for the whole submission batch (record adds plus any
+        # replayed scheduler events each render the full table otherwise).
+        with self.transfer_interface.batch_updates():
+            for item, path, task_id, error in submissions:
+                if task_id is None:
+                    failed += 1
+                    self._create_download_record(item, path, status="失败", error=error)
+                    if error == "登录已过期，请重新登录":
+                        self._show_login_required_error(error)
+                    continue
+                succeeded += 1
+                self._removed_download_task_ids.discard(task_id)
+                self._create_download_record(item, path, task_id=task_id)
+                event = self._pending_download_events.pop(task_id, None)
+                if event is not None:
+                    self._on_download_event(event)
         self._set_status(f"已添加 {succeeded} 个下载任务，失败 {failed} 个")
         self.update_operation_controls()
 
@@ -4430,6 +4834,9 @@ class MainWindow(_MainWindowBase):
             return
 
         terminal = event.status in TERMINAL_TRANSFER_STATUSES
+        if terminal:
+            # 终态后再无状态转换可补：丢弃同任务的滞留事件，防泄漏。
+            self._pending_download_events.pop(event.task_id, None)
         status = event.status if terminal or event.status != record.status else None
         total_bytes = (
             event.total_bytes
@@ -4489,6 +4896,7 @@ class MainWindow(_MainWindowBase):
         self._scan_thread = thread
         self._scan_worker = worker
         self._set_status("正在扫描待上传内容...")
+        # 只记数量不记路径：本地路径不写入日志（隐私规则，测试钉住）。
         LOGGER.info("main_window.upload_scan.start top_count=%s", len(paths))
         thread.start()
 
@@ -4543,13 +4951,15 @@ class MainWindow(_MainWindowBase):
             return
         request = self._upload_conflict_pending.pop(0)
         self._upload_conflict_current = request
-        paths, parent_id, _run_in_background, _summary = request
+        paths, parent_id, _run_in_background, summary = request
         file_browser = self._file_browser
         if file_browser is None:
             self._upload_conflict_current = None
             return
         thread = QThread(self)
-        worker = BrowserOperationWorker(lambda: file_browser.list_directory(parent_id))
+        worker = BrowserOperationWorker(
+            lambda: self._run_upload_conflict_check(file_browser, parent_id, paths, summary)
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._on_upload_conflict_check_succeeded)
@@ -4565,25 +4975,83 @@ class MainWindow(_MainWindowBase):
         LOGGER.info("main_window.upload_conflict_check.start top_count=%s", len(paths))
         thread.start()
 
+    def _run_upload_conflict_check(
+        self,
+        file_browser: FileBrowserBackend,
+        parent_id: str,
+        paths: tuple[Path, ...],
+        summary: UploadBatchSummary | None,
+    ) -> tuple[list[WopanItem], MergeUploadEstimate | None]:
+        """List the target directory and, when a summary dialog is coming,
+        estimate what a merge resolution would add (one cloud walk)."""
+
+        def estimate_merge(conflicts: tuple[Path, ...]) -> MergeUploadEstimate | None:
+            estimate = getattr(file_browser, "estimate_merge_uploads", None)
+            if not callable(estimate) or not conflicts:
+                return None
+            conflict_names = {path.name for path in conflicts}
+            to_upload = 0
+            skipped = 0
+            for path in paths:
+                if path.name in conflict_names:
+                    if path.is_dir():
+                        result = estimate(parent_id, path, path.name)
+                        to_upload += result.files_to_upload
+                        skipped += result.files_skipped
+                    else:
+                        # 合并模式下同名顶层文件跳过（与 resolve 线程一致）
+                        skipped += 1
+                elif path.is_dir():
+                    to_upload += len(scan_folder_tree(path).files)
+                else:
+                    to_upload += 1
+            return MergeUploadEstimate(files_to_upload=to_upload, files_skipped=skipped)
+
+        items = file_browser.list_directory(parent_id)
+        merge_estimate: MergeUploadEstimate | None = None
+        if summary is not None:
+            existing_names = {item.name for item in items}
+            conflicts = find_upload_conflicts(paths, existing_names)
+            if conflicts:
+                try:
+                    merge_estimate = estimate_merge(conflicts)
+                except FileBrowserLoginRequiredError:
+                    raise
+                except (FileBrowserError, OSError, ValueError):
+                    # 估算只是展示增强：失败降级为静态提示，不阻塞对话框。
+                    # OSError/ValueError 来自本地目录扫描（权限/网络盘失效）。
+                    LOGGER.info("main_window.upload_conflict_check.estimate_failed")
+                    merge_estimate = None
+        return (items, merge_estimate)
+
     def _on_upload_conflict_check_succeeded(self, result: object) -> None:
         if self._closing:
             return
         request = self._upload_conflict_current
-        if request is None or not isinstance(result, list):
+        if (
+            request is None
+            or not isinstance(result, tuple)
+            or len(result) != 2
+            or not isinstance(result[0], list)
+        ):
             self._on_upload_conflict_check_failed("上传目录检查结果无效")
             return
-        if not all(isinstance(item, WopanItem) for item in result):
+        cloud_items, merge_estimate = result
+        if not isinstance(merge_estimate, (MergeUploadEstimate, type(None))):
+            self._on_upload_conflict_check_failed("上传目录检查结果无效")
+            return
+        if not all(isinstance(item, WopanItem) for item in cloud_items):
             self._on_upload_conflict_check_failed("上传目录检查结果无效")
             return
         paths, parent_id, run_in_background, summary = request
         if self.current_directory_id() != parent_id:
             self._set_status("目录已变化，请重新提交上传任务")
             return
-        existing_names = {item.name for item in result}
+        existing_names = {item.name for item in cloud_items}
         LOGGER.info(
             "main_window.upload_conflict_check.success top_count=%s cloud_count=%s",
             len(paths),
-            len(result),
+            len(cloud_items),
         )
         self._upload_conflict_dialog_open = True
         try:
@@ -4591,7 +5059,11 @@ class MainWindow(_MainWindowBase):
             if summary is not None:
                 conflicts = find_upload_conflicts(paths, existing_names)
                 dialog = UploadSummaryDialog(
-                    summary, self.breadcrumb_names()[-1], self, conflicts=conflicts
+                    summary,
+                    self.breadcrumb_names()[-1],
+                    self,
+                    conflicts=conflicts,
+                    merge_estimate=merge_estimate,
                 )
                 accepted = dialog.exec() == QDialog.DialogCode.Accepted
                 if self._closing:
@@ -4659,7 +5131,9 @@ class MainWindow(_MainWindowBase):
             return
         targets = resolve_upload_targets(paths, existing_names, resolution)
         skipped_count = len(paths) - len(targets)
-        if skipped_count:
+        if resolution == "merge":
+            self._set_status("合并上传：同名文件夹续传，已存在的同名文件将跳过")
+        elif skipped_count:
             self._set_status(f"已跳过 {skipped_count} 个冲突项目，已添加 {len(targets)} 个上传任务")
         else:
             self._set_status(f"已添加 {len(targets)} 个上传任务")
@@ -4674,8 +5148,16 @@ class MainWindow(_MainWindowBase):
                     ),
                     _parent_id=parent_id,
                     _conflict_checked=True,
+                    merge=resolution == "merge",
                 )
             else:
+                if resolution == "merge" and (
+                    target.local_path.name in existing_names
+                    or server_file_name(target.local_path.name) in existing_names
+                ):
+                    # 合并模式：同名顶层文件已存在，跳过（不创建任务）。
+                    # 名字按服务端存储形态匹配，长名文件上传后被截断存储。
+                    continue
                 self.upload_file_to_current_directory(
                     target.local_path,
                     run_in_background=run_in_background,
@@ -4773,6 +5255,7 @@ class MainWindow(_MainWindowBase):
         _conflict_checked: bool = False,
         _parent_id: str | None = None,
         _record_id: str | None = None,
+        merge: bool = False,
     ) -> None:
         """Upload one local folder tree to the current directory (two phases)."""
         if self._file_browser is None:
@@ -4785,16 +5268,9 @@ class MainWindow(_MainWindowBase):
         if root_name is None and not _conflict_checked:
             self._submit_upload_paths((local_root,))
             return
-        if (
-            self._folder_prepare_thread is not None
-            or self._folder_upload_active is not None
-            or self._folder_upload_queue
-        ):
-            record_id = self._create_upload_record(
-                local_root,
-                name=root_name if root_name is not None else local_root.name,
-                parent_id=(_parent_id if _parent_id is not None else self.current_directory_id()),
-            )
+        if self._folder_prepare_thread is not None or self._folder_upload_record_id is not None:
+            # 文件夹批次不进传输列表：目录创建属于准备阶段（API 直建），
+            # 列表里只有原子文件任务。record_id 仅作内部批次令牌。
             self._folder_prepare_pending.append(
                 PendingFolderUpload(
                     local_path=local_root,
@@ -4802,28 +5278,25 @@ class MainWindow(_MainWindowBase):
                         _parent_id if _parent_id is not None else self.current_directory_id()
                     ),
                     root_name=root_name,
-                    record_id=record_id,
+                    record_id=self._next_transfer_task_id("folder"),
+                    merge=merge,
                 )
             )
-            self._set_status(f"已添加「{local_root.name}」上传任务")
+            self._set_status(f"「{local_root.name}」已加入上传队列")
+            self._update_folder_prepare_cancel_visibility()
             return
 
         parent_id = _parent_id if _parent_id is not None else self.current_directory_id()
         LOGGER.info(
-            "main_window.folder_upload.prepare.start parent_id=%s root_name_length=%s",
+            "main_window.folder_upload.prepare.start parent_id=%s root_name_length=%s merge=%s",
             parent_id,
             len(local_root.name),
+            merge,
         )
-        if _record_id is None:
-            record_id = self._create_upload_record(
-                local_root,
-                name=root_name if root_name is not None else local_root.name,
-                parent_id=parent_id,
-            )
-        else:
-            record_id = _record_id
+        # 同上：批次令牌不建行，准备阶段在状态栏提示（传统网盘的做法——
+        # 目录创建成功后文件才进列表，失败则一个文件任务都不加）。
+        record_id = _record_id if _record_id is not None else self._next_transfer_task_id("folder")
         self._folder_upload_record_id = record_id
-        self.transfer_interface.update_record("upload", record_id, status="创建目录中")
         file_browser = self._file_browser
         thread = QThread(self)
         prepare_cancel = threading.Event()
@@ -4831,7 +5304,10 @@ class MainWindow(_MainWindowBase):
 
             def operation() -> FolderUploadJob:
                 return file_browser.prepare_folder_upload(
-                    parent_id, local_root, cancel_requested=prepare_cancel.is_set
+                    parent_id,
+                    local_root,
+                    cancel_requested=prepare_cancel.is_set,
+                    merge=merge,
                 )
         else:
             resolved_root_name = root_name
@@ -4842,6 +5318,7 @@ class MainWindow(_MainWindowBase):
                     local_root,
                     root_name=resolved_root_name,
                     cancel_requested=prepare_cancel.is_set,
+                    merge=merge,
                 )
 
         worker = BrowserOperationWorker(operation)
@@ -4862,6 +5339,7 @@ class MainWindow(_MainWindowBase):
         self._folder_upload_target_dir_id = parent_id
         self._set_status(f"正在创建目录「{local_root.name}」...")
         thread.start()
+        self._update_folder_prepare_cancel_visibility()
 
     def _on_folder_upload_prepared(self, result: object) -> None:
         if self._closing:
@@ -4870,36 +5348,45 @@ class MainWindow(_MainWindowBase):
             self._finish_folder_upload()
             return
         job = cast(FolderUploadJob, result)
-        record_id = self._folder_upload_record_id
-        if record_id is not None:
-            self.transfer_interface.update_record("upload", record_id, status="上传中")
         LOGGER.info(
             "main_window.folder_upload.prepare.success root_item_id=%s file_count=%s",
             job.root_item_id,
             len(job.files),
         )
-        queue: list[QueuedUploadFile] = []
-        for planned in job.files:
-            task_id = self._create_upload_record(
-                planned.local_path,
-                name=planned.name,
-                size=planned.size,
-                parent_id=planned.target_dir_id,
-                upload_name=planned.name,
-                retryable=True,
-            )
-            queue.append(
-                QueuedUploadFile(
-                    task_id=task_id,
-                    local_path=planned.local_path,
-                    target_dir_id=planned.target_dir_id,
+        child_ids: set[str] = set()
+        # One render for the whole batch: rendering per added record rebuilds
+        # every row's action widgets N times inside this slot.
+        with self.transfer_interface.batch_updates():
+            for planned in job.files:
+                task_id = self._create_upload_record(
+                    planned.local_path,
+                    name=planned.name,
+                    size=planned.size,
+                    parent_id=planned.target_dir_id,
                     upload_name=planned.name,
+                    retryable=True,
                 )
-            )
-        self._folder_upload_queue = queue
-        self._folder_upload_child_ids = {item.task_id for item in queue}
-        self._set_status(f"已添加 {len(queue)} 个上传任务")
-        self._start_next_folder_upload_file()
+                child_ids.add(task_id)
+                # 统一管线：文件夹子任务进入与单文件上传相同的 FIFO，
+                # 并发数同样由 max_concurrent_uploads 控制（不再单槽串行）。
+                self._upload_pending.append(
+                    PendingUploadTask(
+                        parent_id=planned.target_dir_id,
+                        local_path=planned.local_path,
+                        task_id=task_id,
+                        upload_name=planned.name,
+                        show_enqueue_status=False,
+                    )
+                )
+        self._folder_upload_child_ids = child_ids
+        self._folder_children_registered = True
+        if child_ids:
+            self._set_status(f"已添加 {len(child_ids)} 个上传任务")
+            self._start_next_upload_task()
+        else:
+            # 合并重传全部命中（云端已存在同名同大小）：不建任何行。
+            self._set_status("没有需要上传的文件")
+            self._finish_folder_upload()
 
     def _on_folder_upload_prepare_failed(self, message: str) -> None:
         if self._closing:
@@ -4908,7 +5395,7 @@ class MainWindow(_MainWindowBase):
             self._finish_folder_upload()
             return
         LOGGER.warning("main_window.folder_upload.prepare.failed error_length=%s", len(message))
-        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
+        # 目录创建失败：一个文件任务都不会添加（传统网盘语义），只报错。
         self._set_status(f"上传文件夹失败：{message}")
         InfoBar.error(title="上传文件夹失败", content=message, parent=self)
 
@@ -4918,7 +5405,6 @@ class MainWindow(_MainWindowBase):
         if self._folder_upload_record_id in self._upload_removal_requested:
             self._finish_folder_upload()
             return
-        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
         self._show_login_required_error(message)
 
     def _clear_folder_prepare(self) -> None:
@@ -4926,17 +5412,23 @@ class MainWindow(_MainWindowBase):
         self._folder_prepare_thread = None
         self._folder_prepare_worker = None
         self._folder_prepare_cancel = None
-        if self._folder_upload_active is None and not self._folder_upload_queue:
+        if self._folder_upload_record_id is not None and not self._folder_children_registered:
+            # prepare 失败/取消：批次没有登记子任务，复位标记让下一个
+            # 排队的文件夹批次可以开始（成功路径已登记，含空集）。
             self._folder_upload_record_id = None
+            self._folder_upload_target_dir_id = None
+        # prepare 线程存活期间子任务可能已全部完成（同步线程/快速上传）：
+        # 这里补一次收尾判定。
+        self._maybe_finish_folder_upload()
         self._start_next_pending_folder()
+        self._update_folder_prepare_cancel_visibility()
 
     def _start_next_pending_folder(self) -> None:
         if (
             self._closing
             or self._upload_delete_batch
             or self._folder_prepare_thread is not None
-            or self._folder_upload_active is not None
-            or self._folder_upload_queue
+            or self._folder_upload_record_id is not None
             or not self._folder_prepare_pending
         ):
             return
@@ -4947,57 +5439,37 @@ class MainWindow(_MainWindowBase):
             _conflict_checked=True,
             _parent_id=pending.parent_id,
             _record_id=pending.record_id,
+            merge=pending.merge,
         )
 
     def _take_pending_folder(self) -> PendingFolderUpload:
         return self._folder_prepare_pending.pop(0)
 
-    def _start_next_folder_upload_file(self) -> None:
-        """Dequeue and start the next folder-upload file when the slot is free."""
-        if self._upload_delete_batch:
-            return
-        if not self._folder_upload_queue:
-            self._finish_folder_upload()
-            return
-        queued = next(
-            (
-                item
-                for item in self._folder_upload_queue
-                if item.task_id not in self._paused_uploads
-            ),
-            None,
-        )
-        if queued is None:
-            return
-        self._folder_upload_queue.remove(queued)
-        self._folder_upload_active = queued
-        self._start_upload_task(
-            queued.target_dir_id,
-            queued.local_path,
-            queued.task_id,
-            upload_name=queued.upload_name,
-            show_enqueue_status=False,
-        )
-
-    def _continue_folder_upload_queue(self) -> None:
-        """Advance the folder-upload queue after the upload slot cleared."""
+    def _maybe_finish_folder_upload(self) -> None:
+        """Finish the folder batch once every child left the unified pipeline."""
         if self._closing:
+            # 关闭途中不收尾批次：closeEvent 已清空 worker/pending/paused
+            # 注册表，此刻的门永远「全空」，会把还在暂停中的批次误判为
+            # 完成——根行写成误导性汇总、且在销毁途中再起刷新线程
+            # （QThread destroyed while running 的来源）。批次随进程消亡。
             return
-        active = self._folder_upload_active
-        if active is not None and (
-            active.task_id in self._upload_threads
-            or active.task_id in self._paused_uploads
-            or any(pending.task_id == active.task_id for pending in self._upload_pending)
-        ):
+        if self._folder_upload_record_id is None or not self._folder_children_registered:
+            # prepare 未完成（子任务未登记，含空集）时不能据此收尾批次。
             return
-        self._folder_upload_active = None
-        if self._folder_upload_queue:
-            self._start_next_folder_upload_file()
-            return
-        if active is not None:
-            self._finish_folder_upload()
+        for child_id in self._folder_upload_child_ids:
+            if (
+                child_id in self._upload_workers
+                or any(pending.task_id == child_id for pending in self._upload_pending)
+                or child_id in self._paused_uploads
+            ):
+                return
+        self._finish_folder_upload()
 
     def _finish_folder_upload(self) -> None:
+        if self._closing:
+            # 与 _maybe_finish_folder_upload 同因：关闭途中不收尾、不写汇总、
+            # 不起收尾刷新线程。
+            return
         success_count = self._folder_upload_success_count
         failure_count = self._folder_upload_failure_count
         cancel_count = self._folder_upload_cancel_count
@@ -5011,9 +5483,8 @@ class MainWindow(_MainWindowBase):
             or any(task_id in self._paused_uploads for task_id in self._folder_upload_child_ids)
         ):
             return
-        self._folder_upload_active = None
-        self._folder_upload_queue = []
         self._folder_upload_child_ids.clear()
+        self._folder_children_registered = False
         self._folder_upload_failed_ids.clear()
         self._folder_upload_success_count = 0
         self._folder_upload_failure_count = 0
@@ -5025,7 +5496,6 @@ class MainWindow(_MainWindowBase):
         self._invalidate_directory_cache()
         if root_id in self._upload_removal_requested:
             self._upload_removal_requested.discard(root_id)
-            self.transfer_interface.remove_records("upload", {root_id})
             if target_dir_id is not None and self.current_directory_id() == target_dir_id:
                 self.refresh_current_directory()
             self._start_next_pending_folder()
@@ -5038,21 +5508,17 @@ class MainWindow(_MainWindowBase):
         content = f"成功 {success_count} 个，失败 {failure_count} 个"
         if cancel_count:
             content += f"，取消 {cancel_count} 个"
-        if root_id is not None:
-            if cancel_count:
-                self.transfer_interface.update_record("upload", root_id, status="已取消")
-            elif failure_count:
-                self._mark_transfer_failed("upload", root_id, content)
+        if success_count or failure_count or cancel_count:
+            # 全零批次（合并重传全部命中）不弹汇总，状态栏已提示。
+            if failure_count == 0:
+                InfoBar.info(title="上传完成", content=content, parent=self)
             else:
-                self.transfer_interface.update_record("upload", root_id, status="已完成")
-        if failure_count == 0:
-            InfoBar.info(title="上传完成", content=content, parent=self)
-        else:
-            InfoBar.warning(title="上传完成", content=content, parent=self)
-        self._set_status(f"文件夹上传完成：{content}")
+                InfoBar.warning(title="上传完成", content=content, parent=self)
+            self._set_status(f"文件夹上传完成：{content}")
         if target_dir_id is not None and self.current_directory_id() == target_dir_id:
             self.refresh_current_directory()
         self._start_next_pending_folder()
+        self._update_folder_prepare_cancel_visibility()
 
     def prompt_create_folder(self) -> None:
         """Prompt for a folder name and create it."""
@@ -5558,8 +6024,17 @@ class MainWindow(_MainWindowBase):
         thread.start()
 
     def _start_next_upload_task(self) -> None:
+        if self._closing:
+            # 关闭途中不回填：abandon 退出的 worker 触发本函数会在销毁途中
+            # 启动新上传线程（不在 closeEvent 的 join 名单里，进程退出时
+            # 被销毁还在运行）。
+            return
         while self._upload_pending:
             active_count = len(self._upload_threads)
+            if active_count == 0 and self._upload_thread is not None:
+                # 与 _start_upload_task 相同的旧版单任务引用兼容：占位视作
+                # 一个活动槽，避免绕过并发上限（测试用该引用占住槽位）。
+                active_count = 1
             if active_count >= max(1, self._settings.max_concurrent_uploads):
                 return
             if self._upload_pending[0].task_id in self._upload_threads:
@@ -5728,11 +6203,15 @@ class MainWindow(_MainWindowBase):
         record_id = task_id or self._download_task_id
         if record_id is None:
             return
+        record = self.transfer_interface._find_record("download", record_id)
+        # max_connections 未变化时传 None，保持 progress_only 合并管道生效
+        # （与 _on_download_event 的去重一致）。
+        unchanged_max = record is not None and record.max_connections == max_connections
         self.transfer_interface.update_record(
             "download",
             record_id,
             active_connections=active_connections,
-            max_connections=max_connections,
+            max_connections=None if unchanged_max else max_connections,
         )
 
     def _on_download_succeeded(
@@ -5811,9 +6290,9 @@ class MainWindow(_MainWindowBase):
         )
 
     def _on_upload_cancelled(self, task_id: str) -> None:
-        folder_child = task_id in self._folder_upload_child_ids or (
-            self._folder_upload_active is not None and self._folder_upload_active.task_id == task_id
-        )
+        # 终态即离开暂停表（防暂停竞态残留卡住批次收尾三态门）
+        self._paused_uploads.pop(task_id, None)
+        folder_child = task_id in self._folder_upload_child_ids
         if folder_child:
             self._folder_upload_cancel_count += 1
         self.transfer_interface.update_record("upload", task_id, status="已取消")
@@ -5841,6 +6320,7 @@ class MainWindow(_MainWindowBase):
         )
         record_id = task_id or self._upload_task_id
         if record_id is not None:
+            self._paused_uploads.pop(record_id, None)
             total = item.size if item.size is not None else None
             self.transfer_interface.update_record(
                 "upload",
@@ -5852,13 +6332,7 @@ class MainWindow(_MainWindowBase):
         if (
             record_id is not None
             and self._folder_upload_record_id is not None
-            and (
-                record_id in self._folder_upload_child_ids
-                or (
-                    self._folder_upload_active is not None
-                    and record_id == self._folder_upload_active.task_id
-                )
-            )
+            and record_id in self._folder_upload_child_ids
         ):
             if record_id in self._folder_upload_failed_ids:
                 self._folder_upload_failed_ids.remove(record_id)
@@ -5889,13 +6363,9 @@ class MainWindow(_MainWindowBase):
             return
         LOGGER.warning("main_window.upload.failed error=%s", message)
         record_id = task_id or self._upload_task_id
-        if record_id is not None and (
-            record_id in self._folder_upload_child_ids
-            or (
-                self._folder_upload_active is not None
-                and record_id == self._folder_upload_active.task_id
-            )
-        ):
+        if record_id is not None:
+            self._paused_uploads.pop(record_id, None)
+        if record_id is not None and record_id in self._folder_upload_child_ids:
             if record_id not in self._folder_upload_failed_ids:
                 self._folder_upload_failed_ids.add(record_id)
                 self._folder_upload_failure_count += 1
@@ -5909,29 +6379,39 @@ class MainWindow(_MainWindowBase):
             self._show_login_required_error(message)
             return
         failed_task_id = task_id or self._upload_task_id
+        if failed_task_id is not None:
+            self._paused_uploads.pop(failed_task_id, None)
         self._mark_transfer_failed("upload", failed_task_id, message)
         self._show_login_required_error(message)
-        folder_task_ids = {queued.task_id for queued in self._folder_upload_queue}
-        if self._folder_upload_active is not None:
-            folder_task_ids.add(self._folder_upload_active.task_id)
-        if failed_task_id not in folder_task_ids:
+        if failed_task_id not in self._folder_upload_child_ids:
             return
-        self._mark_transfer_failed("upload", self._folder_upload_record_id, message)
+        child_ids = set(self._folder_upload_child_ids)
         self._folder_upload_record_id = None
         self._folder_upload_child_ids.clear()
+        self._folder_children_registered = False
         self._folder_upload_failed_ids.clear()
-        LOGGER.info(
-            "main_window.folder_upload.login_stopped pending=%s",
-            len(self._folder_upload_queue),
-        )
-        for pending_task_id in folder_task_ids:
-            if pending_task_id != failed_task_id:
-                self._mark_transfer_failed("upload", pending_task_id, "登录已过期，请重新登录")
-        self._folder_upload_active = None
-        self._folder_upload_queue = []
+        LOGGER.info("main_window.folder_upload.login_stopped children=%s", len(child_ids))
+        with self.transfer_interface.batch_updates():
+            for child_id in child_ids:
+                if child_id == failed_task_id:
+                    continue
+                if child_id in self._upload_workers:
+                    # 活跃 worker 会各自以登录错误收尾，这里不重复标失败。
+                    continue
+                child_record = self.transfer_interface._find_record("upload", child_id)
+                if child_record is None or child_record.status in TERMINAL_TRANSFER_STATUSES:
+                    # 已完成/已取消的子任务保持终态，不改标失败。
+                    continue
+                self._paused_uploads.pop(child_id, None)
+                self._upload_pending = [
+                    pending for pending in self._upload_pending if pending.task_id != child_id
+                ]
+                self._mark_transfer_failed("upload", child_id, "登录已过期，请重新登录")
         self._folder_upload_success_count = 0
         self._folder_upload_failure_count = 0
+        self._folder_upload_cancel_count = 0
         self._folder_upload_target_dir_id = None
+        self._start_next_pending_folder()
 
     def _clear_upload_task(self) -> None:
         self._delete_finished_thread()
@@ -5957,13 +6437,7 @@ class MainWindow(_MainWindowBase):
             )
             self._upload_task_id = next_task_id
             self._upload_path = None
-        self._continue_folder_upload_queue()
-        if (
-            self._folder_upload_record_id is not None
-            and self._folder_upload_active is None
-            and not self._folder_upload_queue
-        ):
-            self._finish_folder_upload()
+        self._maybe_finish_folder_upload()
         self._start_next_upload_task()
         self.update_operation_controls()
         self._start_next_pending_folder()
@@ -6041,26 +6515,30 @@ class MainWindow(_MainWindowBase):
     def _pause_selected_downloads(self, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
-        for task_id in sorted(task_ids):
-            self._pause_download_task(task_id)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                self._pause_download_task(task_id)
 
     def _resume_selected_downloads(self, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
-        for task_id in sorted(task_ids):
-            self._resume_download_task(task_id)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                self._resume_download_task(task_id)
 
     def _pause_selected_uploads(self, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
-        for task_id in sorted(task_ids):
-            self._pause_upload_task(task_id)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                self._pause_upload_task(task_id)
 
     def _resume_selected_uploads(self, task_ids: object) -> None:
         if not isinstance(task_ids, set):
             return
-        for task_id in sorted(task_ids):
-            self._resume_upload_task(task_id)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                self._resume_upload_task(task_id)
 
     def _pause_upload_task(self, task_id: str) -> None:
         record = self.transfer_interface._find_record("upload", task_id)
@@ -6068,45 +6546,54 @@ class MainWindow(_MainWindowBase):
             return
         worker = self._upload_workers.get(task_id)
         if worker is not None:
+            if record.status not in ACTIVE_UPLOAD_STATUSES:
+                # 终态已送达但线程清理未完成的窗口：此时登记暂停表会让
+                # 批次收尾三态门永远看到该表项，根行卡死「上传中」。
+                return
+            # 暂停的 worker 线程阻塞在下一个分片检查点，仍占着一个并发槽
+            # （取消会丢会话分片，见 file_browser.upload_file 的取消路径），
+            # 恢复时原线程继续。同时登记暂停表供批次收尾判定与重建用。
             worker.request_pause()
+            if record.target_path is not None and record.upload_parent_id:
+                self._paused_uploads[task_id] = PendingUploadTask(
+                    parent_id=record.upload_parent_id,
+                    local_path=record.target_path,
+                    task_id=task_id,
+                    upload_name=record.upload_name,
+                    show_enqueue_status=False,
+                )
             self.transfer_interface.update_record(
                 "upload", task_id, status="已暂停", can_resume=True
             )
-            active = self._folder_upload_active
-            if active is not None and active.task_id == task_id:
-                self._paused_uploads[task_id] = PendingUploadTask(
-                    parent_id=active.target_dir_id,
-                    local_path=active.local_path,
-                    task_id=active.task_id,
-                    upload_name=active.upload_name,
-                    show_enqueue_status=False,
-                )
-                self._folder_upload_active = None
-                self._continue_folder_upload_queue()
-                self._start_next_upload_task()
             return
         pending = next((item for item in self._upload_pending if item.task_id == task_id), None)
-        if pending is None:
-            queued = next(
-                (item for item in self._folder_upload_queue if item.task_id == task_id), None
-            )
-            if queued is not None:
-                pending = PendingUploadTask(
-                    parent_id=queued.target_dir_id,
-                    local_path=queued.local_path,
-                    task_id=queued.task_id,
-                    upload_name=queued.upload_name,
-                    show_enqueue_status=False,
-                )
-        else:
+        if pending is not None:
             self._upload_pending.remove(pending)
         if pending is None:
+            # 重启恢复的「等待中」行不在任何内存队列（worker/pending/folder
+            # queue）里；此前这里静默返回，暂停按钮看似无效。仍然允许暂停：
+            # 从记录字段重建启动参数登记为已暂停，继续时走单文件恢复路径。
+            if (
+                record.target_path is not None
+                and record.upload_parent_id
+                and record.status in ACTIVE_UPLOAD_STATUSES
+                and task_id not in self._paused_uploads
+            ):
+                self._paused_uploads[task_id] = PendingUploadTask(
+                    parent_id=record.upload_parent_id,
+                    local_path=record.target_path,
+                    task_id=task_id,
+                    upload_name=record.upload_name,
+                    show_enqueue_status=False,
+                )
+                self.transfer_interface.update_record(
+                    "upload", task_id, status="已暂停", can_resume=True
+                )
             return
         if task_id in self._paused_uploads or record.status not in ACTIVE_UPLOAD_STATUSES:
             return
         self._paused_uploads[task_id] = pending
         self.transfer_interface.update_record("upload", task_id, status="已暂停", can_resume=True)
-        self._continue_folder_upload_queue()
         self._start_next_upload_task()
 
     def _resume_upload_task(self, task_id: str) -> None:
@@ -6120,6 +6607,12 @@ class MainWindow(_MainWindowBase):
             self.transfer_interface.update_record(
                 "upload", task_id, status="上传中", can_resume=False
             )
+            return
+        if record.target_path is not None and record.target_path.is_dir():
+            # 文件夹汇总行（重启后归一为已暂停）：无可续传内容，批量继续
+            # 时被选中也不应报错或标失败。置于 worker 检查之后，避免未来
+            # 可暂停汇总行时拦截真实的 worker 恢复。
+            self._set_status("该行为文件夹汇总：请选择其中的子文件继续上传")
             return
         pending = self._paused_uploads.pop(task_id, None)
         if pending is None:
@@ -6137,13 +6630,6 @@ class MainWindow(_MainWindowBase):
                 upload_name=record.upload_name,
                 show_enqueue_status=False,
             )
-        if any(item.task_id == task_id for item in self._folder_upload_queue):
-            self.transfer_interface.update_record(
-                "upload", task_id, status="等待中", can_resume=False
-            )
-            if self._folder_upload_active is None:
-                self._start_next_folder_upload_file()
-            return
         self.transfer_interface.update_record("upload", task_id, status="等待中", can_resume=False)
         self._start_upload_task(
             pending.parent_id,
@@ -6162,11 +6648,12 @@ class MainWindow(_MainWindowBase):
             for record in self.transfer_interface.upload_records
             if record.task_id in task_ids
         }
-        for task_id in sorted(task_ids):
-            record = records.get(task_id)
-            if record is None or not record.upload_retryable or record.status != "失败":
-                continue
-            self._retry_upload_task(record)
+        with self.transfer_interface.batch_updates():
+            for task_id in sorted(task_ids):
+                record = records.get(task_id)
+                if record is None or not record.upload_retryable or record.status != "失败":
+                    continue
+                self._retry_upload_task(record)
 
     def _retry_upload_task(self, record: TransferRecord) -> None:
         if self._file_browser is None:
@@ -6208,17 +6695,18 @@ class MainWindow(_MainWindowBase):
         if direction == "upload":
             self._upload_delete_batch = True
             try:
-                for task_id in sorted(
-                    normalized_ids,
-                    key=lambda value: (
-                        value == self._folder_upload_record_id,
-                        value in self._upload_workers,
-                    ),
-                ):
-                    self._remove_upload_task(task_id)
+                with self.transfer_interface.batch_updates():
+                    for task_id in sorted(
+                        normalized_ids,
+                        key=lambda value: (
+                            value == self._folder_upload_record_id,
+                            value in self._upload_workers,
+                        ),
+                    ):
+                        self._remove_upload_task(task_id)
             finally:
                 self._upload_delete_batch = False
-            self._continue_folder_upload_queue()
+            self._maybe_finish_folder_upload()
             self._start_next_upload_task()
             self._start_next_pending_folder()
             return
@@ -6227,11 +6715,33 @@ class MainWindow(_MainWindowBase):
             self._download_items_by_task.pop(task_id, None)
             self._download_controls.pop(task_id, None)
 
+    def _discard_upload_sessions_for_record(self, record: TransferRecord) -> None:
+        """删除上传行时丢弃其持久化会话，避免下次重启复活已删除的任务。
+
+        会话 id 由 (parent, 本地路径, upload_name) 哈希派生，与本会话行的
+        顺序 id（upload-N）不同；两个 id 都尝试丢弃，覆盖「失败行保留会话」
+        与「恢复行即会话行」两种来源（已完成/已取消行的会话本就不存在，
+        丢弃为无害空操作）。
+        """
+        discard_sessions = getattr(self._file_browser, "discard_upload_sessions", None)
+        if not callable(discard_sessions):
+            return
+        task_ids = [record.task_id]
+        if record.target_path is not None and record.upload_parent_id:
+            task_ids.append(
+                make_upload_task_id(record.upload_parent_id, record.target_path, record.upload_name)
+            )
+        discard_sessions(task_ids)
+
     def _remove_upload_task(self, task_id: str) -> None:
         record = self.transfer_interface._find_record("upload", task_id)
         if record is None or task_id in self._upload_removal_requested:
             return
         if record.status in TERMINAL_TRANSFER_STATUSES:
+            # 失败行按重试语义保留会话；用户删除行即放弃任务，须一并丢弃，
+            # 否则 recover_uploads 每次重启都会为它重建一行（复活循环）。
+            self._paused_uploads.pop(task_id, None)
+            self._discard_upload_sessions_for_record(record)
             self.transfer_interface.remove_records("upload", {task_id})
             return
         if task_id == self._folder_upload_record_id:
@@ -6245,22 +6755,11 @@ class MainWindow(_MainWindowBase):
                 worker.request_cancel()
                 self._set_status("正在停止上传；已发出的请求可能仍会在云端完成")
                 return
-            queued = next(
-                (item for item in self._folder_upload_queue if item.task_id == task_id), None
-            )
-            if queued is not None:
-                self._folder_upload_queue.remove(queued)
             if task_id in self._folder_upload_child_ids:
                 self._folder_upload_cancel_count += 1
-            if (
-                self._folder_upload_active is not None
-                and self._folder_upload_active.task_id == task_id
-            ):
-                self._folder_upload_active = None
+            self._discard_upload_sessions_for_record(record)
             self.transfer_interface.remove_records("upload", {task_id})
-            self._continue_folder_upload_queue()
-            if self._folder_upload_record_id is not None and not self._folder_upload_queue:
-                self._finish_folder_upload()
+            self._maybe_finish_folder_upload()
             return
         pending = next((item for item in self._upload_pending if item.task_id == task_id), None)
         if pending is not None:
@@ -6270,22 +6769,16 @@ class MainWindow(_MainWindowBase):
         )
         if folder_pending is not None:
             self._folder_prepare_pending.remove(folder_pending)
-        queued = next((item for item in self._folder_upload_queue if item.task_id == task_id), None)
-        if queued is not None:
-            self._folder_upload_queue.remove(queued)
-            self._folder_upload_cancel_count += 1
-        active = self._folder_upload_active
-        if active is not None and active.task_id == task_id and task_id not in self._upload_workers:
-            self._folder_upload_cancel_count += 1
-            self._folder_upload_active = None
+        if pending is not None or folder_pending is not None:
+            if task_id in self._folder_upload_child_ids:
+                self._folder_upload_cancel_count += 1
+                if task_id in self._folder_upload_failed_ids:
+                    # 失败后重试又被删除：回滚失败计数，避免双重计数
+                    self._folder_upload_failed_ids.remove(task_id)
+                    self._folder_upload_failure_count -= 1
+            self._discard_upload_sessions_for_record(record)
             self.transfer_interface.remove_records("upload", {task_id})
-            if self._folder_upload_queue:
-                self._start_next_folder_upload_file()
-            else:
-                self._finish_folder_upload()
-            return
-        if pending is not None or folder_pending is not None or queued is not None:
-            self.transfer_interface.remove_records("upload", {task_id})
+            self._maybe_finish_folder_upload()
             self._start_next_pending_folder()
             return
         worker = self._upload_workers.get(task_id)
@@ -6296,10 +6789,30 @@ class MainWindow(_MainWindowBase):
             return
         # 重启恢复的非终态行（如「已暂停」）：本会话没有存活 worker/队列，
         # 无需等待退出，直接移除；同时丢弃其持久化会话，避免下次重启复活。
-        discard_sessions = getattr(self._file_browser, "discard_upload_sessions", None)
-        if callable(discard_sessions):
-            discard_sessions([task_id])
+        self._discard_upload_sessions_for_record(record)
         self.transfer_interface.remove_records("upload", {task_id})
+
+    def _request_cancel_folder_prepare(self) -> None:
+        """目录准备/排队中的文件夹批次没有列表行，取消入口收在这里。
+
+        一次点击取消当前准备中的批次并丢弃整个排队队列（排队批次不可见，
+        无法逐个取消）；已创建的云端目录不回滚。
+        """
+        queued = len(self._folder_prepare_pending)
+        self._folder_prepare_pending.clear()
+        if self._folder_upload_record_id is not None:
+            self._cancel_folder_upload()
+        elif queued:
+            self._set_status("已取消排队中的文件夹上传")
+        self._update_folder_prepare_cancel_visibility()
+
+    def _update_folder_prepare_cancel_visibility(self) -> None:
+        button = getattr(self.transfer_interface, "cancel_folder_prepare_button", None)
+        if button is None:
+            return
+        button.setVisible(
+            self._folder_prepare_thread is not None or bool(self._folder_prepare_pending)
+        )
 
     def _cancel_folder_upload(self) -> None:
         root_id = self._folder_upload_record_id
@@ -6308,41 +6821,33 @@ class MainWindow(_MainWindowBase):
         self._upload_removal_requested.add(root_id)
         if self._folder_prepare_cancel is not None:
             self._folder_prepare_cancel.set()
-        pending_ids = {queued.task_id for queued in self._folder_upload_queue}
-        self._folder_upload_queue.clear()
-        for child_id in self._folder_upload_child_ids:
-            paused = self._paused_uploads.pop(child_id, None)
+        child_ids = set(self._folder_upload_child_ids)
+        pending_ids: set[str] = set()
+        for child_id in child_ids:
+            self._paused_uploads.pop(child_id, None)
             worker = self._upload_workers.get(child_id)
             if worker is not None:
+                # 活跃子任务协作取消：已取消事件到达时各自移除记录行，
+                # 最后一个退出时 _maybe_finish_folder_upload 收尾批次。
                 self._upload_removal_requested.add(child_id)
                 worker.request_cancel()
-            elif paused is not None:
+            else:
                 pending_ids.add(child_id)
-            pending_ids.update(
-                pending.task_id for pending in self._upload_pending if pending.task_id == child_id
-            )
-        active = self._folder_upload_active
-        if active is not None:
-            pending_ids.update(
-                pending.task_id
-                for pending in self._upload_pending
-                if pending.task_id == active.task_id
-            )
         self._upload_pending = [
-            pending for pending in self._upload_pending if pending.task_id not in pending_ids
+            pending for pending in self._upload_pending if pending.task_id not in child_ids
         ]
         if pending_ids:
+            # 无 worker 的子行（排队/暂停/失败）直接移除；失败子行同样按
+            # 「放弃任务」丢弃其保留会话，避免重启复活。
+            for child_id in pending_ids:
+                child_record = self.transfer_interface._find_record("upload", child_id)
+                if child_record is not None:
+                    self._discard_upload_sessions_for_record(child_record)
             self.transfer_interface.remove_records("upload", pending_ids)
-        if active is not None:
-            worker = self._upload_workers.get(active.task_id)
-            if worker is not None:
-                if active.task_id not in self._folder_upload_child_ids:
-                    self._upload_removal_requested.add(active.task_id)
-                    worker.request_cancel()
-            else:
-                self._folder_upload_active = None
         self._set_status("正在停止文件夹上传；已创建的云端内容不会自动删除")
-        if self._folder_prepare_thread is None and self._folder_upload_active is None:
+        if self._folder_prepare_thread is None and not any(
+            child_id in self._upload_workers for child_id in child_ids
+        ):
             self._finish_folder_upload()
 
     def _queue_download_operation(
@@ -6447,12 +6952,20 @@ class MainWindow(_MainWindowBase):
         return None
 
     def _recover_downloads(self) -> None:
-        if self._file_browser is None:
+        if (
+            self._file_browser is None
+            or self._download_recovery_done
+            or self._download_recovery_thread is not None
+        ):
             return
         recover = getattr(self._file_browser, "recover_downloads", None)
         if not callable(recover):
             self._load_persisted_download_records()
             return
+        # 一次性守卫（与 _recover_uploads/_load_transfer_history 对等）：
+        # 重新登录会再次触发 set_file_browser，二次恢复会把同一批持久化
+        # 下载重新入队。
+        self._download_recovery_done = True
         thread = QThread(self)
         worker = BrowserOperationWorker(recover)
         worker.moveToThread(thread)
@@ -6474,22 +6987,55 @@ class MainWindow(_MainWindowBase):
         if result:
             self.transfer_interface.flush_progress_render()
             self.transfer_interface._render_download_table()
+            # 恢复建行前到达的调度器事件一直滞留在 pending：现在按行回放，
+            # 补上恢复期间丢失的状态转换。
+            for record in list(self.transfer_interface.download_records):
+                event = self._pending_download_events.pop(record.task_id, None)
+                if event is not None:
+                    self._on_download_event(event)
 
     def _on_download_recovery_failed(self, message: str) -> None:
         LOGGER.warning("main_window.download.recovery.failed error=%s", message)
         self._set_status(f"恢复下载任务失败：{message}")
+        # 调度器缺席时历史里的非终态下载行没有任何执行体（上传侧在历史
+        # 加载时归一）；不归一会保留僵尸「下载中」，且暂停会触发调度器
+        # KeyError 弹费解错误。统一标注为可恢复的暂停态。历史加载与本
+        # 恢复是两个并发装载器：此处只归一已到达的行，随后到达的行由
+        # _on_transfer_history_loaded 按本标志补归一（顺序无关）。
+        self._download_recovery_failed = True
+        with self.transfer_interface.batch_updates():
+            for record in list(self.transfer_interface.download_records):
+                if record.status not in TERMINAL_TRANSFER_STATUSES:
+                    self.transfer_interface.update_record(
+                        "download",
+                        record.task_id,
+                        status="已暂停",
+                        can_resume=True,
+                        error=f"恢复下载任务失败：{message}",
+                    )
 
     def _clear_download_recovery(self) -> None:
         self._delete_finished_thread()
         self._download_recovery_thread = None
         self._download_recovery_worker = None
+        if not self._download_recovery_done and not self._closing:
+            # 恢复线程飞行途中更换了 backend（重新登录）：守卫标志已被
+            # set_file_browser 重置，此处补跑一次让新调度器认领持久化任务。
+            self._recover_downloads()
 
     def _recover_uploads(self) -> None:
-        if self._file_browser is None:
+        if (
+            self._file_browser is None
+            or self._upload_recovery_done
+            or self._upload_recovery_thread is not None
+        ):
             return
         recover = getattr(self._file_browser, "recover_uploads", None)
         if not callable(recover):
             return
+        # 一次性守卫（与 _load_transfer_history 对等）：重新登录会再次触发
+        # set_file_browser，二次恢复会把失败会话改写并重复建行。
+        self._upload_recovery_done = True
         thread = QThread(self)
         worker = BrowserOperationWorker(recover)
         worker.moveToThread(thread)
@@ -6506,11 +7052,22 @@ class MainWindow(_MainWindowBase):
     def _on_upload_recovery_succeeded(self, result: object) -> None:
         if not isinstance(result, tuple) or self._closing:
             return
-        for persisted in result:
-            self._add_persisted_upload_record(persisted)
-        if result:
-            self.transfer_interface.flush_progress_render()
-            self.transfer_interface._render_upload_table()
+        auto_resume: list[str] = []
+        # One render for the recovered batch, not one per restored record.
+        with self.transfer_interface.batch_updates():
+            for persisted in result:
+                task_id = self._add_persisted_upload_record(persisted)
+                if task_id is not None and getattr(persisted, "was_active", False):
+                    auto_resume.append(task_id)
+        for task_id in auto_resume:
+            record = self.transfer_interface._find_record("upload", task_id)
+            if record is None or record.status != "已暂停" or not record.upload_retryable:
+                continue
+            # 死前正在传输的会话自动续传（与下载侧恢复语义对齐）；死前已
+            # 暂停/失败的会话保持手动继续。批处理避免逐行立即全表渲染。
+            LOGGER.info("main_window.upload.recovery.auto_resume task_id=%s", task_id)
+            with self.transfer_interface.batch_updates():
+                self._resume_upload_task(task_id)
 
     def _on_upload_recovery_failed(self, message: str) -> None:
         LOGGER.warning("main_window.upload.recovery.failed error=%s", message)
@@ -6521,11 +7078,75 @@ class MainWindow(_MainWindowBase):
         self._upload_recovery_thread = None
         self._upload_recovery_worker = None
 
-    def _add_persisted_upload_record(self, persisted: object) -> None:
+    def _find_upload_row_by_target(
+        self,
+        target_path: Path | None,
+        upload_parent_id: str | None,
+        upload_name: str | None,
+    ) -> TransferRecord | None:
+        """Find a live non-terminal upload row for one (file, dir, name) target.
+
+        Session-recovery rows and restored history rows describe the same
+        upload with different task ids (hash vs sequence); matching by target
+        lets the two restart loaders merge regardless of completion order.
+        """
+        for record in self.transfer_interface.upload_records:
+            if (
+                record.target_path == target_path
+                and record.upload_parent_id == upload_parent_id
+                and record.upload_name == upload_name
+                and record.status not in TERMINAL_TRANSFER_STATUSES
+            ):
+                return record
+        return None
+
+    def _add_persisted_upload_record(self, persisted: object) -> str | None:
         required = ("task_id", "name", "local_path", "target_parent_id", "status")
         if not all(hasattr(persisted, attribute) for attribute in required):
-            return
+            return None
         persisted_record = cast(UploadTaskRecord, persisted)
+        session_error = str(getattr(persisted_record, "error", "") or "")
+        upload_name = getattr(persisted_record, "upload_name", None)
+        existing = self._find_upload_row_by_target(
+            persisted_record.local_path,
+            persisted_record.target_parent_id,
+            upload_name,
+        )
+        if existing is not None and existing.status != "已暂停":
+            # 用户本会话正在上传/排队同一目标：该活动上传调用服务层时会按
+            # 会话 task_id 自动复用持久化分片，恢复行成为冗余，不添加也
+            # 不覆盖活动行（覆盖会把「上传中」误写成「已暂停」）。
+            LOGGER.info(
+                "main_window.upload.recovery.skipped_active_row task_id=%s",
+                existing.task_id,
+            )
+            return None
+        if existing is not None:
+            # 会话行与已归一化的历史行指向同一文件：合并进现有行，保留其
+            # 序列 task_id，避免同一文件出现两行。
+            self.transfer_interface.update_record(
+                "upload",
+                existing.task_id,
+                status=persisted_record.status,
+                total_bytes=getattr(persisted_record, "file_size", None),
+                can_resume=True,
+                error=session_error,
+            )
+            return existing.task_id
+        failed_row = self._find_failed_upload_row_by_target(
+            persisted_record.local_path,
+            persisted_record.target_parent_id,
+            upload_name,
+        )
+        if failed_row is not None:
+            # 失败历史行 + 残留会话（失败时会话保留）：折叠断点信息、保留
+            # 失败状态与重试按钮，不新增第二行。
+            self.transfer_interface.update_record(
+                "upload",
+                failed_row.task_id,
+                error=_join_distinct_errors(failed_row.error, session_error),
+            )
+            return None
         record = TransferRecord(
             task_id=persisted_record.task_id,
             direction="upload",
@@ -6533,12 +7154,29 @@ class MainWindow(_MainWindowBase):
             size=getattr(persisted_record, "file_size", None),
             target_path=persisted_record.local_path,
             status=persisted_record.status,
-            error=str(getattr(persisted_record, "error", "") or ""),
+            error=session_error,
             upload_parent_id=persisted_record.target_parent_id,
-            upload_name=getattr(persisted_record, "upload_name", None),
+            upload_name=upload_name,
             upload_retryable=bool(getattr(persisted_record, "resumable", False)),
         )
         self.transfer_interface.add_upload_record(record)
+        return record.task_id
+
+    def _find_failed_upload_row_by_target(
+        self,
+        target_path: Path | None,
+        upload_parent_id: str | None,
+        upload_name: str | None,
+    ) -> TransferRecord | None:
+        for record in self.transfer_interface.upload_records:
+            if (
+                record.target_path == target_path
+                and record.upload_parent_id == upload_parent_id
+                and record.upload_name == upload_name
+                and record.status == "失败"
+            ):
+                return record
+        return None
 
     def _load_persisted_download_records(self) -> None:
         if self._file_browser is None:

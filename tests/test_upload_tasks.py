@@ -9,13 +9,16 @@ import pytest
 
 from openwopan.tasks.upload import (
     JUNK_FILE_NAMES,
+    SERVER_FILE_NAME_LIMIT,
     UploadBatchSummary,
+    UploadTarget,
     find_upload_conflicts,
     format_upload_summary,
     next_available_name,
     resolve_upload_targets,
     scan_folder_tree,
     scan_upload_inputs,
+    server_file_name,
 )
 
 
@@ -159,6 +162,108 @@ def test_next_available_name_follows_duplicate_counter_format(
     assert next_available_name(requested, used) == expected
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("报告.txt", "报告.txt"),  # 短名原样
+        ("a" * 96 + ".mkv", "a" * 96 + ".mkv"),  # 恰好 100 字符：原样
+        ("a" * 99 + ".mkv", "a" * 96 + ".mkv"),  # 主名截到 96 + ".mkv" = 100
+        ("b" * 100 + ".jpeg", "b" * 95 + ".jpeg"),  # 4 字符扩展名：95 + 1 + 4 = 100
+        ("c" * 150, "c" * 150),  # 无扩展名：服务端行为未验证，保守原样
+    ],
+)
+def test_server_file_name_truncates_stems_beyond_limit(
+    name: str, expected: str
+) -> None:
+    assert server_file_name(name) == expected
+
+
+def test_server_file_name_matches_observed_truncation_sample() -> None:
+    """UAT 2026-10-06：157 个 .mkv 文件实测，服务端存储主名前 96 字符 + 扩展名。"""
+    local = (
+        "[BeanSub&LoliHouse] Tensei Shitara Slime Datta Ken 4th Season - 01(73) "
+        "[WebRip 1080p HEVC-10bit AAC ASSx2].mkv"
+    )
+
+    assert len(local) == 110  # 主名 106 + ".mkv"
+    stored = server_file_name(local)
+    assert stored == f"{Path(local).stem[:96]}.mkv"
+    assert len(stored) == SERVER_FILE_NAME_LIMIT
+
+
+def test_server_file_name_leaves_pathological_extensions_alone() -> None:
+    name = "x" * 50 + "." + "y" * 99  # 扩展名自身几乎占满限制，主名无空间
+
+    assert server_file_name(name) == name
+
+
+def test_next_available_name_fits_copy_candidates_inside_server_limit() -> None:
+    """长名的副本名必须落在服务端限制内，否则 (copy) 标记会被截掉而再次同名。"""
+    requested = "a" * 99 + ".mkv"
+    stored = server_file_name(requested)  # 云端已有截断名
+
+    candidate = next_available_name(requested, {stored})
+
+    assert len(candidate) <= SERVER_FILE_NAME_LIMIT
+    assert candidate.endswith(" (copy).mkv")
+    assert server_file_name(candidate) == candidate  # 存储后不再变形
+    assert candidate != stored
+
+    second = next_available_name(requested, {stored, candidate})
+    assert len(second) <= SERVER_FILE_NAME_LIMIT
+    assert second.endswith(" (copy) (copy).mkv")
+    assert second != candidate
+
+
+def test_next_available_name_falls_back_to_numbered_names_and_terminates() -> None:
+    """全部可容纳的 (copy) 变体都被占用时：退回数值后缀且必然终止（不死循环）。"""
+    requested = "a" * 99 + ".mkv"
+    marker = " (copy)"
+    ext = ".mkv"
+    max_stem = SERVER_FILE_NAME_LIMIT - len(ext)
+    used = {server_file_name(requested)}
+    copies = 1
+    while len(marker) * copies <= max_stem:
+        base = "a" * (max_stem - len(marker) * copies)
+        used.add(f"{base}{marker * copies}{ext}")
+        copies += 1
+
+    candidate = next_available_name(requested, used)
+
+    assert candidate == "a" * (max_stem - len(" (2)")) + " (2).mkv"
+    assert len(candidate) <= SERVER_FILE_NAME_LIMIT
+    assert server_file_name(candidate) == candidate
+    assert candidate not in used
+
+
+def test_find_upload_conflicts_matches_truncated_cloud_names(tmp_path: Path) -> None:
+    long_name = "a" * 99 + ".mkv"
+    short = _write(tmp_path / "b.txt")
+    long_file = _write(tmp_path / "sub" / long_name)
+
+    conflicts = find_upload_conflicts(
+        (short, long_file), {server_file_name(long_name)}
+    )
+
+    assert conflicts == (long_file,)
+
+
+def test_resolve_upload_targets_recognizes_truncated_conflicts(tmp_path: Path) -> None:
+    """与 find_upload_conflicts 同源：截断名冲突在三种策略下行为一致。"""
+    long_name = "a" * 99 + ".mkv"
+    existing = {server_file_name(long_name)}
+    long_file = _write(tmp_path / "sub" / long_name, b"data")
+
+    assert resolve_upload_targets((long_file,), existing, "skip") == ()
+    assert resolve_upload_targets((long_file,), existing, "merge") == (
+        UploadTarget(long_file, None),
+    )
+
+    (target,) = resolve_upload_targets((long_file,), existing, "copy")
+    assert len(target.upload_name or "") <= SERVER_FILE_NAME_LIMIT
+    assert target.upload_name != long_name
+
+
 def test_resolve_upload_targets_skips_only_conflicting_paths(tmp_path: Path) -> None:
     first = _write(tmp_path / "same.txt", b"one")
     second = _write(tmp_path / "other.txt", b"two")
@@ -188,6 +293,24 @@ def test_resolve_upload_targets_appends_copy_for_repeated_conflicts(tmp_path: Pa
         (first, "report (copy) (copy).txt"),
         (second, "report (copy) (copy) (copy).txt"),
         (third, "report (copy) (copy) (copy) (copy).txt"),
+    ]
+
+
+def test_resolve_upload_targets_merge_keeps_original_names(tmp_path: Path) -> None:
+    """合并策略：冲突项保留原名（文件夹据此续传合并），不再改副本名。"""
+    folder = tmp_path / "已看完"
+    folder.mkdir()
+    conflicting_file = _write(tmp_path / "same.txt", b"one")
+    fresh_file = _write(tmp_path / "new.txt", b"two")
+
+    targets = resolve_upload_targets(
+        (folder, conflicting_file, fresh_file), {"已看完", "same.txt"}, "merge"
+    )
+
+    assert [(target.local_path, target.upload_name) for target in targets] == [
+        (folder, None),
+        (conflicting_file, None),
+        (fresh_file, None),
     ]
 
 

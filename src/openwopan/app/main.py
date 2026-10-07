@@ -94,10 +94,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     app.installTranslator(FluentTranslator())
     setTheme(Theme.LIGHT)
 
-    is_smoke_test = os.environ.get(SMOKE_TEST_ENV) == "1"
-    if unclean_previous_session and not is_smoke_test:
-        show_unclean_shutdown_notice(log_path.parent)
-
     dependencies = build_dependencies()
     dependencies = AppDependencies(
         credential_store=dependencies.credential_store,
@@ -114,10 +110,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     controller = ApplicationController(dependencies, window, _build_login_window, app.quit)
 
+    is_smoke_test = os.environ.get(SMOKE_TEST_ENV) == "1"
     if is_smoke_test:
         QTimer.singleShot(0, app.quit)
     else:
         QTimer.singleShot(0, controller.start)
+        if unclean_previous_session:
+            # 注册顺序即触发顺序：主窗口先显示，提示随后非阻塞浮出——
+            # 关闭提示只关闭提示本身，绝不阻断程序正常使用。
+            # 关键字传参：曾因位置参数写反（window/log_dir 互换）导致
+            # QMessageBox(Path) 崩溃，关键字让这类互换不可能发生。
+            QTimer.singleShot(
+                0,
+                lambda: show_unclean_shutdown_notice(
+                    log_dir=log_path.parent, parent=window
+                ),
+            )
 
     try:
         return int(app.exec())

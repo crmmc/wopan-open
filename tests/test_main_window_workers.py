@@ -29,18 +29,25 @@ from PySide6.QtWidgets import (
 )
 
 import openwopan.ui.main_window as main_window_module
-from openwopan.app.file_browser import FileBrowserError, FileBrowserLoginRequiredError
+from openwopan.app.file_browser import (
+    FileBrowserError,
+    FileBrowserLoginRequiredError,
+    FileBrowserUploadCancelledError,
+)
 from openwopan.app.transfer_history import TransferHistoryAdapter
 from openwopan.storage.settings import AppSettings
 from openwopan.storage.transfer_records import TransferRecordStore
 from openwopan.tasks.download import DownloadTaskControl, DownloadTaskState, DownloadTaskStore
 from openwopan.tasks.upload import (
     FolderUploadJob,
+    MergeUploadEstimate,
     PlannedUploadFile,
     UploadBatchSummary,
     UploadSummaryEntry,
+    UploadTaskRecord,
     UploadTaskState,
     UploadTaskStore,
+    make_upload_task_id,
     scan_folder_tree,
 )
 from openwopan.ui.main_window import (
@@ -52,7 +59,6 @@ from openwopan.ui.main_window import (
     PendingFolderUpload,
     PendingUploadTask,
     PlaceholderInterface,
-    QueuedUploadFile,
     TransferInterface,
     TransferRecord,
     UploadConflictDialog,
@@ -108,8 +114,6 @@ def _sync_worker_tests(request: pytest.FixtureRequest) -> None:
     }
     if request.node.name.split("[", 1)[0] not in real_thread_tests:
         request.getfixturevalue("sync_threads")
-
-
 
 
 def _renamed(item: WopanItem, new_name: str) -> WopanItem:
@@ -288,6 +292,7 @@ class WorkerFileBrowser:
         *,
         root_name: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        merge: bool = False,
     ) -> FolderUploadJob:
         self.prepared_uploads.append((parent_id, local_root))
         self.prepared_upload_names.append(root_name)
@@ -386,7 +391,6 @@ def _wait_until(qapp: QApplication, predicate, timeout: float = 5.0) -> bool:
     return predicate()
 
 
-
 class _CloseBlockingDownloadBrowser(WorkerFileBrowser):
     def __init__(self) -> None:
         super().__init__()
@@ -449,7 +453,6 @@ class _RefusingThread:
     def wait(self, timeout: int) -> bool:
         self.wait_timeouts.append(timeout)
         return False
-
 
 
 # ---------------------------------------------------------------------------
@@ -574,9 +577,7 @@ def test_download_worker_emits_all_callbacks_and_success(
     assert collector.events["failed"] == []
 
 
-def test_download_worker_falls_back_to_legacy_signature(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_download_worker_falls_back_to_legacy_signature(qapp: QApplication, tmp_path: Path) -> None:
     browser = LegacySignatureFileBrowser()
     worker = _make_download_worker(browser, tmp_path)
     collector = _SignalCollector(worker)
@@ -589,9 +590,7 @@ def test_download_worker_falls_back_to_legacy_signature(
     ]
 
 
-def test_download_worker_reports_unrelated_type_error(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_download_worker_reports_unrelated_type_error(qapp: QApplication, tmp_path: Path) -> None:
     worker = _make_download_worker(UnrelatedTypeErrorFileBrowser(), tmp_path)
     collector = _SignalCollector(worker)
 
@@ -645,9 +644,7 @@ def test_download_worker_reports_unexpected_error_without_raising(
     assert collector.events["succeeded"] == []
 
 
-def test_download_progress_accepts_large_byte_count(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_download_progress_accepts_large_byte_count(qapp: QApplication, tmp_path: Path) -> None:
     worker = _make_download_worker(WorkerFileBrowser(), tmp_path)
     collector = _SignalCollector(worker)
 
@@ -686,9 +683,7 @@ def test_upload_worker_reports_unexpected_error_without_raising(
     assert collector.events["succeeded"] == []
 
 
-def test_upload_worker_forwards_progress_with_task_id(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_upload_worker_forwards_progress_with_task_id(qapp: QApplication, tmp_path: Path) -> None:
     class _ProgressBrowser:
         def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
             callback = kwargs.get("progress_callback")
@@ -712,7 +707,8 @@ def test_upload_worker_forwards_progress_with_task_id(
 
 
 def test_upload_worker_stops_before_or_after_backend_call(
-    qapp: QApplication, tmp_path: Path,
+    qapp: QApplication,
+    tmp_path: Path,
 ) -> None:
     class _CancellingBrowser:
         def __init__(self) -> None:
@@ -768,9 +764,7 @@ def test_upload_worker_pause_waits_until_resumed(qapp: QApplication, tmp_path: P
 
     local_path = tmp_path / "upload.txt"
     local_path.write_text("content")
-    worker = UploadWorker(
-        _PausableBrowser(), ROOT_DIRECTORY_ID, local_path, "upload-1"
-    )  # type: ignore[arg-type]
+    worker = UploadWorker(_PausableBrowser(), ROOT_DIRECTORY_ID, local_path, "upload-1")  # type: ignore[arg-type]
     succeeded: list[str] = []
     worker.succeeded.connect(
         lambda _item, task_id: succeeded.append(task_id),
@@ -882,9 +876,7 @@ def test_upload_worker_maps_failed_and_login_required(
     expected_signal: str,
     expected_payload: tuple,
 ) -> None:
-    worker = UploadWorker(
-        _RaisingBrowser(error), ROOT_DIRECTORY_ID, tmp_path / "u.txt", "upload-1"
-    )  # type: ignore[arg-type]
+    worker = UploadWorker(_RaisingBrowser(error), ROOT_DIRECTORY_ID, tmp_path / "u.txt", "upload-1")  # type: ignore[arg-type]
     collector = _UploadCollector(worker)
 
     worker.run()
@@ -954,8 +946,10 @@ def test_refresh_directory_updates_ui_on_gui_thread(qapp: QApplication) -> None:
 
     assert _wait_until(
         qapp,
-        lambda: window._directory_thread is None
-        and not any(isinstance(child, QThread) for child in window.children()),
+        lambda: (
+            window._directory_thread is None
+            and not any(isinstance(child, QThread) for child in window.children())
+        ),
     )
     assert window.refresh_handler_thread_id == gui_thread_id
     assert browser_thread_ids and browser_thread_ids[0] != gui_thread_id
@@ -998,17 +992,21 @@ def test_visibility_check_waits_for_refresh_completion(
         window.upload_file_to_current_directory(local_path)
         assert _wait_until(
             qapp,
-            lambda: window.status_message() == "上传完成：upload.txt"
-            and window._upload_thread is None
-            and window._directory_thread is None,
+            lambda: (
+                window.status_message() == "上传完成：upload.txt"
+                and window._upload_thread is None
+                and window._directory_thread is None
+            ),
         )
     else:
         window.create_folder_with_name("新建文件夹")
         assert _wait_until(
             qapp,
-            lambda: "未在当前目录看到" not in window.status_message()
-            and window._create_thread is None
-            and window._directory_thread is None,
+            lambda: (
+                "未在当前目录看到" not in window.status_message()
+                and window._create_thread is None
+                and window._directory_thread is None
+            ),
         )
 
     assert "未在当前目录看到" not in window.status_message()
@@ -1160,8 +1158,6 @@ def test_refresh_directory_runs_pending_refresh_after_in_flight_finishes(
     assert [item.name for item in window.displayed_items()] == ["child.txt"]
 
 
-
-
 def test_close_window_cancels_and_joins_running_download(
     qapp: QApplication, tmp_path: Path
 ) -> None:
@@ -1203,9 +1199,11 @@ def test_close_window_joins_every_task_keyed_upload_thread(qapp: QApplication) -
     assert second.wait_timeouts == [main_window_module.THREAD_JOIN_TIMEOUT_MS]
 
 
-def test_close_window_cancels_waiting_folder_records(
+def test_close_window_preserves_waiting_tasks_without_batch_rows(
     qapp: QApplication, tmp_path: Path
 ) -> None:
+    """关闭时批次无行可清扫：孤儿行原样保留；等待中的子文件行保持原状态
+    落盘，重启后由历史加载归一为「已暂停」并可手动继续。"""
     window = MainWindow(WorkerFileBrowser())
     root = tmp_path / "active"
     waiting = tmp_path / "waiting"
@@ -1219,10 +1217,10 @@ def test_close_window_cancels_waiting_folder_records(
     waiting_id = window._create_upload_record(waiting)
     window.transfer_interface.update_record("upload", child_id, status="上传中")
     window._folder_upload_record_id = root_id
+    window._folder_upload_child_ids = {child_id, next_id}
 
-    window._folder_upload_active = QueuedUploadFile(child_id, child, "cloud-root", "child.txt")
-    window._folder_upload_queue = [
-        QueuedUploadFile(next_id, next_child, "cloud-root", "next.txt")
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", next_child, next_id, "next.txt", False)
     ]
     window._folder_prepare_pending = [
         PendingFolderUpload(waiting, ROOT_DIRECTORY_ID, "waiting", waiting_id)
@@ -1230,33 +1228,280 @@ def test_close_window_cancels_waiting_folder_records(
 
     window.closeEvent(QCloseEvent())
 
-    assert [window.transfer_interface._find_record("upload", task_id).status for task_id in (
-        root_id, next_id, waiting_id
-    )] == ["已取消", "已取消", "已取消"]
-    assert window._folder_upload_queue == []
+    # 文件夹批次无行可清扫：根/排队文件夹的孤儿行原样保留，
+    # 等待中的子任务保持等待中（重启后归一为已暂停）。
+    assert [
+        window.transfer_interface._find_record("upload", task_id).status
+        for task_id in (root_id, next_id, waiting_id)
+    ] == ["等待中", "等待中", "等待中"]
+    assert window._upload_pending == []
     assert window._folder_prepare_pending == []
     assert window.transfer_interface._find_record("upload", child_id).status == "上传中"
     window._on_folder_upload_prepare_failed("关闭后的失败")
     window._on_folder_upload_prepare_login_required("登录已过期，请重新登录")
-    assert window.transfer_interface._find_record("upload", root_id).status == "已取消"
+    assert window.transfer_interface._find_record("upload", root_id).status == "等待中"
 
 
-def test_close_window_cancels_paused_upload_records(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_close_window_preserves_paused_upload_records(qapp: QApplication, tmp_path: Path) -> None:
+    """用户暂停的任务关闭时保持「已暂停」：重启后可手动继续断点续传，
+    而不是被收尾清扫改写成终态「已取消」（恢复侧本就保留已暂停）。"""
     window = MainWindow(WorkerFileBrowser())
     local_path = tmp_path / "paused.txt"
     task_id = window._create_upload_record(local_path)
     window._paused_uploads[task_id] = PendingUploadTask(
         ROOT_DIRECTORY_ID, local_path, task_id, local_path.name, False
     )
-    window.transfer_interface.update_record("upload", task_id, status="已暂停")
+    window.transfer_interface.update_record("upload", task_id, status="已暂停", can_resume=True)
 
     window.closeEvent(QCloseEvent())
 
     record = window.transfer_interface._find_record("upload", task_id)
-    assert record is not None and record.status == "已取消"
+    assert record is not None and record.status == "已暂停" and record.can_resume
     assert window._paused_uploads == {}
+
+
+def test_close_window_abandons_live_upload_workers(qapp: QApplication, tmp_path: Path) -> None:
+    """关闭 ≠ 取消：暂停中与正在上传的存活 worker 都走 abandon（会话标记
+    「已暂停（中断）」保留分片），行保持原状态供下次启动断点续传。"""
+    window = MainWindow(WorkerFileBrowser())
+    paused_path = tmp_path / "paused-upload.txt"
+    active_path = tmp_path / "active-upload.txt"
+    paused_id = window._create_upload_record(paused_path)
+    active_id = window._create_upload_record(active_path)
+    cancelled: list[str] = []
+    abandoned: list[str] = []
+
+    class _StubWorker:
+        def __init__(self, task_id: str) -> None:
+            self._task_id = task_id
+
+        def request_cancel(self) -> None:
+            cancelled.append(self._task_id)
+
+        def request_abandon(self) -> None:
+            abandoned.append(self._task_id)
+
+    window._upload_workers[paused_id] = _StubWorker(paused_id)  # type: ignore[assignment]
+    window._upload_threads[paused_id] = _RefusingThread()  # type: ignore[assignment]
+    window._upload_workers[active_id] = _StubWorker(active_id)  # type: ignore[assignment]
+    window._upload_threads[active_id] = _RefusingThread()  # type: ignore[assignment]
+    window._paused_uploads[paused_id] = PendingUploadTask(
+        ROOT_DIRECTORY_ID, paused_path, paused_id, paused_path.name, False
+    )
+    window.transfer_interface.update_record("upload", paused_id, status="已暂停", can_resume=True)
+    window.transfer_interface.update_record("upload", active_id, status="上传中")
+
+    window.closeEvent(QCloseEvent())
+
+    assert sorted(abandoned) == sorted([active_id, paused_id])
+    assert cancelled == []
+    assert window.transfer_interface._find_record("upload", paused_id).status == "已暂停"
+    assert window.transfer_interface._find_record("upload", active_id).status == "上传中"
+
+
+def test_close_window_does_not_finish_folder_batch_midway(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """关闭途中不收尾批次：closeEvent 清空注册表后收尾门全空，会把仍在
+    暂停中的批次误判为完成（根行写成误导性汇总、销毁途中再起刷新线程）。
+
+    回归：真实会话中 94 文件批次暂停 64 个后关闭，根行被写成
+    「失败：成功 28 个，失败 2 个」。
+    """
+    window = MainWindow(WorkerFileBrowser())
+    root = tmp_path / "batch"
+    root.mkdir()
+    child = root / "ep01.mkv"
+    child.write_bytes(b"x")
+    child_id = window._create_upload_record(child, parent_id="cloud-1", retryable=True)
+    window._folder_upload_record_id = "folder-token-1"
+    window._folder_upload_child_ids = {child_id}
+    window._folder_children_registered = True
+    window._folder_upload_failure_count = 2
+    window._paused_uploads[child_id] = PendingUploadTask(
+        "cloud-1", child, child_id, child.name, False
+    )
+    window.transfer_interface.update_record("upload", child_id, status="已暂停")
+
+    window.closeEvent(QCloseEvent())
+    # 关闭途中 worker 退出会触发收尾门与收尾本体：都应被 _closing 拦截，
+    # 批次状态原样保留（子行保持已暂停，令牌不被动）。
+    window._maybe_finish_folder_upload()
+    window._finish_folder_upload()
+
+    assert window._folder_upload_record_id == "folder-token-1"
+    child_record = window.transfer_interface._find_record("upload", child_id)
+    assert child_record is not None and child_record.status == "已暂停"
+
+
+def test_closing_window_does_not_backfill_upload_queue(qapp: QApplication, tmp_path: Path) -> None:
+    """关闭途中不回填上传队列：abandon 退出的 worker 触发回填会在销毁途中
+    启动新上传线程（不在 join 名单里，退出时被销毁仍在运行）。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_path = tmp_path / "next.txt"
+    local_path.write_bytes(b"x")
+    window._upload_pending = [
+        PendingUploadTask("cloud-1", local_path, "upload-next", "next.txt", False)
+    ]
+    window._closing = True
+
+    window._start_next_upload_task()
+
+    assert [item.task_id for item in window._upload_pending] == ["upload-next"]
+    assert window._upload_threads == {}
+    window._closing = False
+
+
+def test_upload_worker_abandon_exits_paused_upload_without_cancel_event(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """worker 级：暂停阻塞中的 upload_file 被 abandon 解除后以取消异常退出，
+    但不发出 cancelled 事件，且 cancel 回调带上 preserve_session 标志。"""
+
+    class _PollingBrowser:
+        def __init__(self) -> None:
+            self.cancel_callbacks: list[object] = []
+            self.poll_count = 0
+
+        def upload_file(
+            self,
+            parent_id: str,
+            local_path: Path,
+            *,
+            upload_name: str | None = None,
+            progress_callback: object = None,
+            cancel_requested: object = None,
+        ) -> WopanItem:
+            self.cancel_callbacks.append(cancel_requested)
+            assert callable(cancel_requested)
+            while True:
+                self.poll_count += 1
+                if cancel_requested():
+                    raise FileBrowserUploadCancelledError("上传已取消")
+                time.sleep(0.005)
+
+    browser = _PollingBrowser()
+    worker = main_window_module.UploadWorker(browser, "cloud-1", tmp_path / "f.bin", "t1")
+    events: list[tuple[str, str]] = []
+    worker.cancelled.connect(lambda task_id: events.append(("cancelled", task_id)))
+    worker.failed.connect(lambda message, task_id: events.append(("failed", task_id)))
+    worker.succeeded.connect(lambda item, task_id: events.append(("succeeded", task_id)))
+
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(qapp, lambda: browser.poll_count >= 1)
+        worker.request_pause()
+        # 轮询每 5ms 一次；计数停止增长即已阻塞在暂停检查点上。
+        paused = False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            snapshot = browser.poll_count
+            time.sleep(0.15)
+            if browser.poll_count == snapshot:
+                paused = True
+                break
+        assert paused
+        worker.request_abandon()
+        thread.join(timeout=3000)
+    finally:
+        worker.request_abandon()  # 兜底解除可能的阻塞
+        thread.join(timeout=3000)
+
+    assert not thread.is_alive()
+    assert events == []
+    assert browser.cancel_callbacks[0].preserve_session is True  # type: ignore[attr-defined]
+
+
+def test_upload_worker_abandon_suppresses_error_event_race(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """关闭 abandon 与网络错误的竞态：FileBrowserError 也不发 failed/
+    cancelled——会话已由服务层按 preserve 语义标记，行保持原状态。"""
+
+    class _FailingBrowser:
+        def upload_file(
+            self,
+            parent_id: str,
+            local_path: Path,
+            *,
+            upload_name: str | None = None,
+            progress_callback: object = None,
+            cancel_requested: object = None,
+        ) -> WopanItem:
+            assert callable(cancel_requested)
+            while not cancel_requested():
+                time.sleep(0.005)
+            raise FileBrowserError("网络异常")
+
+    worker = main_window_module.UploadWorker(_FailingBrowser(), "cloud-1", tmp_path / "f.bin", "t1")
+    events: list[tuple[str, str]] = []
+    worker.cancelled.connect(lambda task_id: events.append(("cancelled", task_id)))
+    worker.failed.connect(lambda message, task_id: events.append(("failed", task_id)))
+    worker.succeeded.connect(lambda item, task_id: events.append(("succeeded", task_id)))
+
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not any(
+            cb is not None for cb in (worker._cancel_hook,)
+        ):
+            time.sleep(0.005)
+        worker.request_abandon()
+        thread.join(timeout=3000)
+    finally:
+        worker.request_abandon()
+        thread.join(timeout=3000)
+
+    assert not thread.is_alive()
+    assert events == []
+
+
+def test_upload_worker_abandon_suppresses_login_required_race(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """关闭 abandon 与登录过期的竞态：不发 login_required——行保持原状态，
+    重启后续传时服务层会再次报登录过期。"""
+
+    class _LoginExpiredBrowser:
+        def upload_file(
+            self,
+            parent_id: str,
+            local_path: Path,
+            *,
+            upload_name: str | None = None,
+            progress_callback: object = None,
+            cancel_requested: object = None,
+        ) -> WopanItem:
+            assert callable(cancel_requested)
+            while not cancel_requested():
+                time.sleep(0.005)
+            raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
+
+    worker = main_window_module.UploadWorker(
+        _LoginExpiredBrowser(), "cloud-1", tmp_path / "f.bin", "t1"
+    )
+    login_events: list[str] = []
+    worker.login_required.connect(lambda message, task_id: login_events.append(message))
+    cancelled: list[str] = []
+    worker.cancelled.connect(cancelled.append)
+
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and worker._cancel_hook is None:
+            time.sleep(0.005)
+        worker.request_abandon()
+        thread.join(timeout=3000)
+    finally:
+        worker.request_abandon()
+        thread.join(timeout=3000)
+
+    assert not thread.is_alive()
+    assert login_events == []
+    assert cancelled == []
 
 
 def test_close_window_closes_scheduler_without_waiting_on_gui_thread(
@@ -1410,7 +1655,7 @@ def test_close_window_stuck_thread_exits_subprocess() -> None:
     # a cooperative flag once the window is gone. Old code (no detach) aborted
     # with qFatal while destroying the still-running parented thread; the fix
     # must let the window close and the process exit with status 0.
-    script = r'''
+    script = r"""
 import os
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -1452,12 +1697,12 @@ def shutdown():
 
 QTimer.singleShot(0, shutdown)
 raise SystemExit(app.exec())
-'''
+"""
     env = os.environ.copy()
     src_path = Path(__file__).resolve().parents[1] / "src"
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(src_path), env.get("PYTHONPATH", "")]
-    ).rstrip(os.pathsep)
+    env["PYTHONPATH"] = os.pathsep.join([str(src_path), env.get("PYTHONPATH", "")]).rstrip(
+        os.pathsep
+    )
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=Path(__file__).resolve().parents[1],
@@ -1472,8 +1717,7 @@ raise SystemExit(app.exec())
 
 
 def test_background_download_updates_records_and_clears_task(
-    qapp: QApplication,
-    sync_threads: None, tmp_path: Path
+    qapp: QApplication, sync_threads: None, tmp_path: Path
 ) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
@@ -1490,8 +1734,7 @@ def test_background_download_updates_records_and_clears_task(
 
 
 def test_background_download_failure_marks_record_failed(
-    qapp: QApplication,
-    sync_threads: None, tmp_path: Path
+    qapp: QApplication, sync_threads: None, tmp_path: Path
 ) -> None:
     browser = WorkerFileBrowser(download_error=FileBrowserError("network down"))
     window = MainWindow(browser)
@@ -1518,8 +1761,10 @@ def test_background_download_unexpected_failure_clears_real_thread(
 
     assert _wait_until(
         qapp,
-        lambda: bool(window.transfer_interface.download_records)
-        and window.transfer_interface.download_records[0].status == "失败",
+        lambda: (
+            bool(window.transfer_interface.download_records)
+            and window.transfer_interface.download_records[0].status == "失败"
+        ),
     )
     assert _wait_until(qapp, lambda: window._download_thread is None)
     assert window.transfer_interface.download_records[0].error == "disk full"
@@ -1527,8 +1772,7 @@ def test_background_download_unexpected_failure_clears_real_thread(
 
 
 def test_background_download_login_required_emits_signal(
-    qapp: QApplication,
-    sync_threads: None, tmp_path: Path
+    qapp: QApplication, sync_threads: None, tmp_path: Path
 ) -> None:
     messages: list[str] = []
     browser = WorkerFileBrowser(
@@ -1546,8 +1790,7 @@ def test_background_download_login_required_emits_signal(
 
 
 def test_background_upload_updates_records_and_refreshes(
-    qapp: QApplication,
-    sync_threads: None, tmp_path: Path
+    qapp: QApplication, sync_threads: None, tmp_path: Path
 ) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
@@ -1570,8 +1813,7 @@ def test_background_upload_updates_records_and_refreshes(
 
 
 def test_background_upload_failure_marks_record_failed(
-    qapp: QApplication,
-    sync_threads: None, tmp_path: Path
+    qapp: QApplication, sync_threads: None, tmp_path: Path
 ) -> None:
     browser = WorkerFileBrowser()
     browser.upload_file = lambda parent_id, local_path, **_kwargs: (_ for _ in ()).throw(
@@ -1607,9 +1849,7 @@ def _record_update_thread_ids(window: MainWindow) -> tuple[list[int], int]:
     return observed, gui_thread_id
 
 
-def test_background_upload_updates_ui_on_gui_thread(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_background_upload_updates_ui_on_gui_thread(qapp: QApplication, tmp_path: Path) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     local_path = tmp_path / "upload.txt"
@@ -1623,9 +1863,7 @@ def test_background_upload_updates_ui_on_gui_thread(
     assert observed == [gui_thread_id] * len(observed)
 
 
-def test_folder_prepare_updates_ui_on_gui_thread(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_folder_prepare_updates_ui_on_gui_thread(qapp: QApplication, tmp_path: Path) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -1636,17 +1874,17 @@ def test_folder_prepare_updates_ui_on_gui_thread(
 
     assert _wait_until(
         qapp,
-        lambda: window._folder_prepare_thread is None
-        and window._folder_upload_active is None
-        and window._folder_upload_queue == []
-        and len(observed) >= 3,
+        lambda: (
+            window._folder_prepare_thread is None
+            and window._folder_upload_record_id is None
+            and not window._upload_pending
+            and len(observed) >= 3
+        ),
     )
     assert observed == [gui_thread_id] * len(observed)
 
 
-def test_background_download_updates_ui_on_gui_thread(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_background_download_updates_ui_on_gui_thread(qapp: QApplication, tmp_path: Path) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -1753,8 +1991,7 @@ def test_cancel_download_signal_cancels_control_and_record(qapp: QApplication) -
 
 
 def test_resume_download_restarts_task_from_registered_item(
-    qapp: QApplication,
-    sync_threads: None, tmp_path: Path
+    qapp: QApplication, sync_threads: None, tmp_path: Path
 ) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
@@ -1808,15 +2045,12 @@ def test_resume_download_edge_cases(
 
 
 def test_resume_download_finds_displayed_item_by_name(
-    qapp: QApplication,
-    sync_threads: None, tmp_path: Path
+    qapp: QApplication, sync_threads: None, tmp_path: Path
 ) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
-    _register_download_task(
-        window, "download-1", target_path=tmp_path / "report.txt", item=None
-    )
+    _register_download_task(window, "download-1", target_path=tmp_path / "report.txt", item=None)
 
     window._resume_download_task("download-1")
 
@@ -2008,9 +2242,7 @@ def test_download_with_callbacks_without_browser_returns(
     assert window.status_message() == "请先登录"
 
 
-def test_upload_progress_updates_transfer_record(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_upload_progress_updates_transfer_record(qapp: QApplication, tmp_path: Path) -> None:
     window = MainWindow(WorkerFileBrowser())
     task_id = window._create_upload_record(tmp_path / "upload.bin", size=10)
 
@@ -2020,7 +2252,6 @@ def test_upload_progress_updates_transfer_record(
     assert record is not None
     assert record.bytes_done == 4
     assert record.total_bytes == 10
-
 
     window = MainWindow(WorkerFileBrowser())
     window._create_upload_record(Path("/tmp/upload.txt"))
@@ -2192,9 +2423,7 @@ def stub_move_dialog(monkeypatch: pytest.MonkeyPatch):
     return _StubTargetDialog
 
 
-def test_prompt_create_folder_uses_dialog_result(
-    qapp: QApplication, stub_name_dialog
-) -> None:
+def test_prompt_create_folder_uses_dialog_result(qapp: QApplication, stub_name_dialog) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     stub_name_dialog.stub_text = "Created"
@@ -2206,9 +2435,7 @@ def test_prompt_create_folder_uses_dialog_result(
     assert stub_name_dialog.instances[0].title == "新建文件夹"
 
 
-def test_prompt_create_folder_cancelled_does_nothing(
-    qapp: QApplication, stub_name_dialog
-) -> None:
+def test_prompt_create_folder_cancelled_does_nothing(qapp: QApplication, stub_name_dialog) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -2219,9 +2446,7 @@ def test_prompt_create_folder_cancelled_does_nothing(
     assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
-def test_prompt_rename_item_uses_dialog_result(
-    qapp: QApplication, stub_name_dialog
-) -> None:
+def test_prompt_rename_item_uses_dialog_result(qapp: QApplication, stub_name_dialog) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     stub_name_dialog.stub_text = "renamed.txt"
@@ -2241,9 +2466,7 @@ def test_prompt_rename_item_ignores_missing_row(qapp: QApplication, stub_name_di
     assert stub_name_dialog.instances == []
 
 
-def test_prompt_delete_item_confirmed_deletes_row(
-    qapp: QApplication, stub_message_box
-) -> None:
+def test_prompt_delete_item_confirmed_deletes_row(qapp: QApplication, stub_message_box) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -2255,9 +2478,7 @@ def test_prompt_delete_item_confirmed_deletes_row(
     assert [item.name for item in window.displayed_items()] == ["report.txt"]
 
 
-def test_prompt_delete_item_cancelled_keeps_row(
-    qapp: QApplication, stub_message_box
-) -> None:
+def test_prompt_delete_item_cancelled_keeps_row(qapp: QApplication, stub_message_box) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -2268,9 +2489,7 @@ def test_prompt_delete_item_cancelled_keeps_row(
     assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
-def test_prompt_delete_item_ignores_missing_row(
-    qapp: QApplication, stub_message_box
-) -> None:
+def test_prompt_delete_item_ignores_missing_row(qapp: QApplication, stub_message_box) -> None:
     window = MainWindow(WorkerFileBrowser())
 
     window.prompt_delete_item(9)
@@ -2297,9 +2516,7 @@ def test_prompt_delete_items_batches_all_selected_rows(
     assert window.displayed_items() == ()
 
 
-def test_prompt_delete_item_batches_full_selection(
-    qapp: QApplication, stub_message_box
-) -> None:
+def test_prompt_delete_item_batches_full_selection(qapp: QApplication, stub_message_box) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -2329,9 +2546,7 @@ def test_prompt_delete_item_outside_selection_deletes_only_clicked_row(
     assert [item.name for item in window.displayed_items()] == ["Folder"]
 
 
-def test_prompt_move_item_batches_all_selected_rows(
-    qapp: QApplication, stub_move_dialog
-) -> None:
+def test_prompt_move_item_batches_all_selected_rows(qapp: QApplication, stub_move_dialog) -> None:
     browser = WorkerFileBrowser()
     browser.items_by_parent[ROOT_DIRECTORY_ID].append(
         WopanItem(
@@ -2472,9 +2687,7 @@ def test_update_operation_controls_disables_delete_without_selection(
     assert not delete_button.isEnabled()
 
 
-def test_prompt_move_item_moves_to_selected_entry(
-    qapp: QApplication, stub_move_dialog
-) -> None:
+def test_prompt_move_item_moves_to_selected_entry(qapp: QApplication, stub_move_dialog) -> None:
     browser = WorkerFileBrowser()
     browser.items_by_parent["target-folder"] = []
     window = MainWindow(browser)
@@ -2500,9 +2713,7 @@ def test_prompt_move_item_without_selection_does_nothing(
     assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
-def test_prompt_move_item_cancelled_does_nothing(
-    qapp: QApplication, stub_move_dialog
-) -> None:
+def test_prompt_move_item_cancelled_does_nothing(qapp: QApplication, stub_move_dialog) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -2515,9 +2726,7 @@ def test_prompt_move_item_cancelled_does_nothing(
     assert [item.name for item in window.displayed_items()] == ["Folder", "report.txt"]
 
 
-def test_prompt_move_item_ignores_missing_row(
-    qapp: QApplication, stub_move_dialog
-) -> None:
+def test_prompt_move_item_ignores_missing_row(qapp: QApplication, stub_move_dialog) -> None:
     window = MainWindow(WorkerFileBrowser())
 
     window.prompt_move_item(3)
@@ -2554,9 +2763,7 @@ def stub_conflict_dialog(monkeypatch: pytest.MonkeyPatch):
     return _StubConflictDialog
 
 
-def test_prompt_copy_item_copies_selected_row(
-    qapp: QApplication, stub_move_dialog
-) -> None:
+def test_prompt_copy_item_copies_selected_row(qapp: QApplication, stub_move_dialog) -> None:
     browser = WorkerFileBrowser()
     browser.items_by_parent["target-folder"] = []
     window = MainWindow(browser)
@@ -2686,9 +2893,7 @@ def test_transfer_check_all_conflicts_skipped_shows_hint(
     assert [item.name for item in browser.items_by_parent["target-folder"]] == ["report.txt"]
 
 
-def test_transfer_check_reports_listing_failure(
-    qapp: QApplication, stub_move_dialog
-) -> None:
+def test_transfer_check_reports_listing_failure(qapp: QApplication, stub_move_dialog) -> None:
     class _CheckErrorBrowser(WorkerFileBrowser):
         def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
             if parent_id == "target-folder":
@@ -2718,9 +2923,7 @@ def test_target_dialog_receives_folder_only_listings(qapp: QApplication) -> None
     )
     dialog.directory_requested.connect(window._on_target_directory_requested)
     window._target_dialog = dialog
-    dialog._enter(
-        main_window_module.TargetEntry(item_id="folder-1", name="Folder")
-    )
+    dialog._enter(main_window_module.TargetEntry(item_id="folder-1", name="Folder"))
 
     assert dialog._folder_list.count() == 0
     assert [entry.item_id for entry in dialog._path] == [ROOT_DIRECTORY_ID, "folder-1"]
@@ -2787,9 +2990,7 @@ def test_target_dialog_ignores_requests_while_dialog_closed(qapp: QApplication) 
     assert window._target_load_thread is None
 
 
-def test_prompt_logout_confirmed_emits_logout(
-    qapp: QApplication, stub_message_box
-) -> None:
+def test_prompt_logout_confirmed_emits_logout(qapp: QApplication, stub_message_box) -> None:
     requested: list[bool] = []
     window = MainWindow(WorkerFileBrowser())
     window.logout_requested.connect(lambda: requested.append(True))
@@ -2801,9 +3002,7 @@ def test_prompt_logout_confirmed_emits_logout(
     assert stub_message_box.instances[0].deleted
 
 
-def test_prompt_logout_cancelled_keeps_session(
-    qapp: QApplication, stub_message_box
-) -> None:
+def test_prompt_logout_cancelled_keeps_session(qapp: QApplication, stub_message_box) -> None:
     requested: list[bool] = []
     window = MainWindow(WorkerFileBrowser())
     window.logout_requested.connect(lambda: requested.append(True))
@@ -2996,7 +3195,8 @@ def test_overlapping_download_submissions_keep_both_threads_tracked(
     assert _wait_until(qapp, lambda: len(window.transfer_interface.download_records) == 2)
     assert _wait_until(qapp, lambda: not window._download_submit_threads)
     assert {record.task_id for record in window.transfer_interface.download_records} == {
-        "first", "second"
+        "first",
+        "second",
     }
     assert submitted == [
         ("first", tmp_path / "report.txt"),
@@ -3173,7 +3373,7 @@ class FakeMenu:
             self._actions.append(args[0])
         else:
             action = SimpleNamespace()
-            action.text = (lambda text: (lambda: text))(args[0])
+            action.text = (lambda text: lambda: text)(args[0])
             if len(args) > 1 and callable(args[1]):
                 # 捕获菜单项绑定的回调，测试可用 action.trigger() 模拟点击。
                 action.trigger = args[1]
@@ -3252,9 +3452,7 @@ def test_context_menu_refresh_forces_refetch_despite_cache(
 
 
 def test_name_input_dialog_accepts_non_empty_text_only(qapp: QApplication) -> None:
-    dialog = NameInputDialog(
-        title="新建文件夹", hint="请输入文件夹名称", default_text="新建文件夹"
-    )
+    dialog = NameInputDialog(title="新建文件夹", hint="请输入文件夹名称", default_text="新建文件夹")
     assert dialog.name_text() == "新建文件夹"
 
     dialog._name_input.setText("  valid  ")
@@ -3287,9 +3485,7 @@ def test_download_folder_click_updates_settings_when_folder_selected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     browser = WorkerFileBrowser()
-    window = MainWindow(
-        browser, settings=AppSettings(default_download_path=tmp_path)
-    )
+    window = MainWindow(browser, settings=AppSettings(default_download_path=tmp_path))
     new_folder = tmp_path / "new-downloads"
     new_folder.mkdir()
     monkeypatch.setattr(main_window_module, "QFileDialog", FakeFileDialog)
@@ -3324,9 +3520,7 @@ def test_open_log_file_and_settings_folder_launch_desktop_service(
     log_path = tmp_path / "openwopan.log"
     settings_path = tmp_path / "settings.json"
     window = MainWindow(settings_path=settings_path, log_path=log_path)
-    monkeypatch.setattr(
-        main_window_module.QDesktopServices, "openUrl", staticmethod(opened.append)
-    )
+    monkeypatch.setattr(main_window_module.QDesktopServices, "openUrl", staticmethod(opened.append))
 
     window.setting_interface.open_log_file_card.clicked.emit()
     window.setting_interface.open_settings_folder_card.clicked.emit()
@@ -3379,12 +3573,16 @@ def test_transfer_filters_narrow_visible_records(qapp: QApplication) -> None:
     transfer.add_download_record(_make_record("d-2", status="失败"))
     transfer.add_download_record(_make_record("d-3", status="下载中"))
 
-    transfer._on_download_filter_changed("已完成")
+    transfer.download_filter_combo.setCurrentIndex(
+        main_window_module.DOWNLOAD_STATUS_FILTERS.index("已完成")
+    )
 
     assert transfer.download_table.rowCount() == 1
     assert transfer.download_table.item(0, 0).text() == "d-1.txt"
 
-    transfer._on_upload_filter_changed("失败")
+    transfer.upload_filter_combo.setCurrentIndex(
+        main_window_module.UPLOAD_STATUS_FILTERS.index("失败")
+    )
     assert transfer.upload_table.rowCount() == 0
 
 
@@ -3421,6 +3619,49 @@ def test_transfer_update_record_computes_speed_and_terminal_state(qapp: QApplica
     assert transfer._find_record("upload", "missing-task") is None
 
 
+def test_transfer_name_item_carries_full_name_tooltip(qapp: QApplication) -> None:
+    """名称单元格挂全名 tooltip：省略显示时悬停仍能看到完整文件名。"""
+    transfer = TransferInterface()
+    full_name = "[Group] Some Series [01][Ma10p_1080p][x265_flac].mkv"
+    transfer.add_upload_record(
+        _make_record("u-tip", direction="upload", name=full_name, status="等待中")
+    )
+
+    item = transfer.upload_table.item(0, 0)
+    assert item.text() == full_name
+    assert item.toolTip() == full_name
+
+
+def test_transfer_resize_refreshes_table_viewports(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """几何变化必须强制重绘两个传输表视口：名称列省略点按"绘制时"列宽
+    计算，窗口变宽后若不重绘，省略号会停在旧位置浪费右侧空间（真机
+    2026-10-07）。"""
+    transfer = TransferInterface()
+    transfer.add_upload_record(_make_record("u-1", direction="upload", status="等待中"))
+    updated: list[object] = []
+    for table in (transfer.upload_table, transfer.download_table):
+        original_update = table.viewport().update
+
+        def make_spy(t=table, original_update=original_update):
+            def _update() -> None:
+                updated.append(t)
+                original_update()
+
+            return _update
+
+        monkeypatch.setattr(table.viewport(), "update", make_spy())
+
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QResizeEvent
+
+    transfer.resizeEvent(QResizeEvent(QSize(800, 600), QSize(900, 600)))
+
+    assert transfer.upload_table in updated
+    assert transfer.download_table in updated
+
+
 def test_transfer_update_record_coalesces_progress_renders(
     qapp: QApplication, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3440,7 +3681,8 @@ def test_transfer_update_record_coalesces_progress_renders(
         transfer,
         "_render_table",
         lambda table, records, direction: (
-            render_calls.append(direction), original_render(table, records, direction)
+            render_calls.append(direction),
+            original_render(table, records, direction),
         )[1],
     )
 
@@ -3547,7 +3789,8 @@ def test_main_window_download_events_coalesce_progress_and_connections(
 
 @pytest.mark.parametrize("width", [800, 900])
 def test_download_action_buttons_keep_geometry_during_progress(
-    qapp: QApplication, width: int,
+    qapp: QApplication,
+    width: int,
 ) -> None:
     transfer = TransferInterface()
     transfer.resize(width, 500)
@@ -3581,8 +3824,7 @@ def test_download_action_buttons_keep_geometry_during_progress(
     assert table.cellWidget(1, 5) is widgets[1]
     assert table.cellWidget(2, 5) is widgets[2]
     resume_button = next(
-        child for child in table.cellWidget(0, 5).findChildren(QWidget)
-        if child.toolTip() == "继续"
+        child for child in table.cellWidget(0, 5).findChildren(QWidget) if child.toolTip() == "继续"
     )
     assert resume_button.isEnabled()
 
@@ -3711,13 +3953,12 @@ def test_transfer_batch_pause_and_resume_emit_only_eligible_selected_rows(
         _make_record("u-active", direction="upload", status="上传中", upload_retryable=True)
     )
     transfer.add_upload_record(
-        _make_record("u-paused", direction="upload", status="已暂停", upload_retryable=True,
-                     can_resume=True)
+        _make_record(
+            "u-paused", direction="upload", status="已暂停", upload_retryable=True, can_resume=True
+        )
     )
     transfer.add_download_record(_make_record("d-active", status="下载中"))
-    transfer.add_download_record(
-        _make_record("d-paused", status="已暂停", can_resume=True)
-    )
+    transfer.add_download_record(_make_record("d-paused", status="已暂停", can_resume=True))
 
     transfer.upload_table.selectAll()
     transfer._request_pause_selected("upload")
@@ -3758,6 +3999,729 @@ def test_main_window_batch_upload_controls_active_worker(qapp: QApplication) -> 
     assert record.status == "上传中" and not record.can_resume
 
 
+def test_pause_restored_waiting_upload_row_without_queue_entry(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """重启恢复的「等待中」行不在任何内存队列：暂停仍生效并可继续。
+
+    回归（UAT 2026-10-06）：崩溃恢复后 158 个等待行无 worker/pending/
+    folder-queue 归属，暂停按钮此前静默无效果。
+    """
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "restored.txt"
+    local_path.write_text("data")
+    task_id = window._create_upload_record(
+        local_path,
+        parent_id="cloud-root",
+        upload_name="restored.txt",
+        retryable=True,
+    )
+
+    window._pause_selected_uploads({task_id})
+
+    record = window.transfer_interface._find_record("upload", task_id)
+    assert record is not None
+    assert record.status == "已暂停" and record.can_resume
+    assert task_id in window._paused_uploads
+
+    # sync_threads 使 worker 同步跑完：断言行为结果而非 worker 存活
+    window._resume_selected_uploads({task_id})
+    assert record.status == "已完成"
+    assert ("cloud-root", local_path) in browser.uploaded_files
+
+
+def test_history_restore_normalizes_non_terminal_upload_rows(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """重启恢复：非终态上传历史行归一为「已暂停」，不再显示僵尸状态。"""
+    window = MainWindow(WorkerFileBrowser())
+    (tmp_path / "ep01.mkv").write_bytes(b"x" * 10)
+    (tmp_path / "ep02.mkv").write_bytes(b"x" * 10)
+    (tmp_path / "done.mkv").write_bytes(b"x" * 10)
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=tmp_path / "ep01.mkv",
+                status="上传中",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+            TransferRecord(
+                task_id="upload-2",
+                direction="upload",
+                name="ep02.mkv",
+                size=10,
+                target_path=tmp_path / "ep02.mkv",
+                status="等待中",
+                upload_parent_id="cloud-1",
+                upload_name="ep02.mkv",
+                upload_retryable=True,
+            ),
+            TransferRecord(
+                task_id="upload-3",
+                direction="upload",
+                name="done.mkv",
+                size=10,
+                target_path=tmp_path / "done.mkv",
+                status="已完成",
+            ),
+        )
+    )
+
+    statuses = {r.task_id: r.status for r in window.transfer_interface.upload_records}
+    assert statuses == {
+        "upload-1": "已暂停",
+        "upload-2": "已暂停",
+        "upload-3": "已完成",
+    }
+    paused = window.transfer_interface._find_record("upload", "upload-1")
+    assert paused is not None and paused.can_resume
+
+
+def test_upload_session_recovery_merges_into_restored_history_row(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """会话恢复与归一化历史行同文件合并：无双行、带断点信息、不自动续传。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=local_path,
+                status="上传中",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+    session = UploadTaskRecord(
+        task_id="abc123hash",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="已暂停",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="应用中断，已暂停（已完成 3/5 分片）",
+        resumable=True,
+    )
+
+    window._on_upload_recovery_succeeded((session,))
+
+    rows = [r for r in window.transfer_interface.upload_records if r.target_path == local_path]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.task_id == "upload-1"
+    assert row.status == "已暂停" and row.can_resume and row.upload_retryable
+    assert "3/5" in row.error
+    assert browser.uploaded_files == []  # was_active=False：不自动续传
+
+
+def test_history_ghost_row_dropped_when_session_row_already_present(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """会话恢复先到时，同文件的历史僵尸行被丢弃，不产生双行。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    session = UploadTaskRecord(
+        task_id="hash1",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="已暂停",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="应用中断，已暂停（已完成 3/5 分片）",
+        resumable=True,
+    )
+    window._on_upload_recovery_succeeded((session,))
+
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-9",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=local_path,
+                status="上传中",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+
+    rows = [r for r in window.transfer_interface.upload_records if r.target_path == local_path]
+    assert len(rows) == 1 and rows[0].task_id == "hash1"
+    assert "upload-9" not in {r.task_id for r in window.transfer_interface.upload_records}
+
+
+def test_history_failed_row_folded_when_failed_session_row_already_present(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """失败会话行先到时（装载顺序不定），同文件的失败历史行折叠进会话行，
+    不产生第二行失败；错误去重拼接。
+
+    回归：Trinity_14 在会话恢复先到时出现「upload-39 + 哈希 id」双失败行，
+    根因是 _find_upload_row_by_target 只匹配非终态行。
+    """
+    window = MainWindow(WorkerFileBrowser())
+    local_path = tmp_path / "ep14.mkv"
+    local_path.write_bytes(b"x" * 10)
+    session = UploadTaskRecord(
+        task_id="hash14",
+        name="ep14.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="失败",
+        completed_parts=40,
+        total_parts=41,
+        file_size=10,
+        upload_name="ep14.mkv",
+        error="HTTP 500",
+        resumable=True,
+    )
+    window._on_upload_recovery_succeeded((session,))
+
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-39",
+                direction="upload",
+                name="ep14.mkv",
+                size=10,
+                target_path=local_path,
+                status="失败",
+                error="HTTP 500",
+                upload_parent_id="cloud-1",
+                upload_name="ep14.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+
+    rows = [r for r in window.transfer_interface.upload_records if r.target_path == local_path]
+    assert len(rows) == 1 and rows[0].task_id == "hash14"
+    assert rows[0].status == "失败" and rows[0].error == "HTTP 500"
+    assert "upload-39" not in {r.task_id for r in window.transfer_interface.upload_records}
+
+
+def test_history_download_rows_normalized_when_recovery_failed(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """离线启动（下载恢复已失败）后到达的历史下载行：非终态归一为
+    可恢复的「已暂停」，与 _on_download_recovery_failed 顺序无关。"""
+    window = MainWindow(WorkerFileBrowser())
+    window._download_recovery_failed = True
+
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="download-3",
+                direction="download",
+                name="a.bin",
+                size=10,
+                target_path=tmp_path / "a.bin",
+                status="下载中",
+            ),
+            TransferRecord(
+                task_id="download-4",
+                direction="download",
+                name="b.bin",
+                size=10,
+                target_path=tmp_path / "b.bin",
+                status="已完成",
+            ),
+        )
+    )
+
+    live = window.transfer_interface._find_record("download", "download-3")
+    assert live is not None and live.status == "已暂停" and live.can_resume
+    assert "恢复下载任务失败" in live.error
+    done = window.transfer_interface._find_record("download", "download-4")
+    assert done is not None and done.status == "已完成"
+
+
+def test_relogin_resets_download_recovery_guard(qapp: QApplication, sync_threads: None) -> None:
+    """重新登录（更换 backend）重置下载恢复守卫：新调度器不认识旧持久化
+    任务，必须重跑恢复，否则暂停/继续/取消全部 KeyError 直到重启。"""
+    window = MainWindow(WorkerFileBrowser())
+    window._download_recovery_done = True
+    same_browser = WorkerFileBrowser()
+    window._file_browser = same_browser
+
+    window.set_file_browser(same_browser)
+    window.set_file_browser(same_browser)
+    assert window._download_recovery_done is True
+
+    window.set_file_browser(WorkerFileBrowser())
+    assert window._download_recovery_done is False
+
+
+def test_download_recovery_reruns_when_relogin_beats_inflight_thread(
+    qapp: QApplication, sync_threads: None
+) -> None:
+    """恢复线程飞行途中重新登录（守卫已重置、旧线程刚收尾）：补跑恢复，
+    让新调度器认领持久化任务；关闭途中不补跑。"""
+
+    class RecoverDownloadsBrowser(WorkerFileBrowser):
+        def recover_downloads(self) -> tuple[object, ...]:
+            return ()
+
+    window = MainWindow(RecoverDownloadsBrowser())
+    window._download_recovery_done = False  # set_file_browser 重置过
+
+    window._clear_download_recovery()
+
+    assert window._download_recovery_done is True
+    assert window._download_recovery_thread is None
+
+    window._download_recovery_done = False
+    window._closing = True
+    window._clear_download_recovery()
+    assert window._download_recovery_done is False
+    window._closing = False
+
+
+def test_active_upload_session_auto_resumes_after_restart(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """死前「进行中」的会话重启后自动续传（与下载侧恢复语义对齐）。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=local_path,
+                status="上传中",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+    session = UploadTaskRecord(
+        task_id="abc123hash",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="已暂停",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="应用中断，已暂停（已完成 3/5 分片）",
+        resumable=True,
+        was_active=True,
+    )
+
+    window._on_upload_recovery_succeeded((session,))
+
+    record = window.transfer_interface._find_record("upload", "upload-1")
+    assert record is not None and record.status == "已完成"
+    assert ("cloud-1", local_path) in browser.uploaded_files
+
+
+def test_resume_folder_summary_row_is_guarded(qapp: QApplication, tmp_path: Path) -> None:
+    """文件夹汇总行（重启后归一为已暂停）继续时被守卫：不报错、不标失败。"""
+    window = MainWindow(WorkerFileBrowser())
+    folder = tmp_path / "已看完"
+    folder.mkdir()
+    task_id = window._create_upload_record(folder, name="已看完", parent_id="cloud-root")
+    window.transfer_interface.update_record("upload", task_id, status="已暂停", can_resume=True)
+
+    window._resume_selected_uploads({task_id})
+
+    record = window.transfer_interface._find_record("upload", task_id)
+    assert record is not None and record.status == "已暂停"
+    assert "文件夹汇总" in window.status_message()
+
+
+def test_upload_session_recovery_folds_into_failed_history_row(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """失败历史行 × 残留会话（历史先到）：折叠进失败行，不产生双行。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="ep01.mkv",
+                size=10,
+                target_path=local_path,
+                status="失败",
+                error="HTTP 500",
+                upload_parent_id="cloud-1",
+                upload_name="ep01.mkv",
+                upload_retryable=True,
+            ),
+        )
+    )
+    session = UploadTaskRecord(
+        task_id="hash1",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="失败",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="HTTP 500",
+        resumable=True,
+    )
+
+    window._on_upload_recovery_succeeded((session,))
+
+    rows = [r for r in window.transfer_interface.upload_records if r.target_path == local_path]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.task_id == "upload-1"
+    assert row.status == "失败" and row.upload_retryable  # 保留失败态与重试按钮
+
+
+def test_upload_session_recovery_skips_user_active_row(qapp: QApplication, tmp_path: Path) -> None:
+    """用户本会话正在上传同一目标时，会话恢复不覆盖活动行、不新增行。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    local_path = tmp_path / "ep01.mkv"
+    local_path.write_bytes(b"x" * 10)
+    task_id = window._create_upload_record(
+        local_path, parent_id="cloud-1", upload_name="ep01.mkv", retryable=True
+    )
+    window.transfer_interface.update_record("upload", task_id, status="上传中")
+    session = UploadTaskRecord(
+        task_id="hash1",
+        name="ep01.mkv",
+        local_path=local_path,
+        target_parent_id="cloud-1",
+        status="已暂停",
+        completed_parts=3,
+        total_parts=5,
+        file_size=10,
+        upload_name="ep01.mkv",
+        error="应用中断，已暂停（已完成 3/5 分片）",
+        resumable=True,
+        was_active=True,
+    )
+
+    window._on_upload_recovery_succeeded((session,))
+
+    rows = [r for r in window.transfer_interface.upload_records if r.target_path == local_path]
+    assert len(rows) == 1
+    assert rows[0].task_id == task_id
+    assert rows[0].status == "上传中"  # 活动行未被改写成已暂停
+
+
+def test_history_normalization_marks_file_rows_resumable_only(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """归一化：文件行补 upload_retryable 可续传；文件夹汇总行保持不可续传。"""
+    window = MainWindow(WorkerFileBrowser())
+    file_path = tmp_path / "a.mkv"
+    file_path.write_bytes(b"x")
+    folder = tmp_path / "汇总"
+    folder.mkdir()
+    window._on_transfer_history_loaded(
+        (
+            TransferRecord(
+                task_id="upload-1",
+                direction="upload",
+                name="a.mkv",
+                size=1,
+                target_path=file_path,
+                status="等待中",
+                upload_parent_id="cloud-1",
+                upload_name="a.mkv",
+                upload_retryable=False,
+            ),
+            TransferRecord(
+                task_id="upload-2",
+                direction="upload",
+                name="汇总",
+                size=0,
+                target_path=folder,
+                status="创建目录中",
+                upload_parent_id="cloud-root",
+            ),
+        )
+    )
+
+    file_row = window.transfer_interface._find_record("upload", "upload-1")
+    dir_row = window.transfer_interface._find_record("upload", "upload-2")
+    assert file_row is not None
+    assert file_row.status == "已暂停"
+    assert file_row.upload_retryable and file_row.can_resume
+    assert dir_row is not None
+    assert dir_row.status == "已暂停"
+    assert not dir_row.upload_retryable and not dir_row.can_resume
+
+
+def test_upload_recovery_runs_once_per_session(qapp: QApplication) -> None:
+    """重新登录会再次触发恢复入口：一次性守卫防二次改写与重复建行。"""
+
+    class _RecoverBrowser(WorkerFileBrowser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recover_calls = 0
+
+        def recover_uploads(self) -> tuple[UploadTaskRecord, ...]:
+            self.recover_calls += 1
+            return ()
+
+    browser = _RecoverBrowser()
+    window = MainWindow(browser)
+
+    window._recover_uploads()
+    window._upload_recovery_thread = None  # 同步线程已清理，模拟回到空闲
+    window._recover_uploads()
+
+    assert browser.recover_calls == 1
+    assert window._upload_recovery_done
+
+
+def test_download_recovery_runs_once_per_session(qapp: QApplication) -> None:
+    """下载恢复的一次性守卫：重新登录路径不二次入队（上传侧对等）。"""
+
+    class _RecoverDownloadBrowser(WorkerFileBrowser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recover_calls = 0
+
+        def recover_downloads(self) -> tuple[object, ...]:
+            self.recover_calls += 1
+            return ()
+
+    browser = _RecoverDownloadBrowser()
+    window = MainWindow(browser)
+
+    window._recover_downloads()
+    window._download_recovery_thread = None  # 同步线程已清理，模拟回到空闲
+    window._recover_downloads()
+
+    assert browser.recover_calls == 1
+    assert window._download_recovery_done
+
+
+def test_set_file_browser_closes_old_backend_downloads(qapp: QApplication) -> None:
+    """替换 backend（重新登录）时协作关闭旧下载调度器，防双执行器。"""
+
+    class _ClosingBrowser(WorkerFileBrowser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls: list[bool] = []
+
+        def close_downloads(self, *, wait: bool = True) -> None:
+            self.close_calls.append(wait)
+
+    old_browser = _ClosingBrowser()
+    window = MainWindow(old_browser)
+
+    window.set_file_browser(_ClosingBrowser())
+
+    assert old_browser.close_calls == [False]
+
+
+def test_download_recovery_failure_normalizes_zombie_rows(qapp: QApplication) -> None:
+    """下载恢复失败：历史里的非终态行归一为可恢复暂停态，不留僵尸「下载中」。"""
+    window = MainWindow(WorkerFileBrowser())
+    window.transfer_interface.add_download_record(
+        TransferRecord(
+            task_id="dl-1",
+            direction="download",
+            name="x.bin",
+            size=10,
+            target_path=Path("/tmp/x.bin"),
+            status="下载中",
+        )
+    )
+
+    window._on_download_recovery_failed("存储不可用")
+
+    record = window.transfer_interface._find_record("download", "dl-1")
+    assert record is not None
+    assert record.status == "已暂停" and record.can_resume
+    assert "存储不可用" in record.error
+
+
+def test_download_recovery_replays_pending_events(qapp: QApplication) -> None:
+    """恢复建行后回放滞留的调度器事件，终态事件清理 pending 防泄漏。"""
+    window = MainWindow(WorkerFileBrowser())
+    event = main_window_module.DownloadTaskEvent(
+        task_id="dl-1", status="下载中", bytes_done=5, total_bytes=10
+    )
+    window._on_download_event(event)  # 行不存在 → 暂存
+    assert "dl-1" in window._pending_download_events
+
+    window._on_download_recovery_succeeded(
+        (
+            SimpleNamespace(
+                task_id="dl-1",
+                name="x.bin",
+                target_path=Path("/tmp/x.bin"),
+                status="等待中",
+                total_bytes=10,
+                bytes_done=0,
+                active_connections=0,
+                max_connections=1,
+                supports_resume=False,
+            ),
+        )
+    )
+
+    record = window.transfer_interface._find_record("download", "dl-1")
+    assert record is not None
+    assert record.status == "下载中" and record.bytes_done == 5  # 事件已回放
+    assert "dl-1" not in window._pending_download_events
+
+    terminal = main_window_module.DownloadTaskEvent(
+        task_id="dl-1", status="已完成", bytes_done=10, total_bytes=10
+    )
+    window._pending_download_events["dl-1"] = terminal
+    window._on_download_event(terminal)
+    assert "dl-1" not in window._pending_download_events
+
+
+def test_resolve_upload_paths_merge_threads_merge_and_skips_conflicting_files(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """合并策略：文件夹以 merge=True 续传，同名顶层文件跳过不建任务。"""
+    window = MainWindow(WorkerFileBrowser())
+    folder = tmp_path / "已看完"
+    folder.mkdir()
+    (folder / "a.mkv").write_bytes(b"x")
+    same_file = tmp_path / "same.txt"
+    same_file.write_bytes(b"y")
+    folder_calls: list[dict[str, object]] = []
+    file_calls: list[Path] = []
+    monkeypatch.setattr(
+        window,
+        "upload_folder_to_current_directory",
+        lambda path, **kwargs: folder_calls.append({"path": path, **kwargs}),
+    )
+    monkeypatch.setattr(
+        window,
+        "upload_file_to_current_directory",
+        lambda path, **kwargs: file_calls.append(path),
+    )
+
+    window._resolve_upload_paths(
+        (folder, same_file),
+        {"已看完", "same.txt"},
+        parent_id="0",
+        run_in_background=True,
+        resolution="merge",
+    )
+
+    assert len(folder_calls) == 1
+    assert folder_calls[0]["path"] == folder
+    assert folder_calls[0]["merge"] is True
+    assert file_calls == []  # 同名顶层文件跳过
+
+
+def test_resolve_upload_paths_merge_skips_file_with_truncated_cloud_name(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """合并策略：顶层长名文件的云端截断名已存在 → 不再重复建任务。"""
+    from openwopan.tasks.upload import server_file_name
+
+    window = MainWindow(WorkerFileBrowser())
+    long_name = "a" * 99 + ".mkv"
+    long_file = tmp_path / long_name
+    long_file.write_bytes(b"y")
+    file_calls: list[Path] = []
+    monkeypatch.setattr(
+        window,
+        "upload_file_to_current_directory",
+        lambda path, **kwargs: file_calls.append(path),
+    )
+
+    window._resolve_upload_paths(
+        (long_file,),
+        {server_file_name(long_name)},
+        parent_id="0",
+        run_in_background=True,
+        resolution="merge",
+    )
+
+    assert file_calls == []
+
+
+def test_upload_summary_dialog_merge_resolution(qapp: QApplication, tmp_path: Path) -> None:
+    """确认对话框提供「合并」第三选项并正确返回策略。"""
+    from openwopan.tasks.upload import UploadBatchSummary, UploadSummaryEntry
+
+    folder = tmp_path / "已看完"
+    folder.mkdir()
+    summary = UploadBatchSummary(
+        top_paths=(folder,),
+        file_count=1,
+        folder_count=1,
+        total_bytes=1,
+        preview=(UploadSummaryEntry(folder, "已看完", "文件夹", 0),),
+        omitted_count=0,
+    )
+    dialog = UploadSummaryDialog(summary, "目标目录", None, conflicts=(folder,))
+    assert dialog._merge_conflicts_button is not None
+    dialog._merge_conflicts_button.setChecked(True)
+    assert dialog.resolution() == "merge"
+    dialog._skip_conflicts_button.setChecked(True)
+    assert dialog.resolution() == "skip"
+
+
+def test_remove_records_writes_audit_log(
+    qapp: QApplication, caplog: pytest.LogCaptureFixture
+) -> None:
+    """删除审计：所有删除入口留痕（方向/数量/样本 id）。"""
+    import logging as _logging
+
+    transfer = TransferInterface()
+    transfer.add_upload_record(
+        TransferRecord(
+            task_id="upload-1",
+            direction="upload",
+            name="a.mkv",
+            size=1,
+            target_path=Path("/tmp/a.mkv"),
+            status="已完成",
+        ),
+        render=False,
+        persist=False,
+    )
+    with caplog.at_level(_logging.INFO, logger="openwopan.ui.main_window"):
+        transfer.remove_records("upload", {"upload-1"})
+    assert "transfer.records.remove" in caplog.text
+    assert "count=1" in caplog.text
+
+
 def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3783,11 +4747,8 @@ def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(
     )
     window._folder_upload_record_id = root_id
     window._folder_upload_child_ids = {active_id, next_id}
-    window._folder_upload_active = QueuedUploadFile(
-        active_id, active_path, "cloud-root", "active.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile(next_id, next_path, "cloud-root", "next.txt")
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", next_path, next_id, "next.txt", False)
     ]
     calls: list[str] = []
     worker = SimpleNamespace(
@@ -3796,34 +4757,24 @@ def test_main_window_batch_upload_controls_paused_folder_worker_advances_queue(
     )
     window._upload_workers[active_id] = worker  # type: ignore[assignment]
     window._upload_threads[active_id] = QThread(window)
-    monkeypatch.setattr(
-        window,
-        "_start_upload_task",
-        lambda _parent, _path, task_id, **_kwargs: calls.append(task_id),
-    )
 
     window._pause_upload_task(active_id)
 
-    assert calls == ["pause", next_id]
-    assert window._folder_upload_active is not None
-    assert window._folder_upload_active.task_id == next_id
-    assert window._folder_upload_queue == []
+    # 统一管线：暂停的 worker 阻塞占槽，FIFO 不受影响；恢复原线程继续。
+    assert calls == ["pause"]
     assert active_id in window._paused_uploads
+    assert [pending.task_id for pending in window._upload_pending] == [next_id]
     record = window.transfer_interface._find_record("upload", active_id)
     assert record is not None and record.status == "已暂停"
 
     window._resume_upload_task(active_id)
     assert active_id not in window._paused_uploads
     assert window.transfer_interface._find_record("upload", active_id).status == "上传中"
-    assert calls == ["pause", next_id, "resume"]
+    assert calls == ["pause", "resume"]
 
 
-def test_paused_folder_worker_keeps_upload_limit(
-    qapp: QApplication, tmp_path: Path
-) -> None:
-    window = MainWindow(
-        WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1)
-    )
+def test_paused_folder_worker_keeps_upload_limit(qapp: QApplication, tmp_path: Path) -> None:
+    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1))
     root = tmp_path / "folder"
     root.mkdir()
     active_path = root / "active.txt"
@@ -3839,11 +4790,8 @@ def test_paused_folder_worker_keeps_upload_limit(
     )
     window._folder_upload_record_id = root_id
     window._folder_upload_child_ids = {active_id, next_id}
-    window._folder_upload_active = QueuedUploadFile(
-        active_id, active_path, "cloud-root", "active.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile(next_id, next_path, "cloud-root", "next.txt")
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", next_path, next_id, "next.txt", False)
     ]
     window._upload_workers[active_id] = SimpleNamespace(
         request_pause=lambda: None,
@@ -3853,10 +4801,11 @@ def test_paused_folder_worker_keeps_upload_limit(
 
     window._pause_upload_task(active_id)
 
-    assert window._folder_upload_active is not None
-    assert window._folder_upload_active.task_id == next_id
+    # 暂停的 worker 仍占用唯一并发槽：排队的 next 不启动，状态保持等待。
+    assert active_id in window._paused_uploads
     assert [pending.task_id for pending in window._upload_pending] == [next_id]
     assert list(window._upload_threads) == [active_id]
+    assert window.transfer_interface._find_record("upload", next_id).status == "等待中"
 
 
 def test_main_window_batch_upload_controls_waiting_task(
@@ -3875,9 +4824,7 @@ def test_main_window_batch_upload_controls_waiting_task(
             upload_parent_id=ROOT_DIRECTORY_ID,
         )
     )
-    pending = PendingUploadTask(
-        ROOT_DIRECTORY_ID, local_path, "u-1", local_path.name, False
-    )
+    pending = PendingUploadTask(ROOT_DIRECTORY_ID, local_path, "u-1", local_path.name, False)
     window._upload_pending = [pending]
 
     window._pause_selected_uploads({"u-1"})
@@ -3907,19 +4854,19 @@ def test_main_window_batch_upload_controls_waiting_task(
 def test_cancel_folder_upload_removes_paused_child_record(
     qapp: QApplication, tmp_path: Path
 ) -> None:
+    """取消批次＝逐个子任务放弃：无 worker 的暂停子行直接移除并丢弃会话。"""
     window = MainWindow(WorkerFileBrowser())
     root = tmp_path / "folder"
     child = root / "paused.txt"
     root.mkdir()
     child.write_text("paused")
-    root_id = window._create_upload_record(root, name="folder")
     child_id = window._create_upload_record(
         child,
         parent_id="cloud-root",
         upload_name="paused.txt",
         retryable=True,
     )
-    window._folder_upload_record_id = root_id
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_upload_child_ids = {child_id}
     window._paused_uploads[child_id] = PendingUploadTask(
         "cloud-root", child, child_id, "paused.txt", False
@@ -3928,9 +4875,9 @@ def test_cancel_folder_upload_removes_paused_child_record(
 
     window._cancel_folder_upload()
 
-    assert window.transfer_interface._find_record("upload", root_id) is None
     assert window.transfer_interface._find_record("upload", child_id) is None
     assert child_id not in window._paused_uploads
+    assert window._folder_upload_record_id is None
 
 
 def test_main_window_batch_upload_controls_queued_folder_task(
@@ -3949,11 +4896,8 @@ def test_main_window_batch_upload_controls_queued_folder_task(
         retryable=True,
     )
     window._folder_upload_record_id = root_id
-    window._folder_upload_queue = [
-        main_window_module.QueuedUploadFile(
-            child_id, child, "cloud-root", "child.txt"
-        )
-    ]
+    window._folder_upload_child_ids = {child_id}
+    window._upload_pending = [PendingUploadTask("cloud-root", child, child_id, "child.txt", False)]
     started: list[tuple[object, ...]] = []
     monkeypatch.setattr(
         window,
@@ -3965,7 +4909,7 @@ def test_main_window_batch_upload_controls_queued_folder_task(
 
     assert window.transfer_interface._find_record("upload", child_id).status == "已暂停"
     assert child_id in window._paused_uploads
-    assert [item.task_id for item in window._folder_upload_queue] == [child_id]
+    assert window._upload_pending == []
 
     window._resume_selected_uploads({child_id})
 
@@ -4336,7 +5280,7 @@ def test_resolve_automatic_download_path_falls_back_to_safe_name(
 ) -> None:
     window = MainWindow(settings=AppSettings(default_download_path=tmp_path))  # type: ignore[arg-type]
 
-    resolved = window._resolve_automatic_download_path('bad:name?.txt')
+    resolved = window._resolve_automatic_download_path("bad:name?.txt")
 
     assert resolved is not None
     assert resolved.name == "bad_name_.txt"
@@ -4423,9 +5367,7 @@ def test_next_available_file_name_increments_past_first_duplicate() -> None:
     from openwopan.ui.main_window import _next_available_file_name
 
     assert (
-        _next_available_file_name(
-            "report.txt", {"report.txt", "report (1).txt"}
-        )
+        _next_available_file_name("report.txt", {"report.txt", "report (1).txt"})
         == "report (2).txt"
     )
     assert _next_available_file_name("new.txt", set()) == "new.txt"
@@ -4480,7 +5422,7 @@ def test_mask_account_id(account_id: str, expected: str) -> None:
 @pytest.mark.parametrize(
     ("raw_name", "expected"),
     [
-        ('bad:name?.txt', "bad_name_.txt"),
+        ("bad:name?.txt", "bad_name_.txt"),
         ("...", "download"),
         ("normal.txt", "normal.txt"),
     ],
@@ -4512,9 +5454,7 @@ def test_transfer_active_download_folder_skips_row_without_target(
 ) -> None:
     transfer = TransferInterface()
     transfer.add_download_record(_make_record("d-1", target_path=None))
-    transfer.add_download_record(
-        _make_record("d-2", target_path=Path("/downloads/b.txt"))
-    )
+    transfer.add_download_record(_make_record("d-2", target_path=Path("/downloads/b.txt")))
 
     transfer.download_table.selectRow(0)
 
@@ -4796,9 +5736,7 @@ def test_remove_transfer_records_without_browser_support(qapp: QApplication) -> 
     browser = WorkerFileBrowser()
     browser.remove_download_record = "not-callable"  # type: ignore[assignment]
     window = MainWindow(browser)
-    _register_download_task(
-        window, "download-1", target_path=Path("/tmp/r.txt"), item=_file_item()
-    )
+    _register_download_task(window, "download-1", target_path=Path("/tmp/r.txt"), item=_file_item())
 
     window.transfer_interface.remove_records_requested.emit("download", {"download-1"})
 
@@ -5214,9 +6152,7 @@ def test_tree_sync_partial_cache_hit_fetches_only_missing_ancestors(
 
     # 一次跳两层：目标目录 folder-2 由刷新拉取；祖先层中根目录已缓存、
     # folder-1 缺失——树同步只应对缺失层补发请求
-    window.open_tree_path(
-        (ROOT_DIRECTORY_ID, "folder-1", "folder-2"), ("/", "Folder", "2")
-    )
+    window.open_tree_path((ROOT_DIRECTORY_ID, "folder-1", "folder-2"), ("/", "Folder", "2"))
 
     assert browser.requested_parent_ids == [ROOT_DIRECTORY_ID, "folder-2", "folder-1"]
 
@@ -5589,15 +6525,15 @@ def test_prompt_upload_folder_uploads_selected_folder(
     assert browser.prepared_uploads == [(ROOT_DIRECTORY_ID, local_root)]
     assert len(browser.uploaded_files) == 2
     assert window._folder_prepare_thread is None
-    assert window._folder_upload_queue == []
-    assert window._folder_upload_active is None
+    assert window._upload_pending == []
+    assert window._folder_upload_record_id is None
 
 
 def test_folder_upload_runs_two_phases_and_updates_records(
     qapp: QApplication,
     tmp_path: Path,
 ) -> None:
-    """AC1/AC7：准备记录 + 每文件记录，全部顺序执行并到达终态。"""
+    """AC1/AC7：目录创建在准备阶段完成，列表只落原子文件任务并到达终态。"""
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     window.refresh_current_directory()
@@ -5606,9 +6542,9 @@ def test_folder_upload_runs_two_phases_and_updates_records(
     window.upload_folder_to_current_directory(local_root)
 
     records = _upload_records(window)
-    assert [record.name for record in records] == ["相册", "春节.md", "说明.txt"]
-    assert [record.status for record in records] == ["已完成", "已完成", "已完成"]
-    assert records[1].target_path == local_root / "2024" / "春节.md"
+    assert [record.name for record in records] == ["春节.md", "说明.txt"]
+    assert [record.status for record in records] == ["已完成", "已完成"]
+    assert records[0].target_path == local_root / "2024" / "春节.md"
     # 阶段二逐文件顺序执行，父目录为目标云端目录 ID，名字为去重后的最终名
     assert [parent_id for parent_id, _ in browser.uploaded_files] == [
         f"cloud-{ROOT_DIRECTORY_ID}-2024",
@@ -5675,9 +6611,8 @@ def test_folder_upload_continues_after_single_file_failure(
     window.upload_folder_to_current_directory(local_root)
 
     records = _upload_records(window)
-    assert [record.status for record in records] == ["失败", "失败", "已完成"]
-    assert records[0].error == "成功 1 个，失败 1 个"
-    assert records[1].error == "网络错误"
+    assert [record.status for record in records] == ["失败", "已完成"]
+    assert records[0].error == "网络错误"
     assert ("error", "上传失败", "网络错误") in spy.calls
     assert spy.calls[-1] == ("warning", "上传完成", "成功 1 个，失败 1 个")
     assert len(browser.uploaded_files) == 2
@@ -5692,11 +6627,16 @@ def test_ordinary_upload_login_failure_does_not_clear_folder_queue(
     folder_root = tmp_path / "folder"
     folder_root.mkdir()
     ordinary_task_id = window._create_upload_record(ordinary_path)
-    window._folder_upload_active = QueuedUploadFile(
-        "folder-active", folder_root / "child.txt", "cloud-root", "child.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile("folder-pending", folder_root / "next.txt", "cloud-root", "next.txt")
+    root_id = window._create_upload_record(folder_root, name="folder")
+    window._folder_upload_record_id = root_id
+    window._folder_upload_child_ids = {"folder-active", "folder-pending"}
+    window._upload_pending = [
+        PendingUploadTask(
+            "cloud-root", folder_root / "child.txt", "folder-active", "child.txt", False
+        ),
+        PendingUploadTask(
+            "cloud-root", folder_root / "next.txt", "folder-pending", "next.txt", False
+        ),
     ]
     window._folder_prepare_pending = [
         PendingFolderUpload(folder_root, "pinned-parent", "folder", "pending-folder")
@@ -5706,52 +6646,55 @@ def test_ordinary_upload_login_failure_does_not_clear_folder_queue(
     window._on_upload_login_required("登录已过期，请重新登录", task_id=ordinary_task_id)
 
     assert window.transfer_interface._find_record("upload", ordinary_task_id).status == "失败"
-    assert window._folder_upload_active is not None
-    assert window._folder_upload_active.task_id == "folder-active"
-    assert [queued.task_id for queued in window._folder_upload_queue] == ["folder-pending"]
+    assert window._folder_upload_record_id == root_id
+    assert [pending.task_id for pending in window._upload_pending] == [
+        "folder-active",
+        "folder-pending",
+    ]
     assert window._folder_prepare_pending == [
         PendingFolderUpload(folder_root, "pinned-parent", "folder", "pending-folder")
     ]
     assert window._folder_upload_target_dir_id == "pinned-parent"
 
 
-def test_folder_upload_joins_shared_fifo_behind_waiting_files(
+def test_folder_children_honor_concurrent_upload_limit(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1))
-    ordinary = tmp_path / "ordinary.txt"
-    child = tmp_path / "child.txt"
-    window._upload_thread = QThread(window)  # type: ignore[assignment]
+    """统一管线：文件夹子任务与单文件共用 FIFO，并发数=max_concurrent_uploads。"""
+    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=3))
+    files = []
+    for index in range(5):
+        path = tmp_path / f"ep{index}.txt"
+        path.write_text("x")
+        files.append(path)
+    root_id = window._create_upload_record(tmp_path, name="batch")
+    task_ids = [
+        window._create_upload_record(
+            path, parent_id="cloud-root", upload_name=path.name, retryable=True
+        )
+        for path in files
+    ]
+    window._folder_upload_record_id = root_id
+    window._folder_upload_child_ids = set(task_ids)
     window._upload_pending = [
-        PendingUploadTask(ROOT_DIRECTORY_ID, ordinary, "ordinary", None, False)
+        PendingUploadTask("cloud-root", path, task_id, path.name, False)
+        for path, task_id in zip(files, task_ids, strict=True)
     ]
-    window._folder_upload_queue = [
-        QueuedUploadFile("folder-child", child, "cloud-root", "child.txt")
-    ]
-
-    window._continue_folder_upload_queue()
-
-    assert [pending.task_id for pending in window._upload_pending] == [
-        "ordinary", "folder-child"
-    ]
-    assert window._folder_upload_active is not None
-    assert window._folder_upload_active.task_id == "folder-child"
-    window._upload_thread = None
-    started: list[str] = []
+    launched: list[str] = []
 
     def launch(_parent: str, _path: Path, task_id: str, **_kwargs: object) -> None:
-        started.append(task_id)
+        launched.append(task_id)
         window._upload_threads[task_id] = QThread(window)
 
     monkeypatch.setattr(window, "_launch_upload_task", launch)
+
     window._start_next_upload_task()
-    assert started == ["ordinary"]
-    window._upload_threads.pop("ordinary")
+
+    assert launched == task_ids[:3]  # 3 路并发（修复前文件夹批次固定单任务串行）
+    window._upload_threads.pop(task_ids[0])
     window._start_next_upload_task()
-    assert started == ["ordinary", "folder-child"]
+    assert launched == task_ids[:3] + [task_ids[3]]  # 槽位释放后按 FIFO 补位
     window._upload_threads.clear()
-    window._folder_upload_active = None
-    window._folder_upload_queue.clear()
 
 
 def test_folder_prepare_login_failure_preserves_other_pending_folder(
@@ -5762,11 +6705,9 @@ def test_folder_prepare_login_failure_preserves_other_pending_folder(
     second = tmp_path / "second"
     first.mkdir()
     second.mkdir()
-    first_id = window._create_upload_record(first)
-    second_id = window._create_upload_record(second)
-    window._folder_upload_record_id = first_id
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_prepare_pending = [
-        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", second_id)
+        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", "folder-token-2")
     ]
     started: list[tuple[Path, dict[str, object]]] = []
     monkeypatch.setattr(
@@ -5777,24 +6718,27 @@ def test_folder_prepare_login_failure_preserves_other_pending_folder(
 
     window._on_folder_upload_prepare_login_required("登录已过期，请重新登录")
 
-    assert window.transfer_interface._find_record("upload", first_id).status == "失败"
-    assert window.transfer_interface._find_record("upload", second_id).status == "等待中"
+    # 登录失败不建行也不动排队批次；批次令牌原样传给下一个文件夹。
+    assert _upload_records(window) == []
     assert window._folder_prepare_pending == [
-        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", second_id)
+        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", "folder-token-2")
     ]
     window._clear_folder_prepare()
     assert started[0][0] == second
-    assert started[0][1]["_record_id"] == second_id
+    assert started[0][1]["_record_id"] == "folder-token-2"
 
 
 def test_folder_upload_stops_chaining_on_login_required(
     qapp: QApplication,
     tmp_path: Path,
 ) -> None:
-    """AC6：登录态失效停止排队，未开始记录明确失败。"""
+    """AC6：登录态失效停止排队，未开始记录明确失败。
+
+    单并发下保持确定性：第一个成功、第二个登录失效、第三个被拆除标记。
+    """
     browser = WorkerFileBrowser()
     browser.upload_errors = [None, FileBrowserLoginRequiredError("登录已过期，请重新登录")]
-    window = MainWindow(browser)
+    window = MainWindow(browser, settings=AppSettings(max_concurrent_uploads=1))
     window.refresh_current_directory()
     observed_messages: list[str] = []
     window.login_required.connect(observed_messages.append)
@@ -5805,22 +6749,23 @@ def test_folder_upload_stops_chaining_on_login_required(
 
     assert observed_messages == ["登录已过期，请重新登录"]
     records = _upload_records(window)
-    assert [record.name for record in records] == ["相册", "春节.md", "结尾.txt", "说明.txt"]
-    assert [record.status for record in records] == ["失败", "已完成", "失败", "失败"]
-    assert records[0].error == "登录已过期，请重新登录"
+    assert [record.name for record in records] == ["春节.md", "结尾.txt", "说明.txt"]
+    assert [record.status for record in records] == ["已完成", "失败", "失败"]
     assert records[-1].error == "登录已过期，请重新登录"
     # 登录失效的文件已尝试但不计入成功；第三个文件从未开始
     assert browser.uploaded_files == [
         (f"cloud-{ROOT_DIRECTORY_ID}-2024", local_root / "2024" / "春节.md"),
         (f"cloud-{ROOT_DIRECTORY_ID}-root", local_root / "结尾.txt"),
     ]
-    assert window._folder_upload_queue == []
-    assert window._folder_upload_active is None
+    assert window._upload_pending == []
+    assert window._folder_upload_record_id is None
 
 
 @pytest.mark.parametrize("terminal", ["success", "failure", "login"])
 def test_removed_upload_ignores_late_terminal_result(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     terminal: str,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
@@ -5828,9 +6773,7 @@ def test_removed_upload_ignores_late_terminal_result(
     unrelated = window._create_upload_record(tmp_path / "unrelated.txt")
     window.transfer_interface.update_record("upload", task_id, status="上传中")
     requests: list[bool] = []
-    window._upload_workers[task_id] = SimpleNamespace(
-        request_cancel=lambda: requests.append(True)
-    )  # type: ignore[assignment]
+    window._upload_workers[task_id] = SimpleNamespace(request_cancel=lambda: requests.append(True))  # type: ignore[assignment]
     login: list[str] = []
     window.login_required.connect(login.append)
     monkeypatch.setattr(window, "refresh_current_directory", lambda **kwargs: None)
@@ -5852,45 +6795,60 @@ def test_removed_upload_ignores_late_terminal_result(
 
 @pytest.mark.parametrize("terminal", ["failure", "login"])
 def test_removed_preparing_folder_ignores_late_failure(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     terminal: str,
 ) -> None:
+    """已取消的准备中批次：迟到的失败/登录事件被忽略，不弹错误。
+
+    根批次令牌不再对应列表行，取消语义经 _upload_removal_requested 表达。
+    """
     window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
-    window._folder_upload_record_id = root_id
+    token = "folder-token-1"
+    window._folder_upload_record_id = token
     window._folder_prepare_thread = QThread(window)  # type: ignore[assignment]
     errors: list[str] = []
     monkeypatch.setattr(
         main_window_module.InfoBar, "error", lambda **kwargs: errors.append(kwargs["content"])
     )
-    window._remove_transfer_records("upload", {root_id})
+    window._upload_removal_requested.add(token)
     if terminal == "failure":
         window._on_folder_upload_prepare_failed("late failure")
     else:
         window._on_folder_upload_prepare_login_required("登录已过期，请重新登录")
 
-    assert window.transfer_interface._find_record("upload", root_id) is None
+    assert _upload_records(window) == []
     assert errors == []
 
 
 def test_remove_waiting_folder_child_preserves_next_and_root(
-    qapp: QApplication, tmp_path: Path,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
     root_id = window._create_upload_record(tmp_path / "root")
     queued_id = window._create_upload_record(tmp_path / "queued.txt")
     next_id = window._create_upload_record(tmp_path / "next.txt")
     window._folder_upload_record_id = root_id
-    window._folder_upload_active = QueuedUploadFile(
-        "active", tmp_path / "active.txt", "c", "active.txt"
-    )
-    window._upload_threads["active"] = QThread(window)
-    window._folder_upload_queue = [
-        QueuedUploadFile(queued_id, tmp_path / "queued.txt", "c", "queued.txt"),
-        QueuedUploadFile(next_id, tmp_path / "next.txt", "c", "next.txt"),
+    window._folder_upload_child_ids = {queued_id, next_id}
+    window._upload_pending = [
+        PendingUploadTask("c", tmp_path / "queued.txt", queued_id, "queued.txt", False),
+        PendingUploadTask("c", tmp_path / "next.txt", next_id, "next.txt", False),
     ]
+    launched: list[str] = []
+    monkeypatch.setattr(
+        window,
+        "_launch_upload_task",
+        lambda _parent, _path, task_id, **_kwargs: (
+            launched.append(task_id),
+            window._upload_threads.__setitem__(task_id, QThread(window)),
+        ),
+    )
     window._remove_transfer_records("upload", {queued_id})
-    assert [queued.task_id for queued in window._folder_upload_queue] == [next_id]
+    # 统一管线：删除等待中的子任务后，剩余子任务按 FIFO 自动补位启动
+    assert launched == [next_id]
     assert window._folder_upload_cancel_count == 1
     assert window.transfer_interface._find_record("upload", queued_id) is None
     assert window.transfer_interface._find_record("upload", root_id) is not None
@@ -5929,10 +6887,9 @@ def test_cancel_folder_upload_keeps_paused_worker_until_terminal(
     qapp: QApplication, tmp_path: Path
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
     child_path = tmp_path / "paused.txt"
     child_id = window._create_upload_record(child_path, parent_id="cloud-root")
-    window._folder_upload_record_id = root_id
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_upload_child_ids = {child_id}
     window._paused_uploads[child_id] = PendingUploadTask(
         "cloud-root", child_path, child_id, child_path.name, False
@@ -5945,19 +6902,20 @@ def test_cancel_folder_upload_keeps_paused_worker_until_terminal(
 
     window._cancel_folder_upload()
 
+    # 暂停中的 worker 协作取消，行等到终态事件到达才移除
     assert requested == [True]
-    assert window.transfer_interface._find_record("upload", root_id) is not None
     assert window.transfer_interface._find_record("upload", child_id) is not None
 
     window._on_upload_cancelled(child_id)
     window._upload_workers.pop(child_id)
     window._finish_folder_upload()
-    assert window.transfer_interface._find_record("upload", root_id) is None
     assert window.transfer_interface._find_record("upload", child_id) is None
 
 
 def test_retry_waits_for_previous_worker_with_same_task_id(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
     task_id = window._create_upload_record(tmp_path / "file.txt", parent_id="0")
@@ -5966,7 +6924,8 @@ def test_retry_waits_for_previous_worker_with_same_task_id(
     window.transfer_interface.update_record("upload", task_id, status="失败")
     launched: list[str] = []
     monkeypatch.setattr(
-        window, "_launch_upload_task",
+        window,
+        "_launch_upload_task",
         lambda parent, path, tid, **kwargs: launched.append(tid),
     )
 
@@ -5984,11 +6943,10 @@ def test_retry_waits_for_previous_worker_with_same_task_id(
 
 
 def test_remove_waiting_upload_does_not_start_or_remove_another_task(
-    qapp: QApplication, tmp_path: Path,
+    qapp: QApplication,
+    tmp_path: Path,
 ) -> None:
-    window = MainWindow(
-        WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1)
-    )
+    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1))
     first = window._create_upload_record(tmp_path / "first.txt")
     second = window._create_upload_record(tmp_path / "second.txt")
     window._upload_pending = [
@@ -6005,16 +6963,15 @@ def test_remove_waiting_upload_does_not_start_or_remove_another_task(
 
 
 def test_remove_running_upload_waits_for_terminal_signal(
-    qapp: QApplication, tmp_path: Path,
+    qapp: QApplication,
+    tmp_path: Path,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
     task_id = window._create_upload_record(tmp_path / "running.txt")
     other_id = window._create_upload_record(tmp_path / "other.txt")
     window.transfer_interface.update_record("upload", task_id, status="上传中")
     requested: list[bool] = []
-    window._upload_workers[task_id] = SimpleNamespace(
-        request_cancel=lambda: requested.append(True)
-    )  # type: ignore[assignment]
+    window._upload_workers[task_id] = SimpleNamespace(request_cancel=lambda: requested.append(True))  # type: ignore[assignment]
 
     window._remove_transfer_records("upload", {task_id})
     assert requested == [True]
@@ -6028,152 +6985,161 @@ def test_remove_running_upload_waits_for_terminal_signal(
 
 
 def test_batch_remove_pending_child_root_and_folder_never_starts_selected_folder(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
+    """删除排队中的子任务不触碰文件夹队列；批次取消后才按序启动下一个。"""
+    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1))
+    window._upload_thread = QThread(window)  # type: ignore[assignment]  # 占住唯一槽位
     child_id = window._create_upload_record(tmp_path / "child.txt")
-    selected_id = window._create_upload_record(tmp_path / "selected")
-    survivor_id = window._create_upload_record(tmp_path / "survivor")
-    window._folder_upload_record_id = root_id
-    window._folder_upload_active = QueuedUploadFile(
-        child_id, tmp_path / "child.txt", "c", "child.txt"
-    )
+    window._folder_upload_record_id = "folder-token-1"
+    window._folder_upload_child_ids = {child_id, "upload-held"}
+    window._folder_children_registered = True
     window._upload_pending = [
-        PendingUploadTask("c", tmp_path / "child.txt", child_id, "child.txt", False)
+        PendingUploadTask("c", tmp_path / "child.txt", "upload-held", "child.txt", False)
     ]
     window._folder_prepare_pending = [
-        PendingFolderUpload(tmp_path / "selected", "0", "selected", selected_id),
-        PendingFolderUpload(tmp_path / "survivor", "0", "survivor", survivor_id),
+        PendingFolderUpload(tmp_path / "first", "0", "first", "folder-token-2"),
+        PendingFolderUpload(tmp_path / "survivor", "0", "survivor", "folder-token-3"),
     ]
     started: list[str] = []
     monkeypatch.setattr(
-        window, "upload_folder_to_current_directory",
+        window,
+        "upload_folder_to_current_directory",
         lambda path, **kwargs: started.append(kwargs["_record_id"]),
     )
 
-    window._remove_transfer_records("upload", {root_id, child_id, selected_id})
+    window._remove_transfer_records("upload", {child_id})
+    assert started == []
+    assert window.transfer_interface._find_record("upload", child_id) is None
 
-    assert started == [survivor_id]
-    assert all(
-        window.transfer_interface._find_record("upload", tid) is None
-        for tid in (root_id, child_id, selected_id)
-    )
-    assert window.transfer_interface._find_record("upload", survivor_id) is not None
+    window._cancel_folder_upload()
+    assert started == ["folder-token-2"]
 
 
 def test_batch_remove_does_not_launch_selected_waiting_folder(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
-    selected_id = window._create_upload_record(tmp_path / "selected")
-    survivor_id = window._create_upload_record(tmp_path / "survivor")
-    window._folder_upload_record_id = root_id
+    """批量删除子任务行：不启动任何排队文件夹（批次未收尾）。"""
+    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1))
+    window._upload_thread = QThread(window)  # type: ignore[assignment]  # 占住唯一槽位
+    child_id = window._create_upload_record(tmp_path / "child.txt")
+    window._folder_upload_record_id = "folder-token-1"
+    window._folder_upload_child_ids = {child_id, "upload-other"}
+    window._folder_children_registered = True
+    window._upload_pending = [
+        PendingUploadTask("c", tmp_path / "child.txt", "upload-other", "child.txt", False)
+    ]
     window._folder_prepare_pending = [
-        PendingFolderUpload(tmp_path / "selected", "0", "selected", selected_id),
-        PendingFolderUpload(tmp_path / "survivor", "0", "survivor", survivor_id),
+        PendingFolderUpload(tmp_path / "queued", "0", "queued", "folder-token-2")
     ]
     started: list[str] = []
     monkeypatch.setattr(
-        window, "upload_folder_to_current_directory",
+        window,
+        "upload_folder_to_current_directory",
         lambda path, **kwargs: started.append(kwargs["_record_id"]),
     )
 
-    window._remove_transfer_records("upload", {root_id, selected_id})
+    window._remove_transfer_records("upload", {child_id})
 
-    assert started == [survivor_id]
-    assert window.transfer_interface._find_record("upload", root_id) is None
-    assert window.transfer_interface._find_record("upload", selected_id) is None
+    assert started == []
+    assert window.transfer_interface._find_record("upload", child_id) is None
+    assert window._folder_upload_record_id == "folder-token-1"
 
 
 def test_remove_active_folder_child_waits_then_drains(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
     root_id = window._create_upload_record(tmp_path / "root")
     child_id = window._create_upload_record(tmp_path / "child.txt")
     next_id = window._create_upload_record(tmp_path / "next.txt")
     window._folder_upload_record_id = root_id
-    window._folder_upload_active = QueuedUploadFile(
-        child_id, tmp_path / "child.txt", "c", "child.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile(next_id, tmp_path / "next.txt", "c", "next.txt")
+    window._folder_upload_child_ids = {child_id, next_id}
+    window._upload_pending = [
+        PendingUploadTask("c", tmp_path / "next.txt", next_id, "next.txt", False)
     ]
     requested: list[bool] = []
     window._upload_workers[child_id] = SimpleNamespace(
         request_cancel=lambda: requested.append(True)
     )  # type: ignore[assignment]
     window._upload_threads[child_id] = QThread(window)
-    started: list[str] = []
-    monkeypatch.setattr(
-        window, "_start_upload_task", lambda parent, path, tid, **kw: started.append(tid)
-    )
+    launched: list[str] = []
+
+    def fake_launch(_parent: str, _path: Path, task_id: str, **_kwargs: object) -> None:
+        launched.append(task_id)
+        window._upload_threads[task_id] = QThread(window)
+        window._upload_workers[task_id] = SimpleNamespace(request_cancel=lambda: None)
+
+    monkeypatch.setattr(window, "_launch_upload_task", fake_launch)
 
     window._remove_transfer_records("upload", {child_id})
     assert requested == [True]
+    assert launched == [next_id]  # 槽位仍在（child 未退出），next 由统一 FIFO 补位
     assert window.transfer_interface._find_record("upload", child_id) is not None
     window._on_upload_cancelled(child_id)
     window._upload_workers.pop(child_id)
     window._upload_threads.pop(child_id)
-    window._continue_folder_upload_queue()
+    window._maybe_finish_folder_upload()
 
     assert window.transfer_interface._find_record("upload", child_id) is None
     assert window._folder_upload_cancel_count == 1
-    assert started == [next_id]
     assert window.transfer_interface._find_record("upload", root_id) is not None
 
 
 def test_remove_preparing_folder_waits_for_late_result_before_next_folder(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
-    next_id = window._create_upload_record(tmp_path / "next")
-    window._folder_upload_record_id = root_id
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_prepare_thread = QThread(window)  # type: ignore[assignment]
     cancel_requested = threading.Event()
     window._folder_prepare_cancel = cancel_requested
     window._folder_prepare_pending = [
-        PendingFolderUpload(tmp_path / "next", "0", "next", next_id)
+        PendingFolderUpload(tmp_path / "next", "0", "next", "folder-token-2")
     ]
     started: list[str] = []
     monkeypatch.setattr(
-        window, "upload_folder_to_current_directory",
+        window,
+        "upload_folder_to_current_directory",
         lambda path, **kwargs: started.append(kwargs["_record_id"]),
     )
 
-    window._remove_transfer_records("upload", {root_id})
+    window._cancel_folder_upload()
     assert cancel_requested.is_set()
     assert started == []
-    assert window.transfer_interface._find_record("upload", root_id) is not None
     assert "不会自动删除" in window.status_message()
+    # 迟到的准备结果被丢弃，等线程收尾后才轮到下一个文件夹
     window._on_folder_upload_prepared(object())
-    assert window.transfer_interface._find_record("upload", root_id) is None
     assert started == []
     window._clear_folder_prepare()
-    assert started == [next_id]
+    assert started == ["folder-token-2"]
 
 
 def test_remove_running_folder_waits_for_child_then_starts_next_folder(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
     child_id = window._create_upload_record(tmp_path / "child.txt")
     queued_id = window._create_upload_record(tmp_path / "queued.txt")
-    next_id = window._create_upload_record(tmp_path / "next")
-    window._folder_upload_record_id = root_id
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_upload_target_dir_id = "different-directory"
-    window._folder_upload_active = QueuedUploadFile(
-        child_id, tmp_path / "child.txt", "c", "child.txt"
-    )
-    window._folder_upload_queue = [
-        QueuedUploadFile(queued_id, tmp_path / "queued.txt", "c", "queued.txt")
+    window._folder_upload_child_ids = {child_id, queued_id}
+    window._folder_children_registered = True
+    window._upload_pending = [
+        PendingUploadTask("c", tmp_path / "queued.txt", queued_id, "queued.txt", False)
     ]
     window._folder_prepare_pending = [
-        PendingFolderUpload(tmp_path / "next", "0", "next", next_id)
+        PendingFolderUpload(tmp_path / "next", "0", "next", "folder-token-2")
     ]
     requested: list[bool] = []
     window._upload_workers[child_id] = SimpleNamespace(
@@ -6182,13 +7148,13 @@ def test_remove_running_folder_waits_for_child_then_starts_next_folder(
     window._upload_threads[child_id] = QThread(window)
     started: list[str] = []
     monkeypatch.setattr(
-        window, "upload_folder_to_current_directory",
+        window,
+        "upload_folder_to_current_directory",
         lambda path, **kwargs: started.append(kwargs["_record_id"]),
     )
 
-    window._remove_transfer_records("upload", {root_id})
+    window._cancel_folder_upload()
     assert requested == [True]
-    assert window.transfer_interface._find_record("upload", root_id) is not None
     assert window.transfer_interface._find_record("upload", child_id) is not None
     assert window.transfer_interface._find_record("upload", queued_id) is None
     assert started == []
@@ -6196,83 +7162,71 @@ def test_remove_running_folder_waits_for_child_then_starts_next_folder(
     window._on_upload_cancelled(child_id)
     window._upload_workers.pop(child_id)
     window._upload_threads.pop(child_id)
-    window._continue_folder_upload_queue()
-    assert window.transfer_interface._find_record("upload", root_id) is None
+    window._maybe_finish_folder_upload()
+    assert window._folder_upload_record_id is None
+    assert started == ["folder-token-2"]
     assert window.transfer_interface._find_record("upload", child_id) is None
-    assert started == [next_id]
 
 
 def test_successful_folder_child_retry_clears_root_failure(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """失败子任务重试成功后回滚批次失败计数（汇总不再多算失败）。"""
     window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
     child_id = window._create_upload_record(tmp_path / "child.txt")
-    window._folder_upload_record_id = root_id
-    window.transfer_interface.update_record("upload", root_id, status="上传中")
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_upload_child_ids = {child_id}
-    window._folder_upload_active = QueuedUploadFile(
-        child_id, tmp_path / "child.txt", "c", "child.txt"
-    )
     monkeypatch.setattr(main_window_module.InfoBar, "error", lambda **kwargs: None)
     monkeypatch.setattr(main_window_module.InfoBar, "info", lambda **kwargs: None)
 
     window._on_upload_failed("暂时失败", child_id)
     assert window._folder_upload_failure_count == 1
-    window._folder_upload_active = None
-    window._upload_workers[child_id] = SimpleNamespace(
-        request_cancel=lambda: None
-    )  # type: ignore[assignment]
-    window._finish_folder_upload()
-    assert window.transfer_interface._find_record("upload", root_id).status == "上传中"
 
     window._on_upload_succeeded(_file_item(name="child.txt"), child_id)
-    window._upload_workers.pop(child_id)
-    window._finish_folder_upload()
-
-    assert window.transfer_interface._find_record("upload", root_id).status == "已完成"
+    assert window._folder_upload_failure_count == 0
+    assert window._folder_upload_success_count == 1
     assert window._folder_upload_failed_ids == set()
 
 
 def test_root_stays_active_until_retried_child_finishes(
-    qapp: QApplication, tmp_path: Path,
+    qapp: QApplication,
+    tmp_path: Path,
 ) -> None:
+    """批次在重试子任务终态前不收尾（令牌保持），终态后才释放下一个批次。"""
     window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
     retried_id = window._create_upload_record(tmp_path / "retried.txt")
-    window._folder_upload_record_id = root_id
-    window.transfer_interface.update_record("upload", root_id, status="上传中")
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_upload_child_ids = {retried_id}
+    window._folder_children_registered = True
     requests: list[bool] = []
     window._upload_workers[retried_id] = SimpleNamespace(
         request_cancel=lambda: requests.append(True)
     )  # type: ignore[assignment]
 
     window._finish_folder_upload()
-    assert window._folder_upload_record_id == root_id
-    assert window.transfer_interface._find_record("upload", root_id).status == "上传中"
-    window._remove_transfer_records("upload", {root_id})
+    assert window._folder_upload_record_id == "folder-token-1"
+    window._cancel_folder_upload()
     assert requests == [True]
-    assert window.transfer_interface._find_record("upload", root_id) is not None
+    assert window._folder_upload_record_id == "folder-token-1"
 
     window._on_upload_cancelled(retried_id)
     window._upload_workers.pop(retried_id)
     window._finish_folder_upload()
-    assert window.transfer_interface._find_record("upload", root_id) is None
+    assert window._folder_upload_record_id is None
 
 
 def test_remove_folder_root_stops_retried_child_in_parallel(
-    qapp: QApplication, tmp_path: Path,
+    qapp: QApplication,
+    tmp_path: Path,
 ) -> None:
     window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
     retried_id = window._create_upload_record(tmp_path / "retried.txt")
     active_id = window._create_upload_record(tmp_path / "active.txt")
-    window._folder_upload_record_id = root_id
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_upload_child_ids = {retried_id, active_id}
-    window._folder_upload_active = QueuedUploadFile(
-        active_id, tmp_path / "active.txt", "cloud-root", "active.txt"
-    )
+    window._folder_children_registered = True
     requested: list[str] = []
     for task_id in (retried_id, active_id):
         window._upload_workers[task_id] = SimpleNamespace(
@@ -6280,59 +7234,67 @@ def test_remove_folder_root_stops_retried_child_in_parallel(
         )  # type: ignore[assignment]
         window._upload_threads[task_id] = QThread(window)
 
-    window._remove_transfer_records("upload", {root_id})
+    window._cancel_folder_upload()
     assert set(requested) == {retried_id, active_id}
-    assert window.transfer_interface._find_record("upload", root_id) is not None
     window._on_upload_cancelled(retried_id)
     window._upload_workers.pop(retried_id)
     window._upload_threads.pop(retried_id)
     window._finish_folder_upload()
-    assert window.transfer_interface._find_record("upload", root_id) is not None
+    assert window._folder_upload_record_id == "folder-token-1"
 
     window._on_upload_cancelled(active_id)
     window._upload_workers.pop(active_id)
     window._upload_threads.pop(active_id)
-    window._continue_folder_upload_queue()
-    assert window.transfer_interface._find_record("upload", root_id) is None
+    window._maybe_finish_folder_upload()
+    assert window._folder_upload_record_id is None
     assert window._folder_upload_child_ids == set()
 
 
 def test_remove_folder_root_starts_next_waiting_folder(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """取消活跃批次（原根行删除入口）：清掉子任务并自动开始下一个排队文件夹。"""
     window = MainWindow(WorkerFileBrowser())
-    root_id = window._create_upload_record(tmp_path / "root")
     child_id = window._create_upload_record(tmp_path / "child.txt")
-    next_id = window._create_upload_record(tmp_path / "next")
-    window._folder_upload_record_id = root_id
+    window._folder_upload_record_id = "folder-token-1"
     window._folder_upload_target_dir_id = "different-directory"
-    window._folder_upload_queue = [
-        QueuedUploadFile(child_id, tmp_path / "child.txt", "cloud-root", "child.txt")
+    window._folder_upload_child_ids = {child_id}
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", tmp_path / "child.txt", child_id, "child.txt", False)
     ]
     window._folder_prepare_pending = [
-        PendingFolderUpload(tmp_path / "next", "0", "next", next_id)
+        PendingFolderUpload(tmp_path / "next", "0", "next", "folder-token-2")
     ]
     started: list[str] = []
     monkeypatch.setattr(
-        window, "upload_folder_to_current_directory",
+        window,
+        "upload_folder_to_current_directory",
         lambda path, **kwargs: started.append(kwargs["_record_id"]),
     )
 
-    window._remove_transfer_records("upload", {root_id})
+    window._cancel_folder_upload()
 
-    assert window.transfer_interface._find_record("upload", root_id) is None
     assert window.transfer_interface._find_record("upload", child_id) is None
-    assert window.transfer_interface._find_record("upload", next_id) is not None
-    assert started == [next_id]
+    assert started == ["folder-token-2"]
 
 
 def test_remove_pending_folder_does_not_stop_active_folder(
-    qapp: QApplication, tmp_path: Path,
+    qapp: QApplication,
+    tmp_path: Path,
 ) -> None:
-    window = MainWindow(WorkerFileBrowser())
+    # 单并发 + 占位线程：子任务留在 FIFO，确保删除无关行不影响活跃批次
+    window = MainWindow(WorkerFileBrowser(), settings=AppSettings(max_concurrent_uploads=1))
+    window._upload_thread = QThread(window)  # type: ignore[assignment]
     active_id = window._create_upload_record(tmp_path / "active")
     waiting_id = window._create_upload_record(tmp_path / "waiting")
+    child_id = window._create_upload_record(tmp_path / "child.txt")
     window._folder_upload_record_id = active_id
+    window._folder_upload_child_ids = {child_id}
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", tmp_path / "child.txt", child_id, "child.txt", False)
+    ]
     window._folder_prepare_pending = [
         PendingFolderUpload(tmp_path / "waiting", "0", "waiting", waiting_id)
     ]
@@ -6357,9 +7319,12 @@ def test_folder_upload_starts_next_pending_folder_after_queue_finishes(
         "upload_folder_to_current_directory",
         lambda path, **kwargs: started.append((path, kwargs)),
     )
-    window._folder_upload_active = QueuedUploadFile(
-        "active", second / "active.txt", "cloud-root", "active.txt"
-    )
+    window._folder_upload_record_id = "active-batch"
+    window._folder_upload_child_ids = {"active"}
+    window._folder_children_registered = True
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", second / "active.txt", "active", "active.txt", False)
+    ]
     window._folder_prepare_pending = [
         PendingFolderUpload(second, "pinned-second", "Second", "second-task"),
         PendingFolderUpload(third, "pinned-third", "Third", "third-task"),
@@ -6369,6 +7334,8 @@ def test_folder_upload_starts_next_pending_folder_after_queue_finishes(
     assert started == []
     assert [pending.local_path for pending in window._folder_prepare_pending] == [second, third]
 
+    # 活跃子任务全部离开统一管线后，批次收尾并启动下一个文件夹
+    window._upload_pending.clear()
     window._finish_folder_upload()
 
     assert started == [
@@ -6379,6 +7346,7 @@ def test_folder_upload_starts_next_pending_folder_after_queue_finishes(
                 "_conflict_checked": True,
                 "_parent_id": "pinned-second",
                 "_record_id": "second-task",
+                "merge": False,
             },
         )
     ]
@@ -6391,7 +7359,7 @@ def test_folder_upload_prepare_failure_reports_and_skips_file_records(
     qapp: QApplication,
     tmp_path: Path,
 ) -> None:
-    """AC4：阶段一失败明确报错，不创建任何文件上传任务。"""
+    """AC4：阶段一失败明确报错，不创建任何文件上传任务（列表零行）。"""
     browser = WorkerFileBrowser()
     browser.prepare_error = FileBrowserError("创建目录失败：没有权限")
     window = MainWindow(browser)
@@ -6401,9 +7369,7 @@ def test_folder_upload_prepare_failure_reports_and_skips_file_records(
     window.upload_folder_to_current_directory(local_root)
 
     records = _upload_records(window)
-    assert len(records) == 1
-    assert records[0].status == "失败"
-    assert records[0].error == "创建目录失败：没有权限"
+    assert records == []
     assert browser.uploaded_files == []
     assert "上传文件夹失败" in window.status_message()
     assert window._folder_prepare_thread is None
@@ -6424,7 +7390,7 @@ def test_folder_upload_prepare_login_required_marks_record_failed(
 
     assert observed_messages == ["登录已过期，请重新登录"]
     records = _upload_records(window)
-    assert [record.status for record in records] == ["失败"]
+    assert records == []
     assert browser.uploaded_files == []
 
 
@@ -6437,35 +7403,39 @@ def test_folder_prepare_login_failure_runs_next_independent_folder(
     second = tmp_path / "second"
     first.mkdir()
     second.mkdir()
-    waiting_id = window._create_upload_record(second)
     window._folder_prepare_pending = [
-        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", waiting_id)
+        PendingFolderUpload(second, ROOT_DIRECTORY_ID, "second", "folder-token-2")
     ]
     prepare = browser.prepare_folder_upload
     attempts = 0
 
     def prepare_once_failed(
-        parent_id: str, root: Path, *, root_name: str | None = None,
+        parent_id: str,
+        root: Path,
+        *,
+        root_name: str | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        merge: bool = False,
     ) -> FolderUploadJob:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise FileBrowserLoginRequiredError("登录已过期，请重新登录")
         return prepare(
-            parent_id, root, root_name=root_name, cancel_requested=cancel_requested
+            parent_id,
+            root,
+            root_name=root_name,
+            cancel_requested=cancel_requested,
+            merge=merge,
         )
 
     monkeypatch.setattr(browser, "prepare_folder_upload", prepare_once_failed)
-    window.upload_folder_to_current_directory(
-        first, root_name="first", _conflict_checked=True
-    )
+    window.upload_folder_to_current_directory(first, root_name="first", _conflict_checked=True)
 
     assert attempts == 2
-    records = _upload_records(window)
-    assert [record.status for record in records] == ["已完成", "失败"]
-    assert records[0].task_id == waiting_id
-    assert records[1].error == "登录已过期，请重新登录"
+    # 两个批次都不产生列表行：first 目录创建登录失败（零行），
+    # second 为空目录（零文件任务）。
+    assert _upload_records(window) == []
     assert browser.prepared_uploads == [(ROOT_DIRECTORY_ID, second)]
 
 
@@ -6484,10 +7454,10 @@ def test_folder_upload_without_files_finishes_with_empty_summary(
 
     window.upload_folder_to_current_directory(empty_root)
 
-    assert spy.calls[-1] == ("info", "上传完成", "成功 0 个，失败 0 个")
+    # 全零批次（空目录/合并全命中）：不建行、不弹汇总。
+    assert spy.calls == []
     assert browser.uploaded_files == []
-    records = _upload_records(window)
-    assert [record.status for record in records] == ["已完成"]
+    assert _upload_records(window) == []
 
 
 def test_folder_upload_entry_remains_usable_while_upload_is_active(
@@ -6510,26 +7480,29 @@ def test_folder_upload_entry_remains_usable_while_upload_is_active(
     assert pending.local_path == local_root
     assert pending.parent_id == ROOT_DIRECTORY_ID
     assert pending.root_name == local_root.name
-    assert pending.record_id in {
+    # 排队批次只持内部令牌，不产生列表行
+    assert pending.record_id not in {
         record.task_id for record in window.transfer_interface.upload_records
     }
 
     window._folder_prepare_thread = None
     window._folder_prepare_pending.clear()
 
-    window._folder_upload_queue = [
-        QueuedUploadFile("upload-1", local_root / "file.txt", "cloud-root", "file.txt")
+    window._folder_upload_record_id = "batch-root"
+    window._folder_upload_child_ids = {"upload-1"}
+    window._upload_pending = [
+        PendingUploadTask("cloud-root", local_root / "file.txt", "upload-1", "file.txt", False)
     ]
     window.upload_folder_to_current_directory(local_root)
     pending = window._folder_prepare_pending[0]
     assert pending.local_path == local_root
     assert pending.parent_id == ROOT_DIRECTORY_ID
     assert pending.root_name == local_root.name
-    assert pending.record_id in {
+    assert pending.record_id not in {
         record.task_id for record in window.transfer_interface.upload_records
     }
 
-    window._folder_upload_queue.clear()
+    window._upload_pending.clear()
 
 
 def test_folder_upload_defers_until_single_upload_slot_frees(
@@ -6538,9 +7511,7 @@ def test_folder_upload_defers_until_single_upload_slot_frees(
 ) -> None:
     """准备完成时槽位被单文件上传占用：先排队，槽位释放后自动继续。"""
     browser = WorkerFileBrowser()
-    window = MainWindow(
-        browser, settings=AppSettings(max_concurrent_uploads=1)
-    )
+    window = MainWindow(browser, settings=AppSettings(max_concurrent_uploads=1))
     window.refresh_current_directory()
     local_root = _make_folder_tree(tmp_path)
     job = browser.prepare_folder_upload(ROOT_DIRECTORY_ID, local_root)
@@ -6548,10 +7519,8 @@ def test_folder_upload_defers_until_single_upload_slot_frees(
     window._upload_thread = QThread(window)  # type: ignore[assignment]
     window._folder_upload_target_dir_id = ROOT_DIRECTORY_ID
     window._on_folder_upload_prepared(job)
-    assert len(window._folder_upload_queue) == len(job.files) - 1
-    assert [task.task_id for task in window._upload_pending] == [
-        window._folder_upload_active.task_id
-    ]
+    # 单并发槽被占用：全部子任务留在统一 FIFO，等待槽位释放
+    assert len(window._upload_pending) == len(job.files)
     assert browser.uploaded_files == []
 
     window._upload_thread = None
@@ -6561,7 +7530,56 @@ def test_folder_upload_defers_until_single_upload_slot_frees(
         (f"cloud-{ROOT_DIRECTORY_ID}-2024", local_root / "2024" / "春节.md"),
         (f"cloud-{ROOT_DIRECTORY_ID}-root", local_root / "说明.txt"),
     ]
-    assert window._folder_upload_queue == []
+    assert window._upload_pending == []
+
+
+def test_folder_upload_prepared_batch_renders_table_once(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """文件夹批量入队只做 O(1) 次全表渲染（回归：逐条渲染曾造成 O(n²) 控件重建）。
+
+    修复前每加一条记录就整表重建一次，157 个文件实测 GUI 线程阻塞 ~60s、
+    RSS 冲到 ~6GB（~6.2 万个待删除控件堆积）。修复后一次批量只渲染一次，
+    控件增长与文件数线性相关。
+    """
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser, settings=AppSettings(max_concurrent_uploads=1))
+    window.refresh_current_directory()
+    local_root = tmp_path / "批量"
+    local_root.mkdir()
+    file_count = 60
+    for index in range(file_count):
+        (local_root / f"ep{index:02d}.mkv").write_bytes(b"x")
+    job = browser.prepare_folder_upload(ROOT_DIRECTORY_ID, local_root)
+    assert len(job.files) == file_count
+
+    renders = [0]
+    original_render = window.transfer_interface._render_upload_table
+
+    def counting_render() -> None:
+        renders[0] += 1
+        original_render()
+
+    monkeypatch.setattr(window.transfer_interface, "_render_upload_table", counting_render)
+    widgets_before = len(QApplication.allWidgets())
+
+    # 占住上传槽位，避免首批任务启动引入额外状态渲染（与相邻测试同法）。
+    window._upload_thread = QThread(window)  # type: ignore[assignment]
+    window._folder_upload_target_dir_id = ROOT_DIRECTORY_ID
+    window._on_folder_upload_prepared(job)
+
+    assert renders[0] == 1
+    assert len(window.transfer_interface.upload_records) == file_count
+    # 单次渲染为每行建一组操作控件（~5 个/行）；O(n²) 路径会超出一个数量级。
+    widget_growth = len(QApplication.allWidgets()) - widgets_before
+    assert widget_growth < file_count * 10
+
+    window._upload_thread = None
+    window._upload_pending.clear()
+    window._folder_upload_child_ids.clear()
+    window._folder_upload_record_id = None
 
 
 def test_upload_folder_to_current_directory_requires_browser(qapp: QApplication) -> None:
@@ -6570,6 +7588,93 @@ def test_upload_folder_to_current_directory_requires_browser(qapp: QApplication)
     window.upload_folder_to_current_directory(Path("/tmp/any-folder"))
 
     assert window.status_message() == "请先登录"
+
+
+def test_folder_prepare_cancel_button_cancels_active_batch_and_queue(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """「取消目录创建」按钮：取消准备中的批次并丢弃排队队列（文件夹批次
+    无列表行后的唯一取消入口），准备中止后批次收尾、按钮隐藏。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    assert window.transfer_interface.cancel_folder_prepare_button.isHidden()
+
+    child_id = window._create_upload_record(
+        tmp_path / "child.txt", parent_id="cloud-1", retryable=True
+    )
+    window._folder_upload_record_id = "folder-token-1"
+    window._folder_upload_child_ids = {child_id}
+    window._folder_children_registered = True
+    window._upload_pending = [
+        PendingUploadTask("cloud-1", tmp_path / "child.txt", child_id, "child.txt", False)
+    ]
+    window._folder_prepare_thread = QThread(window)  # type: ignore[assignment]
+    prepare_cancel = threading.Event()
+    window._folder_prepare_cancel = prepare_cancel
+    window._folder_prepare_pending = [
+        PendingFolderUpload(tmp_path / "queued", ROOT_DIRECTORY_ID, "queued", "folder-token-2")
+    ]
+    window._update_folder_prepare_cancel_visibility()
+    assert not window.transfer_interface.cancel_folder_prepare_button.isHidden()
+
+    window.transfer_interface.cancel_folder_prepare_button.click()
+
+    assert prepare_cancel.is_set()
+    assert window._folder_prepare_pending == []
+    assert window._upload_pending == []
+    assert browser.uploaded_files == []
+    # 准备线程协作中止（迟到失败带取消语义）→ 收尾批次；线程收尾后按钮隐藏
+    window._on_folder_upload_prepare_failed("上传已取消")
+    assert window._folder_upload_record_id is None
+    window._folder_prepare_thread = None
+    window._clear_folder_prepare()
+    assert window.transfer_interface.cancel_folder_prepare_button.isHidden()
+
+
+def test_folder_prepare_cancel_button_clears_queued_batches_without_active_prepare(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    window = MainWindow(WorkerFileBrowser())
+    window._folder_prepare_pending = [
+        PendingFolderUpload(tmp_path / "a", ROOT_DIRECTORY_ID, "a", "folder-token-1"),
+        PendingFolderUpload(tmp_path / "b", ROOT_DIRECTORY_ID, "b", "folder-token-2"),
+    ]
+    window._update_folder_prepare_cancel_visibility()
+    assert not window.transfer_interface.cancel_folder_prepare_button.isHidden()
+
+    window.transfer_interface.cancel_folder_prepare_button.click()
+
+    assert window._folder_prepare_pending == []
+    assert "已取消排队中的文件夹上传" in window.status_message()
+    assert window.transfer_interface.cancel_folder_prepare_button.isHidden()
+
+
+def test_folder_drag_never_adds_folder_row_to_transfer_list(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """文件夹拖入只产生原子文件任务行：列表永远没有文件夹行（qB/传统
+    网盘语义——目录创建属准备阶段）。回归：重复拖入同一文件夹会为
+    「已存在」的根目录每次新增一行。"""
+    browser = WorkerFileBrowser()
+    window = MainWindow(browser)
+    window.refresh_current_directory()
+    local_root = _make_folder_tree(tmp_path)
+
+    window.upload_folder_to_current_directory(
+        local_root, root_name=local_root.name, _conflict_checked=True, merge=False
+    )
+    names_first = [record.name for record in _upload_records(window)]
+
+    window.upload_folder_to_current_directory(
+        local_root, root_name=local_root.name, _conflict_checked=True, merge=True
+    )
+    names_second = [record.name for record in _upload_records(window)]
+
+    assert names_first == ["春节.md", "说明.txt"]
+    assert local_root.name not in names_first
+    # 重复拖入（即使替身不实现合并跳过而重传文件）也不会再冒出文件夹行
+    assert local_root.name not in names_second
 
 
 def test_upload_folder_to_current_directory_rejects_empty_folder_name(
@@ -6585,9 +7690,7 @@ def test_upload_folder_to_current_directory_rejects_empty_folder_name(
     assert browser.prepared_uploads == []
 
 
-def test_upload_tasks_respect_concurrent_upload_limit(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_upload_tasks_respect_concurrent_upload_limit(qapp: QApplication, tmp_path: Path) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser, settings=AppSettings(max_concurrent_uploads=1))
     first = tmp_path / "first.txt"
@@ -6633,7 +7736,8 @@ def test_upload_enqueue_status_is_confirmation(
     assert "已添加 2 个上传任务" in messages
     assert not any(message.startswith("正在上传") for message in messages)
     assert [record.status for record in window.transfer_interface.upload_records[-2:]] == [
-        "已完成", "已完成"
+        "已完成",
+        "已完成",
     ]
 
 
@@ -6747,7 +7851,8 @@ def test_upload_folder_conflict_passes_copy_root_name_before_prepare(
     window.upload_folder_to_current_directory(local_root)
 
     assert browser.prepared_upload_names == ["Folder (copy)"]
-    assert window.transfer_interface.upload_records[0].name == "Folder (copy)"
+    # 目录名去重只作用于云端目录树，列表行只有原子文件任务。
+    assert [record.name for record in window.transfer_interface.upload_records] == ["child.txt"]
 
 
 def test_batch_upload_conflict_skip_keeps_non_conflicting_task(
@@ -6775,9 +7880,7 @@ def test_batch_upload_conflict_skip_keeps_non_conflicting_task(
 
     assert browser.uploaded_files == [(ROOT_DIRECTORY_ID, non_conflicting)]
     assert browser.upload_names == ["new.txt"]
-    assert [record.name for record in window.transfer_interface.upload_records] == [
-        "new.txt"
-    ]
+    assert [record.name for record in window.transfer_interface.upload_records] == ["new.txt"]
 
 
 def test_upload_conflict_cancel_creates_no_folder_or_record(
@@ -6806,9 +7909,7 @@ def test_upload_conflict_cancel_creates_no_folder_or_record(
     assert window.status_message() == "已取消上传"
 
 
-def test_upload_conflict_check_runs_off_gui_thread(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_upload_conflict_check_runs_off_gui_thread(qapp: QApplication, tmp_path: Path) -> None:
     browser = WorkerFileBrowser()
     window = MainWindow(browser)
     gui_thread_id = threading.get_ident()
@@ -6872,10 +7973,12 @@ def test_download_button_submits_all_selected_files(
     window.file_interface.download_button.click()
 
     assert {record.name for record in window.transfer_interface.download_records} == {
-        "report.txt", "second.txt"
+        "report.txt",
+        "second.txt",
     }
     assert {call["local_path"] for call in browser.download_calls} == {
-        tmp_path / "report.txt", tmp_path / "second.txt"
+        tmp_path / "report.txt",
+        tmp_path / "second.txt",
     }
 
 
@@ -6943,7 +8046,7 @@ def test_upload_summary_dialog_keeps_labels_compact_when_enlarged(qapp: QApplica
     assert preview is not None and buttons is not None
     assert len(dialog.findChildren(QListWidget)) == 1
     assert dialog.findChildren(QCheckBox) == []
-    assert len(choices) == 2
+    assert len(choices) == 3  # 跳过 / 合并 / 保留副本
     assert "1 个同名" in " ".join(label.text() for label in labels)
     assert preview.item(0).text().startswith("（重复）conflict.txt")
     assert preview.isVisibleTo(dialog) and preview.height() > 200
@@ -6978,13 +8081,174 @@ def test_upload_summary_dialog_bounds_conflict_preview(qapp: QApplication) -> No
     assert not confirm.isEnabled()
 
 
+def test_upload_summary_dialog_shows_merge_task_estimate(qapp: QApplication) -> None:
+    """合并选项旁显示预计新增任务数；选中后决策行给出去重明细。"""
+    parent = QWidget()
+    folder = Path("/tmp/folder")
+    summary = UploadBatchSummary(
+        (folder,), 0, 1, 0, (UploadSummaryEntry(folder, "folder", "文件夹", 0),), 0
+    )
+    dialog = UploadSummaryDialog(
+        summary,
+        "云端目录",
+        parent,
+        conflicts=(folder,),
+        merge_estimate=MergeUploadEstimate(files_to_upload=38, files_skipped=119),
+    )
+
+    assert "预计新增 38 个任务" in dialog._merge_conflicts_button.text()
+    dialog._merge_conflicts_button.setChecked(True)
+    decision = dialog.findChild(main_window_module.BodyLabel, "uploadDecisionLabel")
+    assert decision is not None
+    assert "预计新增 38 个上传任务" in decision.text()
+    assert "跳过 119 个已存在文件" in decision.text()
+
+
+def test_upload_summary_dialog_without_estimate_keeps_static_hint(
+    qapp: QApplication,
+) -> None:
+    """估算不可用（后端不支持/估算失败）时回退静态提示，不显示数字。"""
+    parent = QWidget()
+    folder = Path("/tmp/folder")
+    summary = UploadBatchSummary(
+        (folder,), 0, 1, 0, (UploadSummaryEntry(folder, "folder", "文件夹", 0),), 0
+    )
+    dialog = UploadSummaryDialog(summary, "云端目录", parent, conflicts=(folder,))
+
+    assert "预计新增" not in dialog._merge_conflicts_button.text()
+    dialog._merge_conflicts_button.setChecked(True)
+    decision = dialog.findChild(main_window_module.BodyLabel, "uploadDecisionLabel")
+    assert decision is not None
+    assert "只补传缺失文件" in decision.text()
+
+
+def test_upload_conflict_check_computes_merge_estimate(qapp: QApplication, tmp_path: Path) -> None:
+    """冲突检查顺带估算合并新增数：同名文件夹走云端比对、非冲突文件夹
+    按本地扫描全量计、同名顶层文件计为跳过。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_folder = tmp_path / "已看完"
+    local_folder.mkdir()
+    (local_folder / "ep01.mkv").write_bytes(b"a")
+    (local_folder / "ep02.mkv").write_bytes(b"b")
+    fresh_folder = tmp_path / "新剧"
+    fresh_folder.mkdir()
+    (fresh_folder / "n1.mkv").write_bytes(b"c")
+    (fresh_folder / "n2.mkv").write_bytes(b"d")
+    duplicate_file = tmp_path / "同名.txt"
+    duplicate_file.write_text("x")
+    paths = (local_folder, fresh_folder, duplicate_file)
+    summary = main_window_module.scan_upload_inputs(paths)
+
+    estimates: list[tuple[Path, str | None]] = []
+
+    class EstimateBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            # 云端已有同名「已看完」文件夹与「同名.txt」文件
+            if parent_id == ROOT_DIRECTORY_ID:
+                return [
+                    WopanItem(
+                        item_id="cloud-watched",
+                        name="已看完",
+                        kind=WopanItemKind.FOLDER,
+                        parent_id=parent_id,
+                    ),
+                    WopanItem(
+                        item_id="cloud-dup",
+                        name="同名.txt",
+                        kind=WopanItemKind.FILE,
+                        parent_id=parent_id,
+                        size=1,
+                        download_id="fid",
+                    ),
+                ]
+            return []
+
+        def estimate_merge_uploads(self, parent_id: str, local_root: Path, root_name=None):
+            estimates.append((local_root, root_name))
+            return MergeUploadEstimate(files_to_upload=1, files_skipped=1)
+
+    browser = EstimateBrowser()
+    result = window._run_upload_conflict_check(browser, ROOT_DIRECTORY_ID, paths, summary)
+
+    items, estimate = result
+    assert {item.name for item in items} == {"已看完", "同名.txt"}
+    assert estimates == [(local_folder, "已看完")]
+    # 已看完：1 新增 + 1 跳过；新剧全量 2；同名顶层文件跳过 1
+    assert estimate == MergeUploadEstimate(files_to_upload=3, files_skipped=2)
+
+
+def test_upload_conflict_check_estimate_failure_degrades_to_none(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """估算只是展示增强：后端报错降级为 None，不阻塞对话框（登录过期除外）。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_folder = tmp_path / "已看完"
+    local_folder.mkdir()
+    (local_folder / "ep01.mkv").write_bytes(b"a")
+    summary = main_window_module.scan_upload_inputs((local_folder,))
+
+    class BrokenEstimateBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            return [
+                WopanItem(
+                    item_id="cloud-watched",
+                    name="已看完",
+                    kind=WopanItemKind.FOLDER,
+                    parent_id=parent_id,
+                )
+            ]
+
+        def estimate_merge_uploads(self, *args: object, **kwargs: object) -> object:
+            raise FileBrowserError("listing failed")
+
+    browser = BrokenEstimateBrowser()
+    result = window._run_upload_conflict_check(browser, ROOT_DIRECTORY_ID, (local_folder,), summary)
+
+    _items, estimate = result
+    assert estimate is None
+
+
+def test_upload_conflict_check_estimate_oserror_degrades_to_none(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """本地目录扫描的 OSError（权限/网络盘失效）同样降级，不炸掉冲突检查。"""
+    window = MainWindow(WorkerFileBrowser())
+    local_folder = tmp_path / "已看完"
+    local_folder.mkdir()
+    (local_folder / "ep01.mkv").write_bytes(b"a")
+    summary = main_window_module.scan_upload_inputs((local_folder,))
+
+    class OSErrorEstimateBrowser(WorkerFileBrowser):
+        def list_directory(self, parent_id: str = ROOT_DIRECTORY_ID) -> list[WopanItem]:
+            return [
+                WopanItem(
+                    item_id="cloud-watched",
+                    name="已看完",
+                    kind=WopanItemKind.FOLDER,
+                    parent_id=parent_id,
+                )
+            ]
+
+        def estimate_merge_uploads(self, *args: object, **kwargs: object) -> object:
+            raise OSError("permission denied")
+
+    result = window._run_upload_conflict_check(
+        OSErrorEstimateBrowser(), ROOT_DIRECTORY_ID, (local_folder,), summary
+    )
+
+    assert result[1] is None
+
+
 def test_upload_summary_marks_only_conflicting_top_level_entry(qapp: QApplication) -> None:
     parent = QWidget()
     folder = Path("/tmp/folder")
     child = folder / "child.txt"
     other = Path("/tmp/other.txt")
     summary = UploadBatchSummary(
-        (folder, other), 2, 1, 2,
+        (folder, other),
+        2,
+        1,
+        2,
         (
             UploadSummaryEntry(folder, "folder", "文件夹", 0),
             UploadSummaryEntry(child, "folder/child.txt", "文件", 1),
@@ -6996,7 +8260,9 @@ def test_upload_summary_marks_only_conflicting_top_level_entry(qapp: QApplicatio
     preview = dialog.findChild(QListWidget)
 
     assert [preview.item(index).text().startswith("（重复）") for index in range(3)] == [
-        True, False, False,
+        True,
+        False,
+        False,
     ]
 
 
@@ -7017,8 +8283,7 @@ def test_upload_summary_marks_late_conflict_after_large_folder(
 
     assert preview.count() == 21
     assert any(
-        preview.item(index).text().startswith("（重复）duplicate.txt")
-        for index in range(20)
+        preview.item(index).text().startswith("（重复）duplicate.txt") for index in range(20)
     )
     assert preview.item(20).text() == "另有 7 项"
 
@@ -7060,14 +8325,20 @@ def test_upload_drop_uses_one_summary_for_conflict_decision(
 
     class SummaryDialog:
         def __init__(
-            self, summary: UploadBatchSummary, _target: str, _parent: QWidget, *,
+            self,
+            summary: UploadBatchSummary,
+            _target: str,
+            _parent: QWidget,
+            *,
             conflicts: tuple[Path, ...],
+            merge_estimate: object = None,
         ) -> None:
             dialogs.append((summary.file_count, conflicts))
 
         def _show_modal(self) -> int:
             return int(
-                QDialog.DialogCode.Accepted if resolution is not None
+                QDialog.DialogCode.Accepted
+                if resolution is not None
                 else QDialog.DialogCode.Rejected
             )
 
@@ -7089,11 +8360,13 @@ def test_upload_drop_uses_one_summary_for_conflict_decision(
     # 否则 == 求值与失败 repr 渲染之间列表仍在变（CI 慢机上稳定复现的竞态）。
     assert _wait_until(
         qapp,
-        lambda: not window._upload_threads
-        and len(window.transfer_interface.upload_records) == len(expected_names)
-        and all(
-            record.status in {"失败", "已完成"}
-            for record in window.transfer_interface.upload_records
+        lambda: (
+            not window._upload_threads
+            and len(window.transfer_interface.upload_records) == len(expected_names)
+            and all(
+                record.status in {"失败", "已完成"}
+                for record in window.transfer_interface.upload_records
+            )
         ),
     )
     assert browser.upload_names == expected_names
@@ -7115,9 +8388,7 @@ def test_upload_summary_rejects_navigation_during_confirmation(
             pass
 
         def _show_modal(self) -> int:
-            window._breadcrumb.append(
-                main_window_module.BreadcrumbEntry("folder-1", "Folder")
-            )
+            window._breadcrumb.append(main_window_module.BreadcrumbEntry("folder-1", "Folder"))
             return int(QDialog.DialogCode.Accepted)
 
         exec = _show_modal
@@ -7193,9 +8464,7 @@ class _DropEvent:
         self.accepted = False
 
 
-def test_file_table_rejects_mixed_local_and_remote_drop(
-    qapp: QApplication, tmp_path: Path
-) -> None:
+def test_file_table_rejects_mixed_local_and_remote_drop(qapp: QApplication, tmp_path: Path) -> None:
     parent = QWidget()
     table = DroppableTableWidget(parent)
     dropped: list[tuple[Path, ...]] = []
@@ -7289,11 +8558,13 @@ def test_upload_drop_accepts_batch_with_partial_failure(
 
     assert _wait_until(
         qapp,
-        lambda: window._scan_thread is None
-        and not window._upload_threads
-        and all(
-            record.status in {"失败", "已完成"}
-            for record in window.transfer_interface.upload_records
+        lambda: (
+            window._scan_thread is None
+            and not window._upload_threads
+            and all(
+                record.status in {"失败", "已完成"}
+                for record in window.transfer_interface.upload_records
+            )
         ),
     )
     assert [record.status for record in window.transfer_interface.upload_records] == [
@@ -7310,7 +8581,9 @@ def test_upload_drop_accepts_batch_with_partial_failure(
 
 
 def test_upload_drop_scans_off_gui_thread(
-    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     browser = WorkerFileBrowser()
@@ -7338,9 +8611,11 @@ def test_upload_drop_scans_off_gui_thread(
         window.handle_upload_drop((local_path,))
         assert _wait_until(
             qapp,
-            lambda: window._scan_thread is None
-            and window._upload_conflict_thread is None
-            and window.status_message() == "已取消上传",
+            lambda: (
+                window._scan_thread is None
+                and window._upload_conflict_thread is None
+                and window.status_message() == "已取消上传"
+            ),
         )
 
     assert scan_thread_ids and scan_thread_ids[0] != gui_thread_id
@@ -7455,9 +8730,7 @@ def test_picker_conflict_rejects_navigation_during_dialog(
             pass
 
         def _show_modal(self) -> int:
-            window._breadcrumb.append(
-                main_window_module.BreadcrumbEntry("folder-1", "Folder")
-            )
+            window._breadcrumb.append(main_window_module.BreadcrumbEntry("folder-1", "Folder"))
             return int(QDialog.DialogCode.Accepted)
 
         exec = _show_modal
@@ -7562,13 +8835,9 @@ class UploadRecoveryBrowser(WorkerFileBrowser):
         return self.recovery_records
 
 
-def test_startup_recovers_upload_rows_as_retryable(
-    qapp: QApplication, sync_threads: None
-) -> None:
+def test_startup_recovers_upload_rows_as_retryable(qapp: QApplication, sync_threads: None) -> None:
     """AC7/B5：启动恢复渲染「已暂停 + 可续传」上传行。"""
-    records = tuple(
-        _upload_recovery_record(f"upload-{index}") for index in range(1, 4)
-    )
+    records = tuple(_upload_recovery_record(f"upload-{index}") for index in range(1, 4))
     window = MainWindow(UploadRecoveryBrowser(records))
 
     window.set_file_browser(UploadRecoveryBrowser(records))
@@ -7708,7 +8977,11 @@ def test_resume_recovered_paused_row_without_target_info_notifies(
 def test_remove_recovered_paused_upload_row_discards_session(
     qapp: QApplication, sync_threads: None
 ) -> None:
-    """B5 回归：删除重启恢复的「已暂停」行直接移除并丢弃会话（防复活）。"""
+    """B5 回归：删除重启恢复的「已暂停」行直接移除并丢弃会话（防复活）。
+
+    恢复行的 task_id 即会话 id，但同样按 (parent, path, name) 派生一次——
+    两个 id 都丢弃，覆盖「行 id 与会话 id 分属两套体系」的来源。
+    """
     discarded: list[list[str]] = []
 
     class DiscardBrowser(WorkerFileBrowser):
@@ -7717,12 +8990,43 @@ def test_remove_recovered_paused_upload_row_discards_session(
 
     browser = DiscardBrowser()
     window = MainWindow(browser)
-    window._on_upload_recovery_succeeded((_upload_recovery_record("upload-9"),))
+    record = _upload_recovery_record("upload-9")
+    window._on_upload_recovery_succeeded((record,))
 
     window._remove_transfer_records("upload", {"upload-9"})
 
     assert window.transfer_interface._find_record("upload", "upload-9") is None
-    assert discarded == [["upload-9"]]
+    derived = make_upload_task_id("0", Path("/tmp/upload-9.bin"), "persisted.bin")
+    assert discarded == [["upload-9", derived]]
+
+
+def test_remove_failed_upload_row_discards_derived_session(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """失败行按重试语义保留会话；删除该行 = 放弃任务，须丢弃按
+    (parent, path, name) 派生的会话 id，否则 recover_uploads 每次
+    重启都为已删除任务重建一行（复活循环）。
+
+    回归：Trinity_14 删除失败行后重启仍复活。
+    """
+    discarded: list[list[str]] = []
+
+    class DiscardBrowser(WorkerFileBrowser):
+        def discard_upload_sessions(self, task_ids: Sequence[str]) -> None:
+            discarded.append(list(task_ids))
+
+    window = MainWindow(DiscardBrowser())
+    local_path = tmp_path / "ep14.mkv"
+    task_id = window._create_upload_record(
+        local_path, parent_id="cloud-1", upload_name="ep14.mkv", retryable=True
+    )
+    window.transfer_interface.update_record("upload", task_id, status="失败", error="HTTP 500")
+
+    window._remove_transfer_records("upload", {task_id})
+
+    assert window.transfer_interface._find_record("upload", task_id) is None
+    derived = make_upload_task_id("cloud-1", local_path, "ep14.mkv")
+    assert discarded == [[task_id, derived]]
 
 
 # ---------------------------------------------------------------------------
@@ -7764,9 +9068,7 @@ class FakeTransferPersistence:
         self.load_calls += 1
         return self.history
 
-    def purge_stale_records(
-        self, max_age_days: int = 30
-    ) -> tuple[tuple[str, str], ...]:
+    def purge_stale_records(self, max_age_days: int = 30) -> tuple[tuple[str, str], ...]:
         return self.purged
 
 
@@ -7794,9 +9096,7 @@ def _history_record(task_id: str, direction: str, **overrides: object) -> Transf
 def test_update_record_persists_terminal_and_batches_progress(qapp: QApplication) -> None:
     fake = FakeTransferPersistence()
     interface = TransferInterface(persistence=fake)
-    record = TransferRecord(
-        task_id="upload-1", direction="upload", name="x.bin", size=100
-    )
+    record = TransferRecord(task_id="upload-1", direction="upload", name="x.bin", size=100)
 
     interface.add_upload_record(record)
     assert len(fake.saved) == 1
@@ -7809,9 +9109,7 @@ def test_update_record_persists_terminal_and_batches_progress(qapp: QApplication
     assert ("upload", "upload-1") in interface._persist_dirty
 
     interface._flush_pending_record_persist()
-    assert fake.progress_updates == [
-        ("upload", "upload-1", 50, 0, record.updated_at_epoch)
-    ]
+    assert fake.progress_updates == [("upload", "upload-1", 50, 0, record.updated_at_epoch)]
     assert not interface._persist_timer.isActive()
 
     interface.update_record("upload", "upload-1", status="已完成")
@@ -7823,9 +9121,7 @@ def test_restore_delivery_does_not_write_back(qapp: QApplication) -> None:
     fake = FakeTransferPersistence()
     interface = TransferInterface(persistence=fake)
 
-    interface.add_upload_record(
-        _history_record("upload-9", "upload"), render=False, persist=False
-    )
+    interface.add_upload_record(_history_record("upload-9", "upload"), render=False, persist=False)
 
     assert fake.saved == []
     assert [row.task_id for row in interface.upload_records] == ["upload-9"]
@@ -7834,9 +9130,7 @@ def test_restore_delivery_does_not_write_back(qapp: QApplication) -> None:
 def test_remove_records_deletes_persisted_rows(qapp: QApplication) -> None:
     fake = FakeTransferPersistence()
     interface = TransferInterface(persistence=fake)
-    interface.add_download_record(
-        _history_record("download-1", "download", status="下载中")
-    )
+    interface.add_download_record(_history_record("download-1", "download", status="下载中"))
     interface.update_record("download", "download-1", bytes_done=5)
 
     interface.remove_records("download", {"download-1"})
@@ -7869,9 +9163,7 @@ def test_stop_record_persistence_flushes_pending_progress(qapp: QApplication) ->
 
     interface.stop_record_persistence()
 
-    assert fake.progress_updates == [
-        ("download", "download-1", 7, 0, record.updated_at_epoch)
-    ]
+    assert fake.progress_updates == [("download", "download-1", 7, 0, record.updated_at_epoch)]
     assert not interface._persist_timer.isActive()
 
 
@@ -7901,9 +9193,7 @@ def test_set_file_browser_restores_history_once_on_gui_thread(
             updated_at_epoch=fresh,
         )
     )
-    seeder.save_record(
-        _history_record("download-5", "download", updated_at_epoch=fresh)
-    )
+    seeder.save_record(_history_record("download-5", "download", updated_at_epoch=fresh))
     window = MainWindow(HistoryRestoreBrowser(), transfer_record_store=store)
     renders: list[str] = []
     monkeypatch.setattr(
@@ -7919,9 +9209,7 @@ def test_set_file_browser_restores_history_once_on_gui_thread(
 
     assert renders == ["upload", "download"]
     assert [row.task_id for row in window.transfer_interface.upload_records] == ["upload-3"]
-    assert [row.task_id for row in window.transfer_interface.download_records] == [
-        "download-5"
-    ]
+    assert [row.task_id for row in window.transfer_interface.download_records] == ["download-5"]
     upload_row = window.transfer_interface.upload_records[0]
     assert upload_row.created_at_epoch == 1.0
     assert upload_row.upload_retryable is True
@@ -8054,9 +9342,7 @@ def test_transfer_history_load_failure_is_logged_only(
     with caplog.at_level(logging.WARNING, logger="openwopan.ui.main_window"):
         window._on_transfer_history_failed("boom")
 
-    assert any(
-        "main_window.transfer_history.load_failed" in message for message in caplog.messages
-    )
+    assert any("main_window.transfer_history.load_failed" in message for message in caplog.messages)
     store.close()
 
 
@@ -8108,9 +9394,7 @@ def test_broken_history_store_degrades_without_crashing(
 ) -> None:
     db_path = tmp_path / "records.sqlite3"
     db_path.write_bytes(b"this is not a database" * 100)
-    window = MainWindow(
-        WorkerFileBrowser(), transfer_record_store=TransferRecordStore(db_path)
-    )
+    window = MainWindow(WorkerFileBrowser(), transfer_record_store=TransferRecordStore(db_path))
 
     window.transfer_interface.add_upload_record(
         TransferRecord(task_id="upload-1", direction="upload", name="x.bin", size=1)
@@ -8163,7 +9447,7 @@ def test_folder_upload_flow_persists_root_and_child_records(
     qapp: QApplication,
     tmp_path: Path,
 ) -> None:
-    """上传文件夹流程：root 与逐文件记录分别落库（PRD AC：文件夹批量）。"""
+    """上传文件夹流程：只有原子文件任务落库，目录创建不产生记录行。"""
     store = _opened_store(tmp_path)
     browser = WorkerFileBrowser()
     window = MainWindow(browser, transfer_record_store=store)
@@ -8172,12 +9456,8 @@ def test_folder_upload_flow_persists_root_and_child_records(
 
     window.upload_folder_to_current_directory(local_root)
 
-    rows = {
-        row.name: row
-        for row in store.load_all()
-        if row.direction == "upload"
-    }
-    assert set(rows) == {"相册", "春节.md", "说明.txt"}
+    rows = {row.name: row for row in store.load_all() if row.direction == "upload"}
+    assert set(rows) == {"春节.md", "说明.txt"}
     assert all(row.status == "已完成" for row in rows.values())
     assert rows["春节.md"].local_path == str(local_root / "2024" / "春节.md")
     assert rows["说明.txt"].local_path == str(local_root / "说明.txt")
@@ -8200,16 +9480,12 @@ def test_download_batch_flow_persists_records(
     window._submit_resolved_download_items(targets, run_in_background=False)
 
     rows = {row.task_id: row for row in store.load_all()}
-    live_ids = [
-        record.task_id for record in window.transfer_interface.download_records
-    ]
+    live_ids = [record.task_id for record in window.transfer_interface.download_records]
     assert sorted(rows) == sorted(live_ids)
     assert all(row.direction == "download" for row in rows.values())
     assert [row.status for row in rows.values()] == ["已完成", "已完成"]
     assert {row.local_path for row in rows.values()} == {str(path) for _, path in targets}
     store.close()
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -8302,9 +9578,7 @@ def test_transfer_purge_full_chain_prevents_resurrection(
             updated_at_epoch=now - 31 * 86400,
         )
     )
-    seeder.save_record(
-        _history_record("stale-done", "download", updated_at_epoch=now - 40 * 86400)
-    )
+    seeder.save_record(_history_record("stale-done", "download", updated_at_epoch=now - 40 * 86400))
     seeder.save_record(
         _history_record(
             "kept-retryable",
@@ -8315,9 +9589,7 @@ def test_transfer_purge_full_chain_prevents_resurrection(
             updated_at_epoch=now - 31 * 86400,
         )
     )
-    seeder.save_record(
-        _history_record("fresh-done", "download", updated_at_epoch=now - 86400)
-    )
+    seeder.save_record(_history_record("fresh-done", "download", updated_at_epoch=now - 86400))
     upload_store = UploadTaskStore(root_path=tmp_path / "sessions")
     _seed_upload_state(upload_store, tmp_path, "stale-failed")
     _seed_upload_state(upload_store, tmp_path, "kept-retryable")
@@ -8337,9 +9609,7 @@ def test_transfer_purge_full_chain_prevents_resurrection(
     window.set_file_browser(browser)
 
     rendered_uploads = [row.task_id for row in window.transfer_interface.upload_records]
-    rendered_downloads = [
-        row.task_id for row in window.transfer_interface.download_records
-    ]
+    rendered_downloads = [row.task_id for row in window.transfer_interface.download_records]
     assert rendered_uploads == ["kept-retryable"]
     assert rendered_downloads == ["fresh-done"]
     db_rows = {row.task_id for row in record_store.load_all()}
@@ -8400,9 +9670,7 @@ def test_transfer_purge_runs_off_gui_thread(
     record_store.close()
 
 
-def test_transfer_purge_guards_and_single_flight(
-    qapp: QApplication, sync_threads: None
-) -> None:
+def test_transfer_purge_guards_and_single_flight(qapp: QApplication, sync_threads: None) -> None:
     """关闭中 / 无历史 / 已在跑：清理 kick 不再起新线程。"""
     window = MainWindow()
     fake = FakeTransferPersistence()

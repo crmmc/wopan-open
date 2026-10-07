@@ -443,7 +443,11 @@ def test_sampler_tick_updates_speed_cell_without_rebuild(
 def test_hidden_active_task_is_still_sampled(speed_ui: Any) -> None:
     transfer, clock = speed_ui
     _add_record(transfer, _make_record("u-1", direction="upload"))
-    transfer.upload_filter_combo.setCurrentText("已完成")  # hides the active task
+    from openwopan.ui.main_window import UPLOAD_STATUS_FILTERS
+
+    transfer.upload_filter_combo.setCurrentIndex(
+        UPLOAD_STATUS_FILTERS.index("已完成")
+    )  # hides the active task
     transfer._sample_speeds()
 
     upload = transfer._find_record("upload", "u-1")

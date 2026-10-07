@@ -27,9 +27,11 @@ from openwopan.tasks.download import (
 )
 from openwopan.tasks.scheduler import DownloadCallbacks, DownloadScheduler, DownloadTaskInput
 from openwopan.tasks.upload import (
+    MergeUploadEstimate,
     UploadTaskState,
     UploadTaskStore,
     make_upload_task_id,
+    server_file_name,
 )
 from openwopan.wopan.client import ROOT_DIRECTORY_ID, UploadResumeContext
 from openwopan.wopan.errors import (
@@ -75,15 +77,11 @@ class FakeClient:
         default = [WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)]
         return list(self.listings.get(parent_id, default))
 
-    def search_files(
-        self, keyword: str, page_no: int = 1, page_size: int = 50
-    ) -> list[WopanItem]:
+    def search_files(self, keyword: str, page_no: int = 1, page_size: int = 50) -> list[WopanItem]:
         self.searched_keywords.append((keyword, page_no, page_size))
         if self.error is not None:
             raise self.error
-        return [
-            WopanItem(item_id="file-9", name=f"{keyword}.txt", kind=WopanItemKind.FILE)
-        ]
+        return [WopanItem(item_id="file-9", name=f"{keyword}.txt", kind=WopanItemKind.FILE)]
 
     def get_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
         self.resolved_directory_ids.append(directory_id)
@@ -91,7 +89,9 @@ class FakeClient:
             raise self.error
         return list(self.directory_paths.get(directory_id, []))
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
         self.created_folders.append((parent_id, name))
         if self.error is not None:
             raise self.error
@@ -127,9 +127,7 @@ class FakeClient:
         if self.error is not None:
             raise self.error
 
-    def move_many(
-        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
-    ) -> None:
+    def move_many(self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str) -> None:
         for item_id, kind in items:
             self.move(item_id, kind, target_parent_id)
 
@@ -352,9 +350,7 @@ def test_resolve_directory_path_shortcuts_root() -> None:
     client = FakeClient()
     service = FileBrowserService(client)  # type: ignore[arg-type]
 
-    assert service.resolve_directory_path(ROOT_DIRECTORY_ID) == [
-        (ROOT_DIRECTORY_ID, "个人云")
-    ]
+    assert service.resolve_directory_path(ROOT_DIRECTORY_ID) == [(ROOT_DIRECTORY_ID, "个人云")]
     assert client.resolved_directory_ids == []
 
 
@@ -426,9 +422,7 @@ def test_file_browser_service_passes_expected_sha256_to_downloader(
 
     def fake_download_url(http_client, url, local_path, **kwargs):
         captured.update(kwargs)
-        return DownloadResult(
-            status="已完成", task_id=kwargs["task_id"], local_path=local_path
-        )
+        return DownloadResult(status="已完成", task_id=kwargs["task_id"], local_path=local_path)
 
     monkeypatch.setattr("openwopan.app.file_browser.download_url", fake_download_url)
     service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
@@ -575,7 +569,6 @@ def test_file_browser_service_forwards_upload_progress(tmp_path: Path) -> None:
 
     assert progress == [(2, 8)]
 
-
     class _ExistingNameClient(FakeClient):
         def list_files(self, parent_id: str) -> list[WopanItem]:
             return [
@@ -630,7 +623,9 @@ def test_file_browser_service_cancels_after_cloud_preflight(tmp_path: Path) -> N
 
     with pytest.raises(FileBrowserUploadCancelledError, match="上传已取消"):
         service.upload_file(
-            "folder-1", local_path, upload_name="upload.txt",
+            "folder-1",
+            local_path,
+            upload_name="upload.txt",
             cancel_requested=lambda: cancelled,
         )
 
@@ -677,8 +672,22 @@ def test_file_browser_service_updates_transfer_settings_for_future_uploads(
             "max_upload_threads": 4,
             "retry_max_attempts": 2,
             "upload_name": None,
+            "quick_transfer": True,
         }
     ]
+
+
+def test_file_browser_service_quick_transfer_setting_passes_through(tmp_path: Path) -> None:
+    """秒传开关随设置传递：关闭后客户端收到 quick_transfer=False。"""
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    service.update_settings(AppSettings(enable_quick_transfer=False))
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"upload-content")
+
+    service.upload_file("folder-1", local_path)
+
+    assert client.upload_kwargs[0]["quick_transfer"] is False
 
 
 def test_file_browser_service_syncs_runtime_download_settings(tmp_path: Path) -> None:
@@ -1045,7 +1054,9 @@ class FolderUploadFakeClient(FakeClient):
             for name in sorted(self.existing_names.get(parent_id, set()))
         ]
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
         self.created_folders.append((parent_id, name))
         if self.error is not None:
             raise self.error
@@ -1068,6 +1079,312 @@ def _make_local_tree(tmp_path: Path) -> Path:
     return root
 
 
+class _MergeCloudClient(FakeClient):
+    """Cloud double whose listings carry folders and sized files (merge tests).
+
+    ``create_folder(reuse_existing=True)`` emulates the server merge
+    contract ``prepare_folder_upload`` now relies on: a same-name folder
+    (matched by stored name, long names truncated) is reused and its id
+    returned without creating anything; everything else creates a folder.
+    Unverified edge kept out of the double: a same-name FILE occupying the
+    name (real-server behavior unknown until UAT) falls through to create.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entries: dict[str, list[WopanItem]] = {}
+        self.created: list[tuple[str, str]] = []
+        self.merged: list[tuple[str, str]] = []
+        self.listed_dirs: list[str] = []
+
+    def list_files(self, parent_id: str) -> list[WopanItem]:
+        self.listed_dirs.append(parent_id)
+        return list(self.entries.get(parent_id, []))
+
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
+        if reuse_existing:
+            for item in self.entries.get(parent_id, []):
+                if item.kind is not WopanItemKind.FOLDER:
+                    continue
+                if name == item.name or server_file_name(name) == item.name:
+                    self.merged.append((parent_id, name))
+                    return item
+        self.created.append((parent_id, name))
+        item = WopanItem(
+            item_id=f"new-dir-{len(self.created)}",
+            name=name,
+            kind=WopanItemKind.FOLDER,
+            parent_id=parent_id,
+        )
+        self.entries.setdefault(parent_id, []).append(item)
+        return item
+
+
+def test_prepare_folder_upload_merge_reuses_dirs_and_skips_completed_files(
+    tmp_path: Path,
+) -> None:
+    """合并模式：同名根/子目录复用不重建，同名同大小文件跳过，只补缺失。"""
+    client, local_root = _merge_tree_fixture(tmp_path)
+
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+
+    assert job.root_item_id == "cloud-photos"  # 根目录复用
+    # 只新建了缺失的 season3；photos/season1/season2 都未重建
+    assert client.created == [("cloud-photos", "season3")]
+
+    planned = {(f.target_dir_id, f.name): f.size for f in job.files}
+    assert ("cloud-s1", "ep2.mkv") in planned  # 缺失文件补传
+    assert ("cloud-s2", "new.mkv") in planned  # 上传进复用目录
+    assert any(dir_id.startswith("new-dir-") and name == "x.mkv" for (dir_id, name) in planned)
+    assert all(name != "ep1.mkv" for (_dir_id, name) in planned)  # 同名同大小跳过
+    # 同名不同大小 → 副本名补传
+    assert any(name.startswith("ep3") and "copy" in name for (_dir_id, name) in planned)
+
+
+def test_prepare_folder_upload_merge_delegates_dir_reuse_to_server(tmp_path: Path) -> None:
+    """合并模式目录复用走服务端合并契约：根/子目录 id 一律来自
+    create_folder(reuse_existing=True)，不再预列父目录按名字猜测。"""
+    client, local_root = _merge_tree_fixture(tmp_path)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+
+    assert client.merged == [
+        ("0", "photos"),
+        ("cloud-photos", "season1"),
+        ("cloud-photos", "season2"),
+    ]
+    assert client.created == [("cloud-photos", "season3")]  # 缺的目录仍新建
+    assert job.root_item_id == "cloud-photos"
+    # 父目录不列（"0"/"cloud-photos" 都不含文件）；列目录只发生在含文件
+    # 的目录上，为文件级跳过/副本名服务。
+    assert client.listed_dirs == ["cloud-s1", "cloud-s2", "new-dir-1"]
+
+
+def test_prepare_merge_long_dir_name_merges_by_server_stored_form(tmp_path: Path) -> None:
+    """合并模式下超长目录名交给服务端按存储形态合并：截断存储的云端
+    目录照样复用，不需要客户端列目录比对名字。"""
+    client = _MergeCloudClient()
+    long_dir = "a" * 99 + ".dir"  # 103 字符，服务端存 100 字符截断名
+    stored_dir = server_file_name(long_dir)
+    cloud_root = WopanItem(item_id="r", name="photos", kind=WopanItemKind.FOLDER)
+    cloud_sub = WopanItem(item_id="sub", name=stored_dir, kind=WopanItemKind.FOLDER, parent_id="r")
+    done = WopanItem(
+        item_id="f1",
+        name="ep1.mkv",
+        kind=WopanItemKind.FILE,
+        parent_id="sub",
+        size=100,
+        download_id="fid-1",
+    )
+    client.entries["0"] = [cloud_root]
+    client.entries["r"] = [cloud_sub]
+    client.entries["sub"] = [done]
+    local_root = tmp_path / "photos"
+    (local_root / long_dir).mkdir(parents=True)
+    (local_root / long_dir / "ep1.mkv").write_bytes(b"a" * 100)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+
+    assert client.merged == [("0", "photos"), ("r", long_dir)]  # 长名子目录复用
+    assert client.created == []
+    assert job.files == ()  # 同名同大小文件跳过
+
+
+def test_prepare_folder_upload_without_merge_rejects_existing_root(tmp_path: Path) -> None:
+    """非合并模式保持原语义：根目录同名直接报错。"""
+    client = _MergeCloudClient()
+    client.entries["0"] = [
+        WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
+    ]
+    local_root = tmp_path / "photos"
+    local_root.mkdir()
+    (local_root / "a.mkv").write_bytes(b"x")
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserError, match="上传目标已存在"):
+        service.prepare_folder_upload("0", local_root, root_name="photos")
+
+
+def _merge_tree_fixture(tmp_path: Path) -> tuple[_MergeCloudClient, Path]:
+    client = _MergeCloudClient()
+    cloud_root = WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
+    cloud_s1 = WopanItem(
+        item_id="cloud-s1", name="season1", kind=WopanItemKind.FOLDER, parent_id="cloud-photos"
+    )
+    cloud_s2 = WopanItem(
+        item_id="cloud-s2", name="season2", kind=WopanItemKind.FOLDER, parent_id="cloud-photos"
+    )
+    done_ep1 = WopanItem(
+        item_id="f1",
+        name="ep1.mkv",
+        kind=WopanItemKind.FILE,
+        parent_id="cloud-s1",
+        size=100,
+        download_id="fid-1",
+    )
+    different_ep3 = WopanItem(
+        item_id="f2",
+        name="ep3.mkv",
+        kind=WopanItemKind.FILE,
+        parent_id="cloud-s1",
+        size=999,
+        download_id="fid-2",
+    )
+    client.entries["0"] = [cloud_root]
+    client.entries["cloud-photos"] = [cloud_s1, cloud_s2]
+    client.entries["cloud-s1"] = [done_ep1, different_ep3]
+
+    local_root = tmp_path / "photos"
+    (local_root / "season1").mkdir(parents=True)
+    (local_root / "season2").mkdir()
+    (local_root / "season3").mkdir()
+    (local_root / "season1" / "ep1.mkv").write_bytes(b"a" * 100)
+    (local_root / "season1" / "ep2.mkv").write_bytes(b"b" * 200)
+    (local_root / "season1" / "ep3.mkv").write_bytes(b"c" * 300)
+    (local_root / "season2" / "new.mkv").write_bytes(b"d" * 50)
+    (local_root / "season3" / "x.mkv").write_bytes(b"e" * 10)
+    return client, local_root
+
+
+def test_estimate_merge_uploads_matches_prepare_skip_rules(tmp_path: Path) -> None:
+    """估算与 prepare(merge) 的跳过判定同源：同名同大小跳过、其余新增，
+    且完全只读（不创建任何云端内容）。"""
+    client, local_root = _merge_tree_fixture(tmp_path)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    estimate = service.estimate_merge_uploads("0", local_root, root_name="photos")
+
+    # ep1 同名同大小跳过；ep2 缺失、ep3 大小不同、season2/new、season3/x 新增
+    assert estimate.files_to_upload == 4
+    assert estimate.files_skipped == 1
+    assert client.created == []  # 只读：不建目录
+
+    # 估算数与真实 prepare 的计划一致
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+    assert len(job.files) == estimate.files_to_upload
+
+
+def test_estimate_merge_uploads_root_missing_counts_everything(tmp_path: Path) -> None:
+    """同名根目录不存在：整棵树全量新增。"""
+    client, local_root = _merge_tree_fixture(tmp_path)
+    client.entries["0"] = []  # 云端没有 photos
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    estimate = service.estimate_merge_uploads("0", local_root, root_name="photos")
+
+    assert estimate.files_to_upload == 5
+    assert estimate.files_skipped == 0
+
+
+def _truncated_name_fixture(tmp_path: Path, cloud_size: int) -> tuple[_MergeCloudClient, Path]:
+    """本地 103 字符长名文件 vs 云端 100 字符截断名存储。"""
+    client = _MergeCloudClient()
+    long_name = "a" * 99 + ".mkv"  # 主名 99 + ".mkv" = 103
+    stored_name = server_file_name(long_name)
+    cloud_root = WopanItem(item_id="cloud-photos", name="photos", kind=WopanItemKind.FOLDER)
+    stored_file = WopanItem(
+        item_id="f1",
+        name=stored_name,
+        kind=WopanItemKind.FILE,
+        parent_id="cloud-photos",
+        size=cloud_size,
+        download_id="fid-1",
+    )
+    client.entries["0"] = [cloud_root]
+    client.entries["cloud-photos"] = [stored_file]
+
+    local_root = tmp_path / "photos"
+    local_root.mkdir()
+    (local_root / long_name).write_bytes(b"a" * 100)
+    return client, local_root
+
+
+def test_prepare_merge_skips_files_stored_with_truncated_names(tmp_path: Path) -> None:
+    """长名文件上传后云端以截断名存储：合并模式按存储形态识别为已存在。
+
+    UAT 2026-10-06：服务端把超过 100 字符的文件名截断（主名保留至总长
+    100），此前按精确名比对会误判"缺失"而反复重传。
+    """
+    client, local_root = _truncated_name_fixture(tmp_path, cloud_size=100)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+    estimate = service.estimate_merge_uploads("0", local_root, root_name="photos")
+
+    assert job.files == ()  # 截断名 + 同大小 → 已上传，跳过
+    assert client.created == []  # 根目录复用，不重建
+    assert estimate == MergeUploadEstimate(files_to_upload=0, files_skipped=1)
+
+
+def test_prepare_merge_truncated_name_size_mismatch_plans_fitting_copy(
+    tmp_path: Path,
+) -> None:
+    """截断名同名但大小不同 → 补传副本名，且副本名必须在服务端限制内。"""
+    client, local_root = _truncated_name_fixture(tmp_path, cloud_size=999)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+    estimate = service.estimate_merge_uploads("0", local_root, root_name="photos")
+
+    (planned,) = job.files
+    assert len(planned.name) <= 100  # (copy) 标记不能落在截断点之后
+    assert "(copy)" in planned.name
+    assert estimate == MergeUploadEstimate(files_to_upload=1, files_skipped=0)
+
+
+def test_prepare_folder_upload_long_dotted_dir_names_do_not_collide(
+    tmp_path: Path,
+) -> None:
+    """同 96 前缀的两个长名子目录：按服务端存储形态去重，第二个用副本名。
+
+    目录名只在含扩展名点时适用截断规则；此处用带点目录名构造碰撞。
+    """
+    client = _MergeCloudClient()
+    local_root = tmp_path / "fresh"
+    long_a = "a" * 96 + "XXX" + ".dir"  # 103 字符，存储形态与 long_a/b 相同
+    long_b = "a" * 96 + "YYY" + ".dir"
+    (local_root / long_a).mkdir(parents=True)
+    (local_root / long_b).mkdir()
+    (local_root / long_a / "f.mkv").write_bytes(b"a")
+    (local_root / long_b / "g.mkv").write_bytes(b"b")
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root)  # 非合并、不重命名
+
+    created_names = [name for (_parent, name) in client.created]
+    assert len(created_names) == 3  # 根目录 + 两个子目录
+    second_dir = created_names[2]
+    assert len(second_dir) <= 100  # 副本名落在服务端限制内
+    assert "(copy)" in second_dir
+    assert len(job.files) == 2
+
+
+def test_upload_file_precheck_matches_truncated_cloud_names(tmp_path: Path) -> None:
+    """单文件上传前置检查：云端已有截断名 → 启动即拒绝，不再传完 N-1 片后 500。"""
+    client = _MergeCloudClient()
+    long_name = "a" * 99 + ".mkv"
+    stored = WopanItem(
+        item_id="f1",
+        name=server_file_name(long_name),
+        kind=WopanItemKind.FILE,
+        parent_id="0",
+        size=100,
+        download_id="fid-1",
+    )
+    client.entries["0"] = [stored]
+    local = tmp_path / long_name
+    local.write_bytes(b"a" * 100)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    with pytest.raises(FileBrowserError, match="上传目标已存在"):
+        service.upload_file("0", local, upload_name=long_name)
+
+
 def test_prepare_folder_upload_stops_between_cloud_creates(tmp_path: Path) -> None:
     client = FolderUploadFakeClient()
     service = FileBrowserService(client)  # type: ignore[arg-type]
@@ -1075,9 +1392,9 @@ def test_prepare_folder_upload_stops_between_cloud_creates(tmp_path: Path) -> No
     stopped = False
     create_folder = client.create_folder
 
-    def stop_after_root(parent_id: str, name: str) -> WopanItem:
+    def stop_after_root(parent_id: str, name: str, *, reuse_existing: bool = False) -> WopanItem:
         nonlocal stopped
-        item = create_folder(parent_id, name)
+        item = create_folder(parent_id, name, reuse_existing=reuse_existing)
         stopped = True
         return item
 
@@ -1206,10 +1523,12 @@ def test_prepare_folder_upload_fails_without_partial_job_on_create_error(
     tmp_path: Path,
 ) -> None:
     class _FailSecondCreate(FolderUploadFakeClient):
-        def create_folder(self, parent_id: str, name: str) -> WopanItem:
+        def create_folder(
+            self, parent_id: str, name: str, *, reuse_existing: bool = False
+        ) -> WopanItem:
             if self.created_folders:
                 raise WopanBusinessError("0001", "denied")
-            return super().create_folder(parent_id, name)
+            return super().create_folder(parent_id, name, reuse_existing=reuse_existing)
 
     client = _FailSecondCreate()
     service = FileBrowserService(client)  # type: ignore[arg-type]
@@ -1511,6 +1830,170 @@ def test_service_upload_retry_reuses_session_and_skips_completed_parts(
     assert item.item_id == "uploaded-file"
     task_id = make_upload_task_id("folder-1", local_path, None)
     assert _state(store, task_id) is None
+
+
+def test_service_upload_cancel_preserves_session_when_abandon_flagged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """关闭退出的取消（cancel 回调带 preserve_session）保留会话分片；
+    普通用户取消仍删除会话。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1"), (2, "fid-2")]
+    client.upload_failure = WopanUploadCancelledError("client cancelled")
+    local_path = _three_part_file(tmp_path)
+
+    def abandon_cancel() -> bool:
+        return False
+
+    abandon_cancel.preserve_session = True  # type: ignore[attr-defined]
+
+    with pytest.raises(FileBrowserUploadCancelledError):
+        service.upload_file("folder-1", local_path, cancel_requested=abandon_cancel)
+
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    state = _state(store, task_id)
+    assert state is not None
+    assert state.completed_indexes == [1, 2]
+    # 关闭退出 ≠ 取消：会话归一为「已暂停（中断）」而非删除，重启后
+    # was_active=False，由用户手动继续而非自动续传。
+    assert state.status == "已暂停"
+    assert "应用中断" in state.error and "2/3" in state.error
+
+    with pytest.raises(FileBrowserUploadCancelledError):
+        service.upload_file("folder-1", local_path, cancel_requested=lambda: False)
+
+    assert _state(store, task_id) is None
+
+
+def test_service_upload_restarts_fresh_when_session_rejected_with_5xx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """服务端拒绝续传会话（5xx 且零新分片）：丢弃旧会话整文件重传一次。
+
+    UAT 2026-10-06：130/131 分片的会话续传最后一片时服务端持续回
+    HTTP 500，原路径反复用同一会话重试永远失败。
+    """
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+
+    class _RejectResumeClient(ResumeAwareUploadClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject_resumes = False
+            self._request = httpx.Request("POST", "https://upload.example/openapi/client/upload2C")
+            self._response = httpx.Response(500, request=self._request)
+
+        def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
+            resume = kwargs.get("resume")
+            if (
+                self.reject_resumes
+                and isinstance(resume, UploadResumeContext)
+                and resume.completed_indexes
+            ):
+                self.uploaded_files.append((parent_id, local_path))
+                self.upload_kwargs.append(kwargs)
+                raise httpx.HTTPStatusError(
+                    "Server Error", request=self._request, response=self._response
+                )
+            return super().upload_file(parent_id, local_path, **kwargs)
+
+    client = _RejectResumeClient()
+    service, client, store = _resume_service(tmp_path, client=client)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+
+    client.upload_failure = None
+    client.reject_resumes = True
+    client.part_results = []  # 本次尝试零新分片确认
+    item = service.upload_file("folder-1", local_path)
+
+    assert item.item_id == "uploaded-file"
+    assert len(client.upload_kwargs) == 3
+    second_resume = client.upload_kwargs[1]["resume"]
+    third_resume = client.upload_kwargs[2]["resume"]
+    assert isinstance(second_resume, UploadResumeContext)
+    assert isinstance(third_resume, UploadResumeContext)
+    assert second_resume.completed_indexes == frozenset({1})
+    assert third_resume.completed_indexes == frozenset()
+    assert third_resume.unique_id != second_resume.unique_id
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    assert _state(store, task_id) is None
+
+
+def test_restart_rejected_session_keeps_parts_when_stat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """会话重传启动前文件消失：报可读错误且旧会话分片保留（不被删除）。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+
+    class _RejectAndVanishClient(ResumeAwareUploadClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject = False
+            self._request = httpx.Request("POST", "https://upload.example/x")
+            self._response = httpx.Response(500, request=self._request)
+
+        def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
+            resume = kwargs.get("resume")
+            if self.reject and isinstance(resume, UploadResumeContext) and resume.completed_indexes:
+                local_path.unlink()
+                raise httpx.HTTPStatusError(
+                    "Server Error", request=self._request, response=self._response
+                )
+            return super().upload_file(parent_id, local_path, **kwargs)
+
+    client = _RejectAndVanishClient()
+    service, client, store = _resume_service(tmp_path, client=client)
+    local_path = tmp_path / "report.bin"
+    local_path.write_bytes(b"012345678901234")
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+
+    client.upload_failure = None
+    client.reject = True
+    client.part_results = []
+    with pytest.raises(FileBrowserError, match="无法读取本地文件"):
+        service.upload_file("folder-1", local_path)
+
+    state = store.load(make_upload_task_id("folder-1", local_path, None))
+    assert state is not None
+    assert state.completed_indexes == [1]  # 旧会话断点未丢
+
+
+def test_service_upload_keeps_session_when_new_parts_confirmed_before_5xx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """5xx 前已确认新分片：保留会话走正常失败-续传，不整文件重传。"""
+    monkeypatch.setattr("openwopan.wopan.client.BYTES_PER_MB", 1)
+    service, client, store = _resume_service(tmp_path)
+    client.part_results = [(1, "fid-1")]
+    client.upload_failure = WopanBusinessError("9999", "busy")
+    local_path = _three_part_file(tmp_path)
+
+    with pytest.raises(FileBrowserError):
+        service.upload_file("folder-1", local_path)
+
+    request = httpx.Request("POST", "https://upload.example/openapi/client/upload2C")
+    response = httpx.Response(503, request=request)
+    client.upload_failure = httpx.HTTPStatusError(
+        "Service Unavailable", request=request, response=response
+    )
+    client.part_results = [(2, "fid-2")]  # 本次尝试确认了新分片
+    with pytest.raises(FileBrowserError, match="503"):
+        service.upload_file("folder-1", local_path)
+
+    assert len(client.upload_kwargs) == 2  # 没有第三次整文件重传
+    task_id = make_upload_task_id("folder-1", local_path, None)
+    state = _state(store, task_id)
+    assert state is not None
+    assert state.completed_indexes == [1, 2]
+    assert state.status == "失败"
 
 
 def test_service_upload_discards_state_on_file_size_change(
@@ -1958,9 +2441,7 @@ def test_service_upload_rejects_empty_upload_name(tmp_path: Path) -> None:
     assert client.uploaded_files == []
 
 
-def test_service_upload_maps_stat_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_service_upload_maps_stat_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service, _client, _store = _resume_service(tmp_path)
     local_path = tmp_path / "upload.txt"
     local_path.write_bytes(b"data")

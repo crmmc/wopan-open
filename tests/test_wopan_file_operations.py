@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from collections.abc import Iterator
 from email.parser import BytesParser
@@ -11,6 +12,7 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from openwopan.wopan import client as client_module
 from openwopan.wopan.client import WopanClient
 from openwopan.wopan.errors import (
     WopanBusinessError,
@@ -18,6 +20,7 @@ from openwopan.wopan.errors import (
     WopanUploadCancelledError,
 )
 from openwopan.wopan.models import WopanItemKind
+from openwopan.wopan.naming import server_file_name
 
 TOKEN = "1234567890abcdef-token"
 COOKIE_HEADER = f"foo=bar; WoCloud-Web-Token={TOKEN}"
@@ -57,8 +60,7 @@ def _decrypt_wohome_payload(payload: str) -> dict[str, object]:
 def _multipart_parts(request: httpx.Request) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
     content_type = request.headers["Content-Type"]
     message = BytesParser(policy=default).parsebytes(
-        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode()
-        + request.content
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + request.content
     )
     fields: dict[str, str] = {}
     files: dict[str, tuple[str, bytes]] = {}
@@ -180,6 +182,71 @@ def test_create_folder_requires_created_id() -> None:
 
     with pytest.raises(WopanResponseError, match="missing id"):
         client.create_folder("0", "Reports")
+
+
+def _rsp_code_response(code: str, data: object) -> httpx.Response:
+    return _json_response(
+        {
+            "STATUS": "200",
+            "MSG": "ok",
+            "RSP": {
+                "RSP_CODE": code,
+                "RSP_DESC": "desc",
+                "DATA": _encrypt_wohome_payload(data),
+            },
+        }
+    )
+
+
+def test_create_folder_reuse_existing_sends_is_could_repeat_and_reuses_130007_id() -> None:
+    """reuse_existing：请求带 isCouldRepeat="1"，130007（同名目录已存在）
+    按成功处理并复用 DATA.id —— 官方客户端文件夹上传的目录合并契约。"""
+    client, captured = _client_and_captured_params(
+        [_rsp_code_response("130007", {"id": "existing-dir"})]
+    )
+
+    item = client.create_folder("0", "Reports", reuse_existing=True)
+
+    assert item.item_id == "existing-dir"
+    assert item.name == "Reports"
+    assert item.kind is WopanItemKind.FOLDER
+    assert item.parent_id == "0"
+    assert captured == [
+        (
+            "CreateDirectory",
+            {
+                "spaceType": "0",
+                "familyId": "0",
+                "parentDirectoryId": "0",
+                "directoryName": "Reports",
+                "clientId": "1001000021",
+                "isCouldRepeat": "1",
+            },
+        )
+    ]
+
+
+def test_create_folder_reuse_existing_accepts_new_directory_too() -> None:
+    """reuse_existing 下全新目录照常创建（0000 + 新 id）。"""
+    client, captured = _client_and_captured_params([_success_response({"id": "dir-9"})])
+
+    item = client.create_folder("0", "Reports", reuse_existing=True)
+
+    assert item.item_id == "dir-9"
+    assert captured[0][1]["isCouldRepeat"] == "1"
+
+
+def test_create_folder_without_reuse_still_rejects_130007() -> None:
+    """默认路径保持原语义：不带 isCouldRepeat，130007 仍是业务错误。"""
+    client, captured = _client_and_captured_params(
+        [_rsp_code_response("130007", {"id": "existing-dir"})]
+    )
+
+    with pytest.raises(WopanBusinessError) as excinfo:
+        client.create_folder("0", "Reports")
+
+    assert excinfo.value.code == "130007"
+    assert "isCouldRepeat" not in captured[0][1]
 
 
 def test_rename_file_calls_rename_file_or_directory_with_kind_and_file_type() -> None:
@@ -471,9 +538,7 @@ def test_get_directory_path_rejects_malformed_responses() -> None:
         ([{"directoryName": "test"}], "missing id or name"),
     ],
 )
-def test_get_directory_path_rejects_malformed_items(
-    data: list[object], match: str
-) -> None:
+def test_get_directory_path_rejects_malformed_items(data: list[object], match: str) -> None:
     client, _captured = _client_and_captured_params([_success_response(data)])
 
     with pytest.raises(WopanResponseError, match=match):
@@ -548,7 +613,11 @@ def test_upload_file_gets_zone_and_posts_single_part(tmp_path: Path) -> None:
     assert len(file_info["batchNo"]) == 14
 
 
-def test_upload_file_retries_transient_upload_zone_gateway_error(tmp_path: Path) -> None:
+def test_upload_file_retries_transient_upload_zone_gateway_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(client_module, "_sleep_cancelable", lambda s, _c: sleeps.append(s))
     local_file = tmp_path / "report.txt"
     local_file.write_text("upload-content")
     zone_attempts = 0
@@ -574,6 +643,7 @@ def test_upload_file_retries_transient_upload_zone_gateway_error(tmp_path: Path)
 
     assert item.item_id == "fid-1"
     assert zone_attempts == 2
+    assert sleeps == [5.0]  # 官方契约：重试间隔 5 秒
 
 
 def test_upload_file_posts_multiple_parts_when_configured(
@@ -778,6 +848,25 @@ def test_upload_cancel_prevents_zone_retry(tmp_path: Path) -> None:
     assert len(requests) == 1
 
 
+def test_sleep_cancelable_returns_after_duration() -> None:
+    """重试等待正常走完（短时长验证，不拖慢测试）。"""
+    import time as time_module
+
+    started = time_module.monotonic()
+    client_module._sleep_cancelable(0.3, None)
+    assert time_module.monotonic() - started >= 0.3
+
+
+def test_sleep_cancelable_raises_promptly_on_cancel() -> None:
+    """重试等待期间取消：0.2s 步进内立即抛出，上传取消保持灵敏。"""
+    import time as time_module
+
+    started = time_module.monotonic()
+    with pytest.raises(WopanUploadCancelledError):
+        client_module._sleep_cancelable(5.0, lambda: True)
+    assert time_module.monotonic() - started < 1.0
+
+
 def test_upload_file_falls_back_to_default_zone_url(tmp_path: Path) -> None:
     local_file = tmp_path / "report.bin"
     local_file.write_bytes(b"x")
@@ -799,7 +888,10 @@ def test_upload_file_falls_back_to_default_zone_url(tmp_path: Path) -> None:
     assert upload_urls == ["https://tjupload.pan.wo.cn/openapi/client/upload2C"]
 
 
-def test_upload_file_maps_non_success_upload_response(tmp_path: Path) -> None:
+def test_upload_file_maps_non_success_upload_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "_sleep_cancelable", lambda *_args: None)
     local_file = tmp_path / "report.txt"
     local_file.write_text("content")
 
@@ -815,6 +907,273 @@ def test_upload_file_maps_non_success_upload_response(tmp_path: Path) -> None:
 
     with pytest.raises(WopanBusinessError, match="failed"):
         client.upload_file("0", local_file)
+
+
+def test_upload_part_failure_logs_server_error_body(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """分片 500：每次重试的日志必须带上服务端响应体片段——裸 500 的唯一
+    文字线索（此前只记状态码，服务端给的原因被 raise_for_status 丢弃）。"""
+    monkeypatch.setattr(client_module, "_sleep_cancelable", lambda *_args: None)
+    local_file = tmp_path / "report.txt"
+    local_file.write_text("content")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return _success_response({"url": "https://upload.example.test"})
+        return httpx.Response(500, json={"error": "part assembly failed"})
+
+    client = WopanClient(
+        COOKIE_HEADER,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with caplog.at_level("WARNING", logger="openwopan.wopan.client"):
+        with pytest.raises(httpx.HTTPStatusError):
+            client.upload_file("0", local_file)
+
+    attempt_lines = [
+        line for line in caplog.text.splitlines() if "upload_part.attempt_failed" in line
+    ]
+    assert len(attempt_lines) == 4  # 默认重试 3 次 → 共 4 次尝试，每次都留痕
+    assert "status=500" in caplog.text
+    assert "part assembly failed" in caplog.text  # 响应体片段入库
+    assert "upload_file.http_error" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Quick transfer (秒传) — instant upload by content hash, official-client
+# parity: full-file SHA-256 → POST b.smartont.net quickTransfer; hasFile=1
+# completes without any part; anything else falls back to the chunked upload.
+# ---------------------------------------------------------------------------
+
+QUICK_TRANSFER_CONTENT = b"q" * (3 * 1024 * 1024)  # 恰好到达官方 3MB 探测阈值
+
+
+def _upload_flow_client(
+    quick_responses: list[httpx.Response],
+    dispatch_responses: list[httpx.Response],
+) -> tuple[WopanClient, list[dict[str, object]], list[httpx.Request]]:
+    """Client double routing smartont（秒传）/wohome dispatch/分片上传三类流量。
+
+    ``quick_responses`` 按探测尝试顺序逐个返回（官方契约：最多 3 次尝试）。
+    """
+    quick_payloads: list[dict[str, object]] = []
+    upload_requests: list[httpx.Request] = []
+    dispatch_iter: Iterator[httpx.Response] = iter(dispatch_responses)
+    quick_iter: Iterator[httpx.Response] = iter(quick_responses)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "b.smartont.net":
+            assert request.headers["access-token"] == TOKEN
+            quick_payloads.append(json.loads(request.content))
+            return next(quick_iter)
+        if str(request.url).endswith("/wohome/dispatcher"):
+            return next(dispatch_iter)
+        upload_requests.append(request)
+        return httpx.Response(
+            200, json={"code": "0000", "data": {"fid": "fid-uploaded"}, "msg": "ok"}
+        )
+
+    client = WopanClient(
+        COOKIE_HEADER,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    return client, quick_payloads, upload_requests
+
+
+def _quick_hit_response(has_file: int, fid: str = "") -> httpx.Response:
+    result: dict[str, object] = {"hasFile": has_file}
+    if fid:
+        result["fid"] = fid
+    return httpx.Response(200, json={"meta": {"code": "0000"}, "result": result})
+
+
+def test_upload_file_quick_transfer_hit_completes_without_parts(tmp_path: Path) -> None:
+    """秒传命中：零分片、零 zone 请求，一次探测即完成并上报满进度。"""
+    local_file = tmp_path / "movie.mkv"
+    local_file.write_bytes(QUICK_TRANSFER_CONTENT)
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [_quick_hit_response(1, fid="fid-qt")], []
+    )
+    progress: list[tuple[int, int]] = []
+
+    item = client.upload_file(
+        "folder-1",
+        local_file,
+        quick_transfer=True,
+        progress_callback=lambda uploaded, total: progress.append((uploaded, total)),
+    )
+
+    assert item.item_id == "fid-qt"
+    assert item.download_id == "fid-qt"
+    assert item.name == "movie.mkv"
+    assert item.size == len(QUICK_TRANSFER_CONTENT)
+    assert item.parent_id == "folder-1"
+    assert upload_requests == []  # 没有任何分片上传
+    assert progress == [(len(QUICK_TRANSFER_CONTENT), len(QUICK_TRANSFER_CONTENT))]
+    (payload,) = quick_payloads
+    assert payload["sha256"] == hashlib.sha256(QUICK_TRANSFER_CONTENT).hexdigest()
+    assert payload["fileName"] == "movie.mkv"
+    assert payload["fileType"] == "2"  # mkv → 视频类型码
+    assert payload["fileSize"] == len(QUICK_TRANSFER_CONTENT)
+    assert payload["directoryId"] == "folder-1"
+    assert payload["spaceType"] == "0"
+    assert isinstance(payload["fileModificationTime"], int)
+    batch_no = str(payload["batchNo"])
+    assert len(batch_no) == 14 and batch_no.isdigit()
+
+
+def test_upload_file_quick_transfer_miss_falls_back_to_chunk_upload(tmp_path: Path) -> None:
+    """秒传未命中（hasFile=0）：回落分片上传，流程照常完成。"""
+    local_file = tmp_path / "movie.mkv"
+    local_file.write_bytes(QUICK_TRANSFER_CONTENT)
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [_quick_hit_response(0)], [_success_response({"url": "https://upload.example.test"})]
+    )
+
+    item = client.upload_file("folder-1", local_file, quick_transfer=True)
+
+    assert item.item_id == "fid-uploaded"
+    assert len(upload_requests) == 1
+    assert str(upload_requests[0].url) == "https://upload.example.test/openapi/client/upload2C"
+    assert len(quick_payloads) == 1
+
+
+def test_upload_file_quick_transfer_probe_error_falls_back(tmp_path: Path) -> None:
+    """探测三次尝试全 500：秒传失败绝不阻塞上传，回落分片照常完成。"""
+    local_file = tmp_path / "movie.mkv"
+    local_file.write_bytes(QUICK_TRANSFER_CONTENT)
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [httpx.Response(500, json={})] * 3,
+        [_success_response({"url": "https://upload.example.test"})],
+    )
+
+    item = client.upload_file("folder-1", local_file, quick_transfer=True)
+
+    assert item.item_id == "fid-uploaded"
+    assert len(upload_requests) == 1
+    assert len(quick_payloads) == 3  # 官方契约：重试 2 次，共 3 次尝试
+
+
+def test_upload_file_skips_quick_transfer_by_default(tmp_path: Path) -> None:
+    """默认关闭：协议层不主动探测（由服务层按设置开启）。"""
+    local_file = tmp_path / "movie.mkv"
+    local_file.write_bytes(QUICK_TRANSFER_CONTENT)
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [_quick_hit_response(1, fid="fid-qt")],
+        [_success_response({"url": "https://upload.example.test"})],
+    )
+
+    item = client.upload_file("folder-1", local_file)
+
+    assert item.item_id == "fid-uploaded"  # 走了正常上传
+    assert quick_payloads == []
+
+
+def test_upload_file_quick_transfer_skips_small_files(tmp_path: Path) -> None:
+    """小于 3MB 阈值：即使开启也不探测（官方客户端同款门限）。"""
+    local_file = tmp_path / "tiny.txt"
+    local_file.write_bytes(b"tiny")
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [_quick_hit_response(1, fid="fid-qt")],
+        [_success_response({"url": "https://upload.example.test"})],
+    )
+
+    item = client.upload_file("folder-1", local_file, quick_transfer=True)
+
+    assert item.item_id == "fid-uploaded"
+    assert quick_payloads == []
+    assert len(upload_requests) == 1
+
+
+def test_upload_file_quick_transfer_hit_without_fid_recovers_from_listing(
+    tmp_path: Path,
+) -> None:
+    """命中但响应无 fid：按列表恢复（含长名截断存储形态），绝不重发分片。"""
+    long_name = "b" * 99 + ".mkv"  # 103 字符，服务端存 100 字符截断名
+    stored_name = server_file_name(long_name)
+    local_file = tmp_path / long_name
+    local_file.write_bytes(QUICK_TRANSFER_CONTENT)
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [_quick_hit_response(1)],
+        [
+            _success_response(
+                {
+                    "files": [
+                        {
+                            "id": "item-1",
+                            "name": stored_name,
+                            "type": "1",
+                            "fid": "fid-listed",
+                            "size": len(QUICK_TRANSFER_CONTENT),
+                        }
+                    ]
+                }
+            )
+        ],
+    )
+
+    item = client.upload_file("folder-1", local_file, upload_name=long_name, quick_transfer=True)
+
+    assert item.item_id == "fid-listed"
+    assert item.download_id == "fid-listed"
+    assert item.name == long_name
+    assert upload_requests == []  # 未重发任何分片
+
+
+def test_upload_file_quick_transfer_hit_without_fid_and_missing_listing_raises(
+    tmp_path: Path,
+) -> None:
+    """命中、无 fid、列表也没有：直接失败提示刷新，避免重复上传产生副本。"""
+    local_file = tmp_path / "movie.mkv"
+    local_file.write_bytes(QUICK_TRANSFER_CONTENT)
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [_quick_hit_response(1)], [_success_response({"files": []})]
+    )
+
+    with pytest.raises(WopanResponseError, match="秒传已完成但目标目录未找到对应文件"):
+        client.upload_file("folder-1", local_file, quick_transfer=True)
+
+    assert upload_requests == []
+
+
+def test_upload_file_quick_transfer_retries_transient_probe_errors(tmp_path: Path) -> None:
+    """官方契约：瞬时失败重试（共 3 次尝试），前两次 500 第三次命中即秒传完成。"""
+    local_file = tmp_path / "movie.mkv"
+    local_file.write_bytes(QUICK_TRANSFER_CONTENT)
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [
+            httpx.Response(500, json={}),
+            httpx.Response(500, json={}),
+            _quick_hit_response(1, fid="fid-qt"),
+        ],
+        [],
+    )
+
+    item = client.upload_file("folder-1", local_file, quick_transfer=True)
+
+    assert item.item_id == "fid-qt"
+    assert len(quick_payloads) == 3  # 三次尝试各带同一份哈希载荷
+    assert upload_requests == []
+
+
+def test_upload_file_quick_transfer_recovery_listing_error_raises_friendly(
+    tmp_path: Path,
+) -> None:
+    """命中无 fid 且恢复列表 5xx：转为友好报错，绝不冒泡 5xx 触发整文件重传。"""
+    local_file = tmp_path / "movie.mkv"
+    local_file.write_bytes(QUICK_TRANSFER_CONTENT)
+    client, quick_payloads, upload_requests = _upload_flow_client(
+        [_quick_hit_response(1)], [httpx.Response(502, json={})]
+    )
+
+    with pytest.raises(WopanResponseError, match="秒传已完成但目标目录未找到对应文件"):
+        client.upload_file("folder-1", local_file, quick_transfer=True)
+
+    assert upload_requests == []
 
 
 def test_get_download_info_calls_get_download_url_and_returns_url() -> None:
