@@ -77,15 +77,11 @@ class FakeClient:
         default = [WopanItem(item_id="folder-1", name="Folder", kind=WopanItemKind.FOLDER)]
         return list(self.listings.get(parent_id, default))
 
-    def search_files(
-        self, keyword: str, page_no: int = 1, page_size: int = 50
-    ) -> list[WopanItem]:
+    def search_files(self, keyword: str, page_no: int = 1, page_size: int = 50) -> list[WopanItem]:
         self.searched_keywords.append((keyword, page_no, page_size))
         if self.error is not None:
             raise self.error
-        return [
-            WopanItem(item_id="file-9", name=f"{keyword}.txt", kind=WopanItemKind.FILE)
-        ]
+        return [WopanItem(item_id="file-9", name=f"{keyword}.txt", kind=WopanItemKind.FILE)]
 
     def get_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
         self.resolved_directory_ids.append(directory_id)
@@ -93,7 +89,9 @@ class FakeClient:
             raise self.error
         return list(self.directory_paths.get(directory_id, []))
 
-    def create_folder(self, parent_id: str, name: str, *, reuse_existing: bool = False) -> WopanItem:
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
         self.created_folders.append((parent_id, name))
         if self.error is not None:
             raise self.error
@@ -129,9 +127,7 @@ class FakeClient:
         if self.error is not None:
             raise self.error
 
-    def move_many(
-        self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str
-    ) -> None:
+    def move_many(self, items: Sequence[tuple[str, WopanItemKind]], target_parent_id: str) -> None:
         for item_id, kind in items:
             self.move(item_id, kind, target_parent_id)
 
@@ -354,9 +350,7 @@ def test_resolve_directory_path_shortcuts_root() -> None:
     client = FakeClient()
     service = FileBrowserService(client)  # type: ignore[arg-type]
 
-    assert service.resolve_directory_path(ROOT_DIRECTORY_ID) == [
-        (ROOT_DIRECTORY_ID, "个人云")
-    ]
+    assert service.resolve_directory_path(ROOT_DIRECTORY_ID) == [(ROOT_DIRECTORY_ID, "个人云")]
     assert client.resolved_directory_ids == []
 
 
@@ -428,9 +422,7 @@ def test_file_browser_service_passes_expected_sha256_to_downloader(
 
     def fake_download_url(http_client, url, local_path, **kwargs):
         captured.update(kwargs)
-        return DownloadResult(
-            status="已完成", task_id=kwargs["task_id"], local_path=local_path
-        )
+        return DownloadResult(status="已完成", task_id=kwargs["task_id"], local_path=local_path)
 
     monkeypatch.setattr("openwopan.app.file_browser.download_url", fake_download_url)
     service = FileBrowserService(FakeClient())  # type: ignore[arg-type]
@@ -577,7 +569,6 @@ def test_file_browser_service_forwards_upload_progress(tmp_path: Path) -> None:
 
     assert progress == [(2, 8)]
 
-
     class _ExistingNameClient(FakeClient):
         def list_files(self, parent_id: str) -> list[WopanItem]:
             return [
@@ -632,7 +623,9 @@ def test_file_browser_service_cancels_after_cloud_preflight(tmp_path: Path) -> N
 
     with pytest.raises(FileBrowserUploadCancelledError, match="上传已取消"):
         service.upload_file(
-            "folder-1", local_path, upload_name="upload.txt",
+            "folder-1",
+            local_path,
+            upload_name="upload.txt",
             cancel_requested=lambda: cancelled,
         )
 
@@ -1061,7 +1054,9 @@ class FolderUploadFakeClient(FakeClient):
             for name in sorted(self.existing_names.get(parent_id, set()))
         ]
 
-    def create_folder(self, parent_id: str, name: str, *, reuse_existing: bool = False) -> WopanItem:
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
         self.created_folders.append((parent_id, name))
         if self.error is not None:
             raise self.error
@@ -1176,9 +1171,7 @@ def test_prepare_merge_long_dir_name_merges_by_server_stored_form(tmp_path: Path
     long_dir = "a" * 99 + ".dir"  # 103 字符，服务端存 100 字符截断名
     stored_dir = server_file_name(long_dir)
     cloud_root = WopanItem(item_id="r", name="photos", kind=WopanItemKind.FOLDER)
-    cloud_sub = WopanItem(
-        item_id="sub", name=stored_dir, kind=WopanItemKind.FOLDER, parent_id="r"
-    )
+    cloud_sub = WopanItem(item_id="sub", name=stored_dir, kind=WopanItemKind.FOLDER, parent_id="r")
     done = WopanItem(
         item_id="f1",
         name="ep1.mkv",
@@ -1887,9 +1880,7 @@ def test_service_upload_restarts_fresh_when_session_rejected_with_5xx(
         def __init__(self) -> None:
             super().__init__()
             self.reject_resumes = False
-            self._request = httpx.Request(
-                "POST", "https://upload.example/openapi/client/upload2C"
-            )
+            self._request = httpx.Request("POST", "https://upload.example/openapi/client/upload2C")
             self._response = httpx.Response(500, request=self._request)
 
         def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
@@ -1948,11 +1939,7 @@ def test_restart_rejected_session_keeps_parts_when_stat_fails(
 
         def upload_file(self, parent_id: str, local_path: Path, **kwargs: object) -> WopanItem:
             resume = kwargs.get("resume")
-            if (
-                self.reject
-                and isinstance(resume, UploadResumeContext)
-                and resume.completed_indexes
-            ):
+            if self.reject and isinstance(resume, UploadResumeContext) and resume.completed_indexes:
                 local_path.unlink()
                 raise httpx.HTTPStatusError(
                     "Server Error", request=self._request, response=self._response
@@ -2454,9 +2441,7 @@ def test_service_upload_rejects_empty_upload_name(tmp_path: Path) -> None:
     assert client.uploaded_files == []
 
 
-def test_service_upload_maps_stat_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_service_upload_maps_stat_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service, _client, _store = _resume_service(tmp_path)
     local_path = tmp_path / "upload.txt"
     local_path.write_bytes(b"data")

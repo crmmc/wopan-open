@@ -4896,11 +4896,8 @@ class MainWindow(_MainWindowBase):
         self._scan_thread = thread
         self._scan_worker = worker
         self._set_status("正在扫描待上传内容...")
-        LOGGER.info(
-            "main_window.upload_scan.start top_count=%s paths=%s",
-            len(paths),
-            [str(path) for path in paths],
-        )
+        # 只记数量不记路径：本地路径不写入日志（隐私规则，测试钉住）。
+        LOGGER.info("main_window.upload_scan.start top_count=%s", len(paths))
         thread.start()
 
     def _on_upload_scan_succeeded(self, result: object) -> None:
