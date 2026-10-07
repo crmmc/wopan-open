@@ -182,6 +182,71 @@ def test_create_folder_requires_created_id() -> None:
         client.create_folder("0", "Reports")
 
 
+def _rsp_code_response(code: str, data: object) -> httpx.Response:
+    return _json_response(
+        {
+            "STATUS": "200",
+            "MSG": "ok",
+            "RSP": {
+                "RSP_CODE": code,
+                "RSP_DESC": "desc",
+                "DATA": _encrypt_wohome_payload(data),
+            },
+        }
+    )
+
+
+def test_create_folder_reuse_existing_sends_is_could_repeat_and_reuses_130007_id() -> None:
+    """reuse_existing：请求带 isCouldRepeat="1"，130007（同名目录已存在）
+    按成功处理并复用 DATA.id —— 官方客户端文件夹上传的目录合并契约。"""
+    client, captured = _client_and_captured_params(
+        [_rsp_code_response("130007", {"id": "existing-dir"})]
+    )
+
+    item = client.create_folder("0", "Reports", reuse_existing=True)
+
+    assert item.item_id == "existing-dir"
+    assert item.name == "Reports"
+    assert item.kind is WopanItemKind.FOLDER
+    assert item.parent_id == "0"
+    assert captured == [
+        (
+            "CreateDirectory",
+            {
+                "spaceType": "0",
+                "familyId": "0",
+                "parentDirectoryId": "0",
+                "directoryName": "Reports",
+                "clientId": "1001000021",
+                "isCouldRepeat": "1",
+            },
+        )
+    ]
+
+
+def test_create_folder_reuse_existing_accepts_new_directory_too() -> None:
+    """reuse_existing 下全新目录照常创建（0000 + 新 id）。"""
+    client, captured = _client_and_captured_params([_success_response({"id": "dir-9"})])
+
+    item = client.create_folder("0", "Reports", reuse_existing=True)
+
+    assert item.item_id == "dir-9"
+    assert captured[0][1]["isCouldRepeat"] == "1"
+
+
+def test_create_folder_without_reuse_still_rejects_130007() -> None:
+    """默认路径保持原语义：不带 isCouldRepeat，130007 仍是业务错误。"""
+    client, captured = _client_and_captured_params(
+        [_rsp_code_response("130007", {"id": "existing-dir"})]
+    )
+
+    with pytest.raises(WopanBusinessError) as excinfo:
+        client.create_folder("0", "Reports")
+
+    assert excinfo.value.code == "130007"
+    assert "isCouldRepeat" not in captured[0][1]
+
+
 def test_rename_file_calls_rename_file_or_directory_with_kind_and_file_type() -> None:
     client, captured = _client_and_captured_params([_success_response("")])
 

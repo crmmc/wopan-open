@@ -93,7 +93,7 @@ class FakeClient:
             raise self.error
         return list(self.directory_paths.get(directory_id, []))
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+    def create_folder(self, parent_id: str, name: str, *, reuse_existing: bool = False) -> WopanItem:
         self.created_folders.append((parent_id, name))
         if self.error is not None:
             raise self.error
@@ -1047,7 +1047,7 @@ class FolderUploadFakeClient(FakeClient):
             for name in sorted(self.existing_names.get(parent_id, set()))
         ]
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+    def create_folder(self, parent_id: str, name: str, *, reuse_existing: bool = False) -> WopanItem:
         self.created_folders.append((parent_id, name))
         if self.error is not None:
             raise self.error
@@ -1071,17 +1071,37 @@ def _make_local_tree(tmp_path: Path) -> Path:
 
 
 class _MergeCloudClient(FakeClient):
-    """Cloud double whose listings carry folders and sized files (merge tests)."""
+    """Cloud double whose listings carry folders and sized files (merge tests).
+
+    ``create_folder(reuse_existing=True)`` emulates the server merge
+    contract ``prepare_folder_upload`` now relies on: a same-name folder
+    (matched by stored name, long names truncated) is reused and its id
+    returned without creating anything; everything else creates a folder.
+    Unverified edge kept out of the double: a same-name FILE occupying the
+    name (real-server behavior unknown until UAT) falls through to create.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.entries: dict[str, list[WopanItem]] = {}
         self.created: list[tuple[str, str]] = []
+        self.merged: list[tuple[str, str]] = []
+        self.listed_dirs: list[str] = []
 
     def list_files(self, parent_id: str) -> list[WopanItem]:
+        self.listed_dirs.append(parent_id)
         return list(self.entries.get(parent_id, []))
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
+        if reuse_existing:
+            for item in self.entries.get(parent_id, []):
+                if item.kind is not WopanItemKind.FOLDER:
+                    continue
+                if name == item.name or server_file_name(name) == item.name:
+                    self.merged.append((parent_id, name))
+                    return item
         self.created.append((parent_id, name))
         item = WopanItem(
             item_id=f"new-dir-{len(self.created)}",
@@ -1113,6 +1133,59 @@ def test_prepare_folder_upload_merge_reuses_dirs_and_skips_completed_files(
     assert all(name != "ep1.mkv" for (_dir_id, name) in planned)  # 同名同大小跳过
     # 同名不同大小 → 副本名补传
     assert any(name.startswith("ep3") and "copy" in name for (_dir_id, name) in planned)
+
+
+def test_prepare_folder_upload_merge_delegates_dir_reuse_to_server(tmp_path: Path) -> None:
+    """合并模式目录复用走服务端合并契约：根/子目录 id 一律来自
+    create_folder(reuse_existing=True)，不再预列父目录按名字猜测。"""
+    client, local_root = _merge_tree_fixture(tmp_path)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+
+    assert client.merged == [
+        ("0", "photos"),
+        ("cloud-photos", "season1"),
+        ("cloud-photos", "season2"),
+    ]
+    assert client.created == [("cloud-photos", "season3")]  # 缺的目录仍新建
+    assert job.root_item_id == "cloud-photos"
+    # 父目录不列（"0"/"cloud-photos" 都不含文件）；列目录只发生在含文件
+    # 的目录上，为文件级跳过/副本名服务。
+    assert client.listed_dirs == ["cloud-s1", "cloud-s2", "new-dir-1"]
+
+
+def test_prepare_merge_long_dir_name_merges_by_server_stored_form(tmp_path: Path) -> None:
+    """合并模式下超长目录名交给服务端按存储形态合并：截断存储的云端
+    目录照样复用，不需要客户端列目录比对名字。"""
+    client = _MergeCloudClient()
+    long_dir = "a" * 99 + ".dir"  # 103 字符，服务端存 100 字符截断名
+    stored_dir = server_file_name(long_dir)
+    cloud_root = WopanItem(item_id="r", name="photos", kind=WopanItemKind.FOLDER)
+    cloud_sub = WopanItem(
+        item_id="sub", name=stored_dir, kind=WopanItemKind.FOLDER, parent_id="r"
+    )
+    done = WopanItem(
+        item_id="f1",
+        name="ep1.mkv",
+        kind=WopanItemKind.FILE,
+        parent_id="sub",
+        size=100,
+        download_id="fid-1",
+    )
+    client.entries["0"] = [cloud_root]
+    client.entries["r"] = [cloud_sub]
+    client.entries["sub"] = [done]
+    local_root = tmp_path / "photos"
+    (local_root / long_dir).mkdir(parents=True)
+    (local_root / long_dir / "ep1.mkv").write_bytes(b"a" * 100)
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+
+    job = service.prepare_folder_upload("0", local_root, root_name="photos", merge=True)
+
+    assert client.merged == [("0", "photos"), ("r", long_dir)]  # 长名子目录复用
+    assert client.created == []
+    assert job.files == ()  # 同名同大小文件跳过
 
 
 def test_prepare_folder_upload_without_merge_rejects_existing_root(tmp_path: Path) -> None:
@@ -1312,9 +1385,9 @@ def test_prepare_folder_upload_stops_between_cloud_creates(tmp_path: Path) -> No
     stopped = False
     create_folder = client.create_folder
 
-    def stop_after_root(parent_id: str, name: str) -> WopanItem:
+    def stop_after_root(parent_id: str, name: str, *, reuse_existing: bool = False) -> WopanItem:
         nonlocal stopped
-        item = create_folder(parent_id, name)
+        item = create_folder(parent_id, name, reuse_existing=reuse_existing)
         stopped = True
         return item
 
@@ -1443,10 +1516,12 @@ def test_prepare_folder_upload_fails_without_partial_job_on_create_error(
     tmp_path: Path,
 ) -> None:
     class _FailSecondCreate(FolderUploadFakeClient):
-        def create_folder(self, parent_id: str, name: str) -> WopanItem:
+        def create_folder(
+            self, parent_id: str, name: str, *, reuse_existing: bool = False
+        ) -> WopanItem:
             if self.created_folders:
                 raise WopanBusinessError("0001", "denied")
-            return super().create_folder(parent_id, name)
+            return super().create_folder(parent_id, name, reuse_existing=reuse_existing)
 
     client = _FailSecondCreate()
     service = FileBrowserService(client)  # type: ignore[arg-type]

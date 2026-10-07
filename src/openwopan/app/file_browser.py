@@ -134,7 +134,9 @@ class FileBrowserBackend(Protocol):
     def resolve_directory_path(self, directory_id: str) -> list[tuple[str, str]]:
         """Resolve a directory id to its root-relative id/name path."""
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
         """Create a folder and return the created item."""
 
     def rename_item(self, item: WopanItem, new_name: str) -> None:
@@ -444,14 +446,24 @@ class FileBrowserService:
         )
         return items
 
-    def create_folder(self, parent_id: str, name: str) -> WopanItem:
-        """Create a folder in a directory."""
+    def create_folder(
+        self, parent_id: str, name: str, *, reuse_existing: bool = False
+    ) -> WopanItem:
+        """Create a folder in a directory.
+
+        ``reuse_existing`` lets the server merge into a same-name directory
+        and return its id (upload-tree reuse) instead of reporting a
+        conflict.
+        """
         LOGGER.info(
-            "file_browser.create_folder.start parent_id=%s name_length=%s",
+            "file_browser.create_folder.start parent_id=%s name_length=%s reuse_existing=%s",
             parent_id,
             len(name),
+            reuse_existing,
         )
-        item = self._call(lambda: self._client.create_folder(parent_id, name))
+        item = self._call(
+            lambda: self._client.create_folder(parent_id, name, reuse_existing=reuse_existing)
+        )
         LOGGER.info(
             "file_browser.create_folder.success parent_id=%s item_id=%s",
             parent_id,
@@ -1009,9 +1021,16 @@ class FileBrowserService:
         created stay on the cloud (no rollback).
 
         ``merge`` continues into an existing tree instead of duplicating it:
-        same-name directories (root included) are reused, and same-name
-        same-size files are treated as already uploaded and skipped; only
-        the missing files are planned.
+        directories (root included) are merged server-side — one
+        ``CreateDirectory`` per folder with ``isCouldRepeat="1"``, the
+        server returning the existing same-name directory's id (code 130007
+        included) or creating it — so no parent directory is pre-listed and
+        no name is compared client-side; the server's stored names (long
+        names truncated) are the single source of truth. Same-name
+        same-size files are then treated as already uploaded and skipped;
+        only the missing files are planned. A same-name *file* blocking a
+        directory name is expected to fail the server request instead of
+        silently renaming (edge not yet observed on the real server).
         """
         if not parent_id:
             raise FileBrowserError("目标文件夹不能为空")
@@ -1037,18 +1056,18 @@ class FileBrowserService:
         try:
             if cancel_requested is not None and cancel_requested():
                 raise FileBrowserUploadCancelledError("上传已取消")
-            existing_root_items = self._existing_items(parent_id)
-            existing_root_names = set(existing_root_items)
             requested_root = root_name if root_name is not None else plan.root_name
             if not requested_root:
                 raise FileBrowserError("上传文件夹名称不能为空")
-            root_existing = _merge_existing_item(existing_root_items, requested_root)
-            if merge and root_existing is not None and root_existing.kind is WopanItemKind.FOLDER:
-                # 合并模式：同名根目录已存在则直接复用，缺的文件补传。
+            if merge:
+                # 合并模式：根目录交给服务端合并（isCouldRepeat，同名返回
+                # 已有 id），不预列父目录、不按名字猜测——服务端存储名
+                # （含长名截断）是唯一事实。
+                root_item = self.create_folder(parent_id, requested_root, reuse_existing=True)
                 resolved_root_name = requested_root
-                root_item = root_existing
             else:
-                if root_name is not None and _server_name_taken(existing_root_names, root_name) and not merge:
+                existing_root_names = set(self._existing_items(parent_id))
+                if root_name is not None and _server_name_taken(existing_root_names, root_name):
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 resolved_root_name = (
                     root_name
@@ -1077,18 +1096,16 @@ class FileBrowserService:
                 if cancel_requested is not None and cancel_requested():
                     raise FileBrowserUploadCancelledError("上传已取消")
                 rel_parent, _, local_name = rel_path.rpartition("/")
-                parent_names = taken_names(rel_parent)
-                existing = (
-                    _merge_existing_item(cloud_items_for(rel_parent), local_name)
-                    if merge
-                    else None
-                )
-                if merge and existing is not None and existing.kind is WopanItemKind.FOLDER:
-                    # 合并模式：同名子目录复用，不再创建副本。
-                    parent_names.add(server_file_name(local_name))
-                    dir_ids[rel_path] = existing.item_id
+                if merge:
+                    # 合并模式：子目录同样交给服务端合并，客户端不做名字
+                    # 预判，也不为没有文件的目录浪费一次列目录请求。
+                    merged = self.create_folder(
+                        dir_ids[rel_parent], local_name, reuse_existing=True
+                    )
+                    dir_ids[rel_path] = merged.item_id
                     continue
-                if root_name is not None and _server_name_taken(parent_names, local_name) and not merge:
+                parent_names = taken_names(rel_parent)
+                if root_name is not None and _server_name_taken(parent_names, local_name):
                     raise FileBrowserError("上传目标已存在，请刷新后重试")
                 folder_name = next_available_name(local_name, parent_names)
                 if cancel_requested is not None and cancel_requested():
@@ -1173,9 +1190,12 @@ class FileBrowserService:
     ) -> MergeUploadEstimate:
         """Read-only estimate of what merging ``local_root`` would add.
 
-        跳过判定与 prepare_folder_upload 的 merge 分支同源：同名目录复用并
-        递归比对、同名同大小文件视为已上传；本地独有的子树整树计为新增。
-        不创建任何云端内容，只做列表读取；同名根目录不存在时全量新增。
+        文件跳过判定与 prepare_folder_upload 的 merge 分支同源：同名同大小
+        文件视为已上传；本地独有的子树整树计为新增。目录以存储名比对判定
+        （估算无法触发服务端合并）——服务端对同名目录返回同一个 id（130007
+        契约），存储名在同一父目录内唯一，所以名字走到的一定是 prepare 实际
+        合并进的目录。不创建任何云端内容，只做列表读取；同名根目录不存在
+        时全量新增。
         """
         plan = scan_folder_tree(local_root)
         requested_root = root_name if root_name is not None else plan.root_name
