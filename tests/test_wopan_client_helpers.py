@@ -121,8 +121,10 @@ def test_upload_file_rejects_directory(tmp_path: Path) -> None:
 def test_upload_part_retries_transient_business_error_then_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """部分失败语义：单片先失败、重试后成功，整体上传成功。"""
+    """部分失败语义：单片先失败、隔 5 秒重试后成功，整体上传成功。"""
+    sleeps: list[float] = []
     monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    monkeypatch.setattr(client_module, "_sleep_cancelable", lambda s, _c: sleeps.append(s))
     local_file = tmp_path / "report.bin"
     local_file.write_bytes(b"abcdefghijklmnopq")
     attempts: list[int] = []
@@ -146,6 +148,7 @@ def test_upload_part_retries_transient_business_error_then_succeeds(
 
     assert item.item_id == "fid-1"
     assert attempts.count(2) == 2  # part 2 retried once and then succeeded
+    assert sleeps == [5.0]  # 重试前等待官方契约的 5 秒间隔
 
 
 def test_upload_file_reports_completed_progress(tmp_path: Path) -> None:
@@ -163,7 +166,6 @@ def test_upload_file_reports_completed_progress(tmp_path: Path) -> None:
 
     assert item.item_id == "fid-1"
     assert progress == [(7, 7)]
-
 
     """整体失败语义：单片重试耗尽后整体上传失败。"""
     from openwopan.wopan.errors import WopanBusinessError
@@ -207,6 +209,7 @@ def test_upload_file_single_part_runs_through_part_executor(
 ) -> None:
     """单分片规划同样经过分片 executor：重试与进度语义与多分片一致。"""
     monkeypatch.setattr(client_module, "BYTES_PER_MB", 1)
+    monkeypatch.setattr(client_module, "_sleep_cancelable", lambda *_args: None)
     local_file = tmp_path / "tiny.bin"
     local_file.write_bytes(b"abc")  # 3 bytes < 5-byte part → total_parts == 1
     attempts: list[int] = []
@@ -298,9 +301,7 @@ def test_upload_part_rejects_malformed_response(tmp_path: Path, body: str, match
     response = httpx.Response(200, content=body.encode())
 
     with pytest.raises(WopanResponseError, match=match):
-        _upload_client(_upload_handler(response)).upload_file(
-            "0", local_file, retry_max_attempts=0
-        )
+        _upload_client(_upload_handler(response)).upload_file("0", local_file, retry_max_attempts=0)
 
 
 def test_get_download_info_rejects_non_object_entries() -> None:
@@ -357,9 +358,7 @@ def test_validate_session_rejects_missing_user_id() -> None:
 
 
 def test_dispatch_maps_non_200_status_without_message() -> None:
-    wopan = _dispatch_client(
-        lambda _r: httpx.Response(200, json={"STATUS": "500", "RSP": {}})
-    )
+    wopan = _dispatch_client(lambda _r: httpx.Response(200, json={"STATUS": "500", "RSP": {}}))
 
     with pytest.raises(WopanResponseError, match="WoPan service call failed"):
         wopan.query_cloud_usage("13800138000")

@@ -12,6 +12,7 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from openwopan.wopan import client as client_module
 from openwopan.wopan.client import WopanClient
 from openwopan.wopan.errors import (
     WopanBusinessError,
@@ -612,7 +613,11 @@ def test_upload_file_gets_zone_and_posts_single_part(tmp_path: Path) -> None:
     assert len(file_info["batchNo"]) == 14
 
 
-def test_upload_file_retries_transient_upload_zone_gateway_error(tmp_path: Path) -> None:
+def test_upload_file_retries_transient_upload_zone_gateway_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(client_module, "_sleep_cancelable", lambda s, _c: sleeps.append(s))
     local_file = tmp_path / "report.txt"
     local_file.write_text("upload-content")
     zone_attempts = 0
@@ -638,6 +643,7 @@ def test_upload_file_retries_transient_upload_zone_gateway_error(tmp_path: Path)
 
     assert item.item_id == "fid-1"
     assert zone_attempts == 2
+    assert sleeps == [5.0]  # 官方契约：重试间隔 5 秒
 
 
 def test_upload_file_posts_multiple_parts_when_configured(
@@ -842,6 +848,25 @@ def test_upload_cancel_prevents_zone_retry(tmp_path: Path) -> None:
     assert len(requests) == 1
 
 
+def test_sleep_cancelable_returns_after_duration() -> None:
+    """重试等待正常走完（短时长验证，不拖慢测试）。"""
+    import time as time_module
+
+    started = time_module.monotonic()
+    client_module._sleep_cancelable(0.3, None)
+    assert time_module.monotonic() - started >= 0.3
+
+
+def test_sleep_cancelable_raises_promptly_on_cancel() -> None:
+    """重试等待期间取消：0.2s 步进内立即抛出，上传取消保持灵敏。"""
+    import time as time_module
+
+    started = time_module.monotonic()
+    with pytest.raises(WopanUploadCancelledError):
+        client_module._sleep_cancelable(5.0, lambda: True)
+    assert time_module.monotonic() - started < 1.0
+
+
 def test_upload_file_falls_back_to_default_zone_url(tmp_path: Path) -> None:
     local_file = tmp_path / "report.bin"
     local_file.write_bytes(b"x")
@@ -863,7 +888,10 @@ def test_upload_file_falls_back_to_default_zone_url(tmp_path: Path) -> None:
     assert upload_urls == ["https://tjupload.pan.wo.cn/openapi/client/upload2C"]
 
 
-def test_upload_file_maps_non_success_upload_response(tmp_path: Path) -> None:
+def test_upload_file_maps_non_success_upload_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_module, "_sleep_cancelable", lambda *_args: None)
     local_file = tmp_path / "report.txt"
     local_file.write_text("content")
 
@@ -882,10 +910,13 @@ def test_upload_file_maps_non_success_upload_response(tmp_path: Path) -> None:
 
 
 def test_upload_part_failure_logs_server_error_body(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """分片 500：每次重试的日志必须带上服务端响应体片段——裸 500 的唯一
     文字线索（此前只记状态码，服务端给的原因被 raise_for_status 丢弃）。"""
+    monkeypatch.setattr(client_module, "_sleep_cancelable", lambda *_args: None)
     local_file = tmp_path / "report.txt"
     local_file.write_text("content")
 

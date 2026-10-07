@@ -86,6 +86,9 @@ QUICK_TRANSFER_API = "https://b.smartont.net:443/openapi/transfer/quickTransfer"
 QUICK_TRANSFER_MIN_FILE_SIZE = 3 * 1024 * 1024
 QUICK_TRANSFER_TIMEOUT_SECONDS = 30.0
 QUICK_TRANSFER_HASH_CHUNK_SIZE = 1024 * 1024
+# 官方客户端契约：分片/zone 重试间隔 5 秒（RETRY_DELAY=5e3）。零间隔连发
+# 对持续几十秒的服务端抖动毫无意义（UAT 2026-10-07：4 发 6 秒内全灭）。
+UPLOAD_RETRY_DELAY_SECONDS = 5.0
 STANDARD_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1303,6 +1306,8 @@ class WopanClient:
                     max_attempts,
                     _http_error_detail(exc),
                 )
+                if _attempt + 1 < max_attempts:
+                    _sleep_cancelable(UPLOAD_RETRY_DELAY_SECONDS, cancel_requested)
             except ValueError as exc:
                 raise WopanResponseError("upload2C response cannot be decoded") from exc
         if last_error is not None:
@@ -1334,6 +1339,8 @@ class WopanClient:
                     exc.response.status_code,
                     attempt + 1,
                 )
+                if attempt + 1 < attempts:
+                    _sleep_cancelable(UPLOAD_RETRY_DELAY_SECONDS, cancel_requested)
             except httpx.HTTPError:
                 _check_upload_cancelled(cancel_requested)
                 raise
@@ -1464,6 +1471,17 @@ def _http_error_detail(exc: Exception) -> str:
         snippet = exc.response.text[:200].replace("\n", " ").strip()
         return f"status={exc.response.status_code} body={snippet!r}"
     return f"type={type(exc).__name__}"
+
+
+def _sleep_cancelable(seconds: float, cancel_requested: Callable[[], bool] | None) -> None:
+    """Sleep in small steps so pause/cancel stays responsive during retry delays."""
+    deadline = time.monotonic() + seconds
+    while True:
+        _check_upload_cancelled(cancel_requested)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
 
 
 def _sign(key: str, res_time: int, req_seq: int, channel: str) -> str:
