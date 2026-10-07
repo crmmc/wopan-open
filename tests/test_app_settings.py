@@ -39,12 +39,14 @@ def test_load_app_settings_roundtrip(tmp_path: Path) -> None:
         max_download_threads=8,
         retry_max_attempts=2,
         download_part_mode="fixed",
+        enable_quick_transfer=False,
     )
 
     save_app_settings(original, path)
     loaded = load_app_settings(path)
 
     assert loaded == original
+    assert AppSettings().enable_quick_transfer is True  # 秒传默认开启
 
 
 @pytest.mark.parametrize(
@@ -55,6 +57,7 @@ def test_load_app_settings_roundtrip(tmp_path: Path) -> None:
         ("stay_logged_in", "yes", "stay_logged_in must be a bool"),
         ("default_download_path", 42, "default_download_path must be a string"),
         ("ask_download_location", "no", "ask_download_location must be a bool"),
+        ("enable_quick_transfer", "off", "enable_quick_transfer must be a bool"),
     ],
 )
 def test_load_app_settings_rejects_invalid_types(

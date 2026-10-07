@@ -81,6 +81,11 @@ PERSONAL_SEARCH_TYPE = "2"
 SEARCH_DEFAULT_PAGE_SIZE = 50
 PERSONAL_FAMILY_ID = "0"
 DEFAULT_VIP_LEVEL = "0"
+QUICK_TRANSFER_API = "https://b.smartont.net:443/openapi/transfer/quickTransfer"
+# 官方客户端阈值：小于 3MB 的文件不做秒传探测，直接分片上传。
+QUICK_TRANSFER_MIN_FILE_SIZE = 3 * 1024 * 1024
+QUICK_TRANSFER_TIMEOUT_SECONDS = 30.0
+QUICK_TRANSFER_HASH_CHUNK_SIZE = 1024 * 1024
 STANDARD_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -730,6 +735,7 @@ class WopanClient:
         progress_callback: UploadProgressCallback | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         resume: UploadResumeContext | None = None,
+        quick_transfer: bool = False,
     ) -> WopanItem:
         """Upload a local file to a parent directory.
 
@@ -740,6 +746,12 @@ class WopanClient:
         finishes its parts without a usable fid, or fails after the server
         may already have assembled the file, the target directory listing is
         queried to recover the fid by name+size match.
+
+        With ``quick_transfer`` files at or above
+        ``QUICK_TRANSFER_MIN_FILE_SIZE`` first probe the instant-transfer
+        API (full-file SHA-256, official-client parity): a hit completes
+        the file server-side without sending any part; a miss or any probe
+        failure falls back to the normal chunked upload.
         """
         if not parent_id:
             raise ValueError("parent_id must not be empty")
@@ -794,6 +806,22 @@ class WopanClient:
                 progress_callback(file_size, file_size)
             return recovered
 
+        unique_id = resume.unique_id if resume is not None else str(int(time.time() * 1000))
+        batch_no = resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
+        if quick_transfer and file_size >= QUICK_TRANSFER_MIN_FILE_SIZE:
+            item = self._try_quick_transfer(
+                parent_id=parent_id,
+                file_name=file_name,
+                file_size=file_size,
+                file_type=upload_file_type,
+                batch_no=batch_no,
+                local_path=local_path,
+                cancel_requested=cancel_requested,
+            )
+            if item is not None:
+                if progress_callback is not None:
+                    progress_callback(file_size, file_size)
+                return item
         if cancel_requested is None:
             zone_url = self.get_upload_zone_url(retry_max_attempts=retry_max_attempts)
         else:
@@ -802,8 +830,6 @@ class WopanClient:
             )
         _check_upload_cancelled(cancel_requested)
         upload_url = f"{zone_url.rstrip('/')}/openapi/client/upload2C"
-        unique_id = resume.unique_id if resume is not None else str(int(time.time() * 1000))
-        batch_no = resume.batch_no if resume is not None else time.strftime("%Y%m%d%H%M%S")
         token_key = _wohome_crypto_key(self._access_token)
         file_info = {
             "spaceType": PERSONAL_SPACE_TYPE,
@@ -959,6 +985,135 @@ class WopanClient:
                     file_size=file_size,
                     fid=item.download_id,
                 )
+        return None
+
+    def _try_quick_transfer(
+        self,
+        *,
+        parent_id: str,
+        file_name: str,
+        file_size: int,
+        file_type: str,
+        batch_no: str,
+        local_path: Path,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> WopanItem | None:
+        """Probe the instant-transfer API; return the completed item or None.
+
+        Mirrors the official client: hash the whole file with SHA-256, then
+        POST it with name/size/directory/mtime to ``QUICK_TRANSFER_API``.
+        ``meta.code == "0000"`` with ``result.hasFile == 1`` means the
+        server created the target entry from existing content instantly.
+        A miss, a non-success code, or any probe failure returns None so
+        the caller falls back to the chunked upload — the probe must never
+        block an upload. The one exception: a hit whose fid cannot be
+        confirmed (missing from the response and from the directory
+        listing) raises instead, because re-uploading would duplicate the
+        entry the server just created.
+        """
+        _check_upload_cancelled(cancel_requested)
+        LOGGER.info(
+            "wopan.quick_transfer.start parent_id=%s file_name_length=%s file_size=%s",
+            parent_id,
+            len(file_name),
+            file_size,
+        )
+        try:
+            sha256 = _sha256_file(local_path, cancel_requested=cancel_requested)
+            payload = {
+                "sha256": sha256,
+                "fileSize": file_size,
+                "fileName": file_name,
+                "fileType": file_type,
+                "batchNo": batch_no,
+                "spaceType": PERSONAL_SPACE_TYPE,
+                "directoryId": parent_id,
+                "fileModificationTime": int(local_path.stat().st_mtime * 1000),
+            }
+        except WopanUploadCancelledError:
+            raise
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("wopan.quick_transfer.probe_failed error_type=%s", type(exc).__name__)
+            return None
+        raw = self._post_quick_transfer_payload(payload)
+        if raw is None:
+            return None
+        meta = raw.get("meta")
+        result = raw.get("result")
+        meta_info = meta if isinstance(meta, dict) else {}
+        result_info = result if isinstance(result, dict) else {}
+        code = str(meta_info.get("code") or "")
+        if code != "0000" or str(result_info.get("hasFile")) != "1":
+            # 2001（容量不足）等非成功码按未命中回落，配额错误交给分片
+            # 上传的既有通路统一上报——官方在探测阶段即时报错，属有意分歧。
+            LOGGER.info("wopan.quick_transfer.miss code=%s", code)
+            return None
+        fid = str(result_info.get("fid") or result_info.get("fileId") or "")
+        if fid:
+            LOGGER.info("wopan.quick_transfer.hit parent_id=%s fid_from=1", parent_id)
+            return build_uploaded_file_item(
+                file_name=file_name,
+                parent_id=parent_id,
+                file_size=file_size,
+                fid=fid,
+            )
+        try:
+            recovered = self._recover_upload_item_from_listing(
+                parent_id=parent_id, file_name=file_name, file_size=file_size
+            )
+        except Exception as recovery_error:
+            # 服务端已确认转存：任何恢复失败都必须报「未找到」并停止，
+            # 绝不能带着 5xx 原始异常冒泡——那会让服务层的会话重启守卫
+            # 误判并整文件重传，产生改名副本。
+            LOGGER.warning(
+                "wopan.quick_transfer.recovery_failed error_type=%s",
+                type(recovery_error).__name__,
+            )
+            raise WopanResponseError(
+                "秒传已完成但目标目录未找到对应文件，请刷新后重试"
+            ) from recovery_error
+        if recovered is None:
+            raise WopanResponseError("秒传已完成但目标目录未找到对应文件，请刷新后重试")
+        LOGGER.info("wopan.quick_transfer.hit parent_id=%s fid_from=2", parent_id)
+        return recovered
+
+    def _post_quick_transfer_payload(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """POST the quick transfer probe, retrying transient failures.
+
+        Official client parity: timeout 30s, two retries (three attempts).
+        Only transient failures (transport errors, 5xx) are retried; a 4xx
+        or a malformed body gives up immediately. Returns the decoded
+        response object, or None when the probe could not complete so the
+        caller falls back to the chunked upload.
+        """
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._http_client.post(
+                    QUICK_TRANSFER_API,
+                    json=payload,
+                    headers={"access-token": self._access_token},
+                    timeout=QUICK_TRANSFER_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                raw = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                transient = not (
+                    isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500
+                )
+                LOGGER.warning(
+                    "wopan.quick_transfer.probe_error attempt=%s transient=%s error_type=%s",
+                    attempt,
+                    transient,
+                    type(exc).__name__,
+                )
+                if not transient or attempt == attempts:
+                    return None
+                continue
+            if not isinstance(raw, dict):
+                LOGGER.info("wopan.quick_transfer.malformed_response")
+                return None
+            return raw
         return None
 
     def _recover_upload_item_on_error(
@@ -1267,6 +1422,24 @@ def build_uploaded_file_item(
         download_id=fid,
         size=file_size,
     )
+
+
+def _sha256_file(
+    path: Path,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+    chunk_size: int = QUICK_TRANSFER_HASH_CHUNK_SIZE,
+) -> str:
+    """Stream one file through SHA-256, checking cancellation per chunk."""
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        while True:
+            _check_upload_cancelled(cancel_requested)
+            chunk = file_obj.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _sign(key: str, res_time: int, req_seq: int, channel: str) -> str:

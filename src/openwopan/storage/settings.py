@@ -43,6 +43,7 @@ class AppSettings:
     upload_part_size_mb: int = 5
     download_part_size_mb: int = 5
     download_part_mode: str = "auto"
+    enable_quick_transfer: bool = True
 
     def __post_init__(self) -> None:
         if self.last_account_id == "":
@@ -51,6 +52,8 @@ class AppSettings:
             raise ValueError("stay_logged_in must be a bool")
         if not isinstance(self.ask_download_location, bool):
             raise ValueError("ask_download_location must be a bool")
+        if not isinstance(self.enable_quick_transfer, bool):
+            raise ValueError("enable_quick_transfer must be a bool")
         if not isinstance(self.default_download_path, Path):
             raise ValueError("default_download_path must be a Path")
         normalized_level = self.log_level.upper()
@@ -142,6 +145,7 @@ def save_app_settings(settings: AppSettings, path: Path | None = None) -> Path:
                 "upload_part_size_mb": settings.upload_part_size_mb,
                 "download_part_size_mb": settings.download_part_size_mb,
                 "download_part_mode": settings.download_part_mode,
+                "enable_quick_transfer": settings.enable_quick_transfer,
             },
             file,
             indent=2,
@@ -166,12 +170,16 @@ def _read_app_settings(raw: dict[str, Any]) -> AppSettings:
     ask_download_location = raw.get("ask_download_location", True)
     if not isinstance(ask_download_location, bool):
         raise ValueError("ask_download_location must be a bool")
+    enable_quick_transfer = raw.get("enable_quick_transfer", True)
+    if not isinstance(enable_quick_transfer, bool):
+        raise ValueError("enable_quick_transfer must be a bool")
     return AppSettings(
         last_account_id=last_account_id,
         log_level=log_level,
         stay_logged_in=stay_logged_in,
         default_download_path=Path(default_download_path),
         ask_download_location=ask_download_location,
+        enable_quick_transfer=enable_quick_transfer,
         max_download_threads=raw.get("max_download_threads", 8),
         max_upload_threads=raw.get("max_upload_threads", 4),
         max_concurrent_downloads=raw.get("max_concurrent_downloads", 4),

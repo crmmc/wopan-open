@@ -679,8 +679,22 @@ def test_file_browser_service_updates_transfer_settings_for_future_uploads(
             "max_upload_threads": 4,
             "retry_max_attempts": 2,
             "upload_name": None,
+            "quick_transfer": True,
         }
     ]
+
+
+def test_file_browser_service_quick_transfer_setting_passes_through(tmp_path: Path) -> None:
+    """秒传开关随设置传递：关闭后客户端收到 quick_transfer=False。"""
+    client = FakeClient()
+    service = FileBrowserService(client)  # type: ignore[arg-type]
+    service.update_settings(AppSettings(enable_quick_transfer=False))
+    local_path = tmp_path / "upload.txt"
+    local_path.write_bytes(b"upload-content")
+
+    service.upload_file("folder-1", local_path)
+
+    assert client.upload_kwargs[0]["quick_transfer"] is False
 
 
 def test_file_browser_service_syncs_runtime_download_settings(tmp_path: Path) -> None:

@@ -752,6 +752,7 @@ class FileBrowserService:
             "max_upload_threads": self._settings.max_upload_threads,
             "retry_max_attempts": self._settings.retry_max_attempts,
             "upload_name": upload_name,
+            "quick_transfer": self._settings.enable_quick_transfer,
         }
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
@@ -770,7 +771,13 @@ class FileBrowserService:
                         )
                     )
                 except TypeError:
-                    for key in ("resume", "cancel_requested", "progress_callback"):
+                    drop_order = (
+                        "quick_transfer",
+                        "resume",
+                        "cancel_requested",
+                        "progress_callback",
+                    )
+                    for key in drop_order:
                         if key in kwargs:
                             del kwargs[key]
                             break
@@ -873,8 +880,7 @@ class FileBrowserService:
     ) -> WopanItem:
         """Discard a server-rejected session and re-upload the file once."""
         LOGGER.warning(
-            "file_browser.upload_file.session_rejected_restart parent_id=%s "
-            "file_name_length=%s",
+            "file_browser.upload_file.session_rejected_restart parent_id=%s file_name_length=%s",
             parent_id,
             len(local_path.name),
         )
@@ -1218,9 +1224,7 @@ class FileBrowserService:
         for rel_path in plan.folders:  # 父目录先于子目录（scan 保证）
             rel_parent, _, local_name = rel_path.rpartition("/")
             items = items_for(rel_parent)
-            existing = (
-                _merge_existing_item(items, local_name) if items is not None else None
-            )
+            existing = _merge_existing_item(items, local_name) if items is not None else None
             if existing is not None and existing.kind is WopanItemKind.FOLDER:
                 dir_ids[rel_path] = existing.item_id
             else:
@@ -1230,9 +1234,7 @@ class FileBrowserService:
         files_skipped = 0
         for planned in plan.files:
             items = items_for(planned.rel_dir)
-            existing = (
-                _merge_existing_item(items, planned.name) if items is not None else None
-            )
+            existing = _merge_existing_item(items, planned.name) if items is not None else None
             if (
                 existing is not None
                 and existing.kind is WopanItemKind.FILE
@@ -1241,9 +1243,7 @@ class FileBrowserService:
                 files_skipped += 1
             else:
                 files_to_upload += 1
-        return MergeUploadEstimate(
-            files_to_upload=files_to_upload, files_skipped=files_skipped
-        )
+        return MergeUploadEstimate(files_to_upload=files_to_upload, files_skipped=files_skipped)
 
     def get_cloud_usage(self, account_id: str) -> WopanCloudUsage:
         """Return cloud storage usage for the current account."""
