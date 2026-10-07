@@ -1539,6 +1539,15 @@ class TransferInterface(QWidget):
         # hidden, so the visible window's widgets need one render.
         self._schedule_progress_render(self._active_direction)
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        # 名称列的省略点是"绘制时"按列宽算的：窗口变宽后已绘制行若未被
+        # 重绘，省略号会停在旧位置、右侧留大片空白（真机 2026-10-07）。
+        # 强制两个表视口重绘一次，绘制期会用当前列宽重新省略；Qt 会对
+        # resize 事件做合并，成本是每次几何变化最多两次全视口重绘。
+        self.upload_table.viewport().update()
+        self.download_table.viewport().update()
+
     def _on_upload_filter_changed(self, index: int) -> None:
         data = self.upload_filter_combo.itemData(index)
         # 文本带计数后缀（"已完成 (5)"），过滤键必须是 itemData 里的规范名。
@@ -1616,6 +1625,9 @@ class TransferInterface(QWidget):
                     # so its UserRole id would poison the sequence compare.
                     table_item = QTableWidgetItem(value)
                     table_item.setData(Qt.ItemDataRole.UserRole, record.task_id)
+                    if column == TRANSFER_COL_NAME:
+                        # 无论省略位置如何，悬停始终能看到完整名称。
+                        table_item.setToolTip(record.name)
                     if column in _TRANSFER_RIGHT_COLUMNS:
                         table_item.setTextAlignment(_TRANSFER_RIGHT_ALIGNMENT)
                     table.setItem(row, column, table_item)

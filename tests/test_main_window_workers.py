@@ -3697,6 +3697,48 @@ def test_transfer_update_record_computes_speed_and_terminal_state(qapp: QApplica
     assert transfer._find_record("upload", "missing-task") is None
 
 
+def test_transfer_name_item_carries_full_name_tooltip(qapp: QApplication) -> None:
+    """名称单元格挂全名 tooltip：省略显示时悬停仍能看到完整文件名。"""
+    transfer = TransferInterface()
+    full_name = "[Group] Some Series [01][Ma10p_1080p][x265_flac].mkv"
+    transfer.add_upload_record(
+        _make_record("u-tip", direction="upload", name=full_name, status="等待中")
+    )
+
+    item = transfer.upload_table.item(0, 0)
+    assert item.text() == full_name
+    assert item.toolTip() == full_name
+
+
+def test_transfer_resize_refreshes_table_viewports(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """几何变化必须强制重绘两个传输表视口：名称列省略点按"绘制时"列宽
+    计算，窗口变宽后若不重绘，省略号会停在旧位置浪费右侧空间（真机
+    2026-10-07）。"""
+    transfer = TransferInterface()
+    transfer.add_upload_record(_make_record("u-1", direction="upload", status="等待中"))
+    updated: list[object] = []
+    for table in (transfer.upload_table, transfer.download_table):
+        original_update = table.viewport().update
+
+        def make_spy(t=table, original_update=original_update):
+            def _update() -> None:
+                updated.append(t)
+                original_update()
+            return _update
+
+        monkeypatch.setattr(table.viewport(), "update", make_spy())
+
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QResizeEvent
+
+    transfer.resizeEvent(QResizeEvent(QSize(800, 600), QSize(900, 600)))
+
+    assert transfer.upload_table in updated
+    assert transfer.download_table in updated
+
+
 def test_transfer_update_record_coalesces_progress_renders(
     qapp: QApplication, monkeypatch: pytest.MonkeyPatch
 ) -> None:
